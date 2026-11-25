@@ -40,7 +40,8 @@ use windows::{
         Composition::{
             CompositionBatchTypes, CompositionBrush, CompositionRoundedRectangleGeometry,
             CompositionScopedBatch, CompositionSurfaceBrush, Compositor, ContainerVisual,
-            Desktop::DesktopWindowTarget, ShapeVisual, SpriteVisual, VisualCollection,
+            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, ScalarKeyFrameAnimation,
+            ShapeVisual, SpriteVisual, VisualCollection,
         },
     },
     Win32::{
@@ -631,9 +632,11 @@ pub struct MenuBar {
     /// Stable parent: content refreshes must not restart reveal animations.
     surface: ContainerVisual,
     /// Stable children of `surface`: the strip (fills, app name, status
-    /// items) and the island above it. The ghost bar animates only the strip.
+    /// items) and the island above it, which can fade independently.
     strip_layer: ContainerVisual,
     island_layer: ContainerVisual,
+    island_shown: Option<bool>,
+    island_hide_until: Option<Instant>,
     /// Ghost bar (`Config::menu_bar_ghost`): it auto-hides, but hidden, the
     /// island stays on screen.
     ghost: bool,
@@ -1343,6 +1346,8 @@ impl MenuBar {
             surface,
             strip_layer,
             island_layer,
+            island_shown: None,
+            island_hide_until: None,
             ghost: false,
             window_region: None,
             #[cfg(test)]
@@ -1470,7 +1475,9 @@ impl MenuBar {
             // Whichever layer animated so far starts over in its resting state.
             self.animation_epoch = self.animation_epoch.wrapping_add(1);
             self.exit_animation = None;
-            for layer in [&self.strip_layer, &self.surface] {
+            self.island_shown = None;
+            self.island_hide_until = None;
+            for layer in [&self.strip_layer, &self.island_layer, &self.surface] {
                 layer.StopAnimation(h!("Offset.Y"))?;
                 layer.StopAnimation(h!("Opacity"))?;
                 layer.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
@@ -1710,8 +1717,10 @@ impl MenuBar {
         (self.bounds.bottom - self.bounds.top) as f32 * 0.3
     }
 
-    fn animate_visibility(&mut self, gfx: &Gfx, shown: bool) -> Result<()> {
-        let c = &gfx.compositor;
+    fn visibility_easing(
+        c: &Compositor,
+        shown: bool,
+    ) -> Result<(CubicBezierEasingFunction, TimeSpan)> {
         let ease = if shown {
             c.CreateCubicBezierEasingFunction(Vector2::new(0.2, 0.8), Vector2::new(0.2, 1.0))?
         } else {
@@ -1720,6 +1729,60 @@ impl MenuBar {
         let duration = TimeSpan {
             Duration: i64::from(if shown { REVEAL_MS } else { HIDE_MS }) * 10_000,
         };
+        Ok((ease, duration))
+    }
+
+    fn visibility_fade(
+        c: &Compositor,
+        shown: bool,
+        ease: &CubicBezierEasingFunction,
+        duration: TimeSpan,
+    ) -> Result<ScalarKeyFrameAnimation> {
+        let fade = c.CreateScalarKeyFrameAnimation()?;
+        fade.SetDuration(duration)?;
+        fade.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
+        fade.InsertKeyFrameWithEasingFunction(1.0, if shown { 1.0 } else { 0.0 }, ease)?;
+        Ok(fade)
+    }
+
+    fn sync_island_fade(&mut self, presence: Presence) -> Result<()> {
+        if !self.ghost {
+            return Ok(());
+        }
+        let shown = presence != Presence::Hidden && self.triggers_span.width() > 0.0;
+        let previous = self.island_shown;
+        if self.visible && previous == Some(shown) {
+            return Ok(());
+        }
+        self.island_hide_until = None;
+        if self.visible && previous.is_some() && system::animations_enabled() {
+            let started = (|| -> Result<()> {
+                let c = self.island_layer.Compositor()?;
+                let (ease, duration) = Self::visibility_easing(&c, shown)?;
+                let fade = Self::visibility_fade(&c, shown, &ease, duration)?;
+                self.island_layer.StartAnimation(h!("Opacity"), &fade)?;
+                Ok(())
+            })();
+            if started.is_ok() {
+                self.island_shown = Some(shown);
+                self.island_hide_until =
+                    (!shown).then(|| Instant::now() + Duration::from_millis(u64::from(HIDE_MS)));
+                return Ok(());
+            }
+            if let Err(error) = started {
+                muelle_shell::log::line(&format!("animación de la isla: {error:#}"));
+            }
+        }
+        self.island_layer.StopAnimation(h!("Opacity"))?;
+        self.island_layer
+            .SetOpacity(if shown { 1.0 } else { 0.0 })?;
+        self.island_shown = self.visible.then_some(shown);
+        Ok(())
+    }
+
+    fn animate_visibility(&mut self, gfx: &Gfx, shown: bool) -> Result<()> {
+        let c = &gfx.compositor;
+        let (ease, duration) = Self::visibility_easing(c, shown)?;
         let slide = c.CreateScalarKeyFrameAnimation()?;
         slide.SetDuration(duration)?;
         slide.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
@@ -1728,10 +1791,7 @@ impl MenuBar {
             if shown { 0.0 } else { -self.reveal_lift() },
             &ease,
         )?;
-        let fade = c.CreateScalarKeyFrameAnimation()?;
-        fade.SetDuration(duration)?;
-        fade.InsertExpressionKeyFrame(0.0, h!("this.StartingValue"))?;
-        fade.InsertKeyFrameWithEasingFunction(1.0, if shown { 1.0 } else { 0.0 }, &ease)?;
+        let fade = Self::visibility_fade(c, shown, &ease, duration)?;
         let batch = (!shown)
             .then(|| c.CreateScopedBatch(CompositionBatchTypes::Animation))
             .transpose()?;
@@ -1805,8 +1865,15 @@ impl MenuBar {
         if completed_epoch.is_some_and(|epoch| epoch != self.animation_epoch) {
             return Ok(());
         }
+        let island_hiding = self.island_hide_until.is_some();
+        if self
+            .island_hide_until
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.island_hide_until = None;
+        }
         let Some(deadline) = self.hide_until else {
-            return Ok(());
+            return if island_hiding { self.place() } else { Ok(()) };
         };
         self.pointer_left_at(gfx, point)?;
         if self.hide_until.is_none() {
@@ -1920,8 +1987,11 @@ impl MenuBar {
             self.exit_animation = None;
         }
         let presence = self.presence_now();
+        self.sync_island_fade(presence)?;
         let hiding = self.hide_until.is_some();
-        let on_screen = self.visible && (presence != Presence::Hidden || hiding);
+        let show_bar = self.visible && (presence != Presence::Hidden || hiding);
+        let island_hiding = self.island_hide_until.is_some();
+        let on_screen = show_bar || island_hiding;
         let full = presence == Presence::Full;
         if let Some(monitor) = &self.accessories {
             monitor.set_visible(full);
@@ -1939,13 +2009,13 @@ impl MenuBar {
             self.surface.StopAnimation(h!("Opacity"))?;
             self.surface.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
             self.surface.SetOpacity(1.0)?;
-            if presence == Presence::IslandOnly && !hiding {
+            if !full && !hiding {
                 self.park_surface()?;
             }
         } else if !self.auto_hide {
             self.reset_surface()?;
         }
-        let region = (on_screen && presence == Presence::IslandOnly && !hiding)
+        let region = (!hiding && (presence == Presence::IslandOnly || island_hiding))
             .then(|| ghost_region(self.triggers_span, bar_height as f32))
             .flatten();
         // An auto-hiding or intelligent bar leaves the whole screen to the
@@ -1987,7 +2057,7 @@ impl MenuBar {
                 }
             }
             if needs_pointer_timer(
-                on_screen,
+                show_bar,
                 presence,
                 self.auto_hide,
                 self.panel.is_some(),
@@ -2001,7 +2071,12 @@ impl MenuBar {
                 let _ = KillTimer(Some(self.hwnd), POINTER_TIMER);
             }
             let _ = KillTimer(Some(self.hwnd), HIDE_ANIMATION_TIMER);
-            if let Some(deadline) = self.hide_until {
+            if let Some(deadline) = self
+                .hide_until
+                .into_iter()
+                .chain(self.island_hide_until)
+                .min()
+            {
                 let wait = deadline.saturating_duration_since(Instant::now());
                 SetTimer(
                     Some(self.hwnd),
@@ -5016,10 +5091,17 @@ mod island_tests {
 
         bar.set_covered(&gfx, true)?;
         assert_eq!(bar.presence_now(), Presence::Hidden);
+        if system::animations_enabled() {
+            let deadline = bar.island_hide_until.context("island fade-out")?;
+            assert!(visible(&bar), "keep the window alive during the fade");
+            assert_eq!(bar.strip_layer.Opacity()?, 0.0);
+            bar.finish_hide_at(&gfx, deadline, below, None)?;
+        }
         assert!(!visible(&bar));
         bar.set_covered(&gfx, false)?;
         assert_eq!(bar.presence_now(), Presence::IslandOnly);
         assert!(visible(&bar));
+        assert_eq!(bar.island_shown, Some(true));
 
         let mut scaled = bar.look.clone().context("look")?;
         scaled.scale = 1.5;
