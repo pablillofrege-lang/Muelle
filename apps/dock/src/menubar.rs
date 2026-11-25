@@ -1710,7 +1710,12 @@ impl MenuBar {
             // SAFETY: `track` is a valid structure with its size initialized.
             unsafe { TrackMouseEvent(&mut track)? };
         }
-        self.refresh(gfx)
+        let reason = if inside && self.ghost && self.visible {
+            usage::Refresh::Reveal
+        } else {
+            usage::Refresh::Scheduled
+        };
+        self.refresh_with_usage(gfx, reason)
     }
 
     fn reveal_lift(&self) -> f32 {
@@ -2273,7 +2278,7 @@ impl MenuBar {
                 }
                 IslandAction::Refresh => {
                     if let Some(usage) = &mut self.usage {
-                        usage.refresh(true);
+                        usage.refresh(usage::Refresh::Manual);
                     }
                 }
                 IslandAction::Media(control) => {
@@ -2370,6 +2375,10 @@ impl MenuBar {
 
     /// Redraws the bar if anything it shows has changed.
     pub fn refresh(&mut self, gfx: &Gfx) -> Result<()> {
+        self.refresh_with_usage(gfx, usage::Refresh::Scheduled)
+    }
+
+    fn refresh_with_usage(&mut self, gfx: &Gfx, reason: usage::Refresh) -> Result<()> {
         let Some(monitor) = system::primary_monitor() else {
             return Ok(());
         };
@@ -2387,7 +2396,7 @@ impl MenuBar {
         } else if self.presence_now() != Presence::Hidden
             && let Some(usage) = &mut self.usage
         {
-            usage.refresh(false);
+            usage.refresh(reason);
         }
         let appearance = appearance::menu_bar();
         let look = Look {

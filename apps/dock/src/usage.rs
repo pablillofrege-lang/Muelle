@@ -29,6 +29,7 @@ use windows::Win32::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const REVEAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
@@ -384,6 +385,38 @@ fn decode_logo(bytes: &[u8]) -> Option<IconImage> {
     })
 }
 
+pub enum Refresh {
+    Scheduled,
+    Reveal,
+    Manual,
+}
+
+impl Refresh {
+    fn due(
+        self,
+        elapsed: Duration,
+        snapshot: &Snapshot,
+        active: ActiveProviders,
+        now: SystemTime,
+    ) -> bool {
+        match self {
+            Self::Manual => true,
+            Self::Scheduled => elapsed >= REFRESH_INTERVAL,
+            Self::Reveal => {
+                elapsed >= REFRESH_INTERVAL
+                    || (elapsed >= REVEAL_REFRESH_INTERVAL
+                        && Provider::ALL.into_iter().any(|provider| {
+                            active.has(provider)
+                                && snapshot.get(provider).fetched_at.is_some_and(|fetched| {
+                                    now.duration_since(fetched)
+                                        .is_ok_and(|age| age >= REVEAL_REFRESH_INTERVAL)
+                                })
+                        }))
+            }
+        }
+    }
+}
+
 pub struct Monitor {
     current: Arc<Mutex<Snapshot>>,
     running: Arc<AtomicBool>,
@@ -422,7 +455,7 @@ impl Monitor {
         self.last_active = ActiveProviders::default();
     }
 
-    pub fn refresh(&mut self, force: bool) {
+    pub fn refresh(&mut self, reason: Refresh) {
         if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -432,11 +465,17 @@ impl Monitor {
             self.mark_inactive();
             return;
         }
-        if !force
-            && active == self.last_active
-            && self
-                .last_started
-                .is_some_and(|then| then.elapsed() < REFRESH_INTERVAL)
+        if active == self.last_active
+            && let Some(started) = self.last_started
+            && !reason.due(
+                started.elapsed(),
+                &self
+                    .current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                active,
+                SystemTime::now(),
+            )
         {
             self.running.store(false, Ordering::Release);
             return;
@@ -1398,6 +1437,28 @@ fn parse_codex(value: &Value) -> Vec<Window> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_refresh_requires_stale_active_data_and_respects_retry_interval() {
+        let now = SystemTime::now();
+        let mut active = ActiveProviders::default();
+        active.0[Provider::Codex as usize] = true;
+        let mut snapshot = Snapshot::default();
+        snapshot.providers[Provider::Claude as usize].fetched_at =
+            Some(now - Duration::from_secs(120));
+        let elapsed = Duration::from_secs(120);
+        assert!(!Refresh::Reveal.due(elapsed, &snapshot, active, now));
+
+        snapshot.providers[Provider::Codex as usize].fetched_at =
+            Some(now - Duration::from_secs(59));
+        assert!(!Refresh::Reveal.due(elapsed, &snapshot, active, now));
+        snapshot.providers[Provider::Codex as usize].fetched_at =
+            Some(now - Duration::from_secs(61));
+        assert!(Refresh::Reveal.due(elapsed, &snapshot, active, now));
+        assert!(!Refresh::Reveal.due(Duration::from_secs(59), &snapshot, active, now));
+        assert!(!Refresh::Scheduled.due(elapsed, &snapshot, active, now));
+        assert!(Refresh::Manual.due(Duration::ZERO, &snapshot, active, now));
+    }
     use serde_json::json;
 
     #[test]
