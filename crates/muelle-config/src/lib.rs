@@ -1006,7 +1006,10 @@ mod tests {
             r#"{"menuBarGhost":true,"menuBarBare":true,"menuBarEssentials":true}"#,
         )?;
         assert!(chosen.menu_bar_ghost && chosen.menu_bar_bare && chosen.menu_bar_essentials);
-        assert_eq!(serde_json::from_str::<Config>(&serde_json::to_string(&chosen)?)?, chosen);
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&chosen)?)?,
+            chosen
+        );
         Ok(())
     }
 
