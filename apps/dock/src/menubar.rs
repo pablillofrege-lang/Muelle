@@ -1382,10 +1382,6 @@ impl MenuBar {
     }
 
     /// Ghost bar on or off (see `ghost`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired into the app in the next commit")
-    )]
     pub fn set_ghost(&mut self, ghost: bool) -> Result<()> {
         if self.ghost == ghost {
             return Ok(());

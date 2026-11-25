@@ -325,7 +325,8 @@ impl App {
                 &self.gfx,
                 self.config.ai_usage,
                 self.config.menu_bar_music,
-                self.config.menu_bar_auto_hide,
+                // Hidden from the first frame, or the whole ghost bar flashes.
+                self.config.menu_bar_auto_hide || self.config.menu_bar_ghost,
                 widgets,
             )
             .inspect_err(|error| eprintln!("muelle: barra superior: {error:#}"))
@@ -333,8 +334,11 @@ impl App {
         }
         if let Some(bar) = &mut self.menubar {
             bar.set_clock_target(self.config.menu_bar_clock_target.as_deref());
+            // Ghost first: the other way round, the whole bar would show for
+            // a moment.
             let applied = bar
-                .set_auto_hide(self.config.menu_bar_auto_hide)
+                .set_ghost(self.config.menu_bar_ghost)
+                .and_then(|()| bar.set_auto_hide(self.config.menu_bar_auto_hide))
                 .and_then(|()| bar.set_smart_hide(self.config.menu_bar_smart_hide))
                 .and_then(|()| bar.set_usage_enabled(&self.gfx, self.config.ai_usage))
                 .and_then(|()| bar.set_media_enabled(&self.gfx, self.config.menu_bar_music))

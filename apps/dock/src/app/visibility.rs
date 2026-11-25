@@ -28,6 +28,26 @@ use super::{
     HOVER_OMEGA, millis,
 };
 
+/// Whether the window in front hides the menu bar. The ghost bar hides its
+/// island only for a maximized window on the bar's display, or full screen;
+/// a window merely near the top edge leaves it. Otherwise, intelligent
+/// hiding: any window reaching under the bar covers it.
+/// `front` is the visible rect of the window in front and whether it is
+/// maximized, when it is one of the tracked windows.
+pub(super) fn menu_bar_covered(
+    ghost: bool,
+    smart: bool,
+    fullscreen: bool,
+    front: Option<(RECT, bool)>,
+    bar: RECT,
+) -> bool {
+    if ghost {
+        fullscreen || front.is_some_and(|(rect, maximized)| maximized && rects_overlap(bar, rect))
+    } else {
+        smart && front.is_some_and(|(rect, _)| rects_overlap(bar, rect))
+    }
+}
+
 pub(super) fn rects_overlap(a: RECT, b: RECT) -> bool {
     a.left < a.right
         && a.top < a.bottom
@@ -92,7 +112,7 @@ impl App {
         }
         // From the settings, not the live bar: at startup the dock is placed
         // before the bar exists, and it must not move once the bar appears.
-        if !self.config.menu_bar || self.config.menu_bar_auto_hide {
+        if !self.config.menu_bar || self.config.menu_bar_auto_hide || self.config.menu_bar_ghost {
             return 0;
         }
         primary_monitor()
@@ -126,7 +146,9 @@ impl App {
         // intelligent one while a window covers it (issue #61).
         let enabled = watch_dock
             || (self.menubar.is_some()
-                && (self.config.menu_bar_auto_hide || self.config.menu_bar_smart_hide));
+                && (self.config.menu_bar_auto_hide
+                    || self.config.menu_bar_smart_hide
+                    || self.config.menu_bar_ghost));
         if enabled && self.edge_watch.is_none() {
             self.edge_watch = EdgeWatch::start(self.visual)
                 .inspect_err(|error| {
@@ -312,11 +334,23 @@ impl App {
                 tracker::keep_below(front, strip);
             }
             // Intelligent hiding (issue #61): the same test as the dock's,
-            // against the bar's strip.
-            let covered = self.config.menu_bar_smart_hide
-                && self.windows.iter().any(|window| window.hwnd == front)
-                && tracker::visible_rect(front)
-                    .is_some_and(|rect| rects_overlap(bar.bounds(), rect));
+            // against the bar's strip. The ghost bar asks for a maximized
+            // window instead (see `menu_bar_covered`).
+            let tracked = self.windows.iter().any(|window| window.hwnd == front);
+            let front_rect = tracked
+                .then(|| {
+                    let rect = tracker::visible_rect(front)?;
+                    let maximized = tracker::screen_rect(front).is_some_and(|(_, zoomed)| zoomed);
+                    Some((rect, maximized))
+                })
+                .flatten();
+            let covered = menu_bar_covered(
+                self.config.menu_bar_ghost,
+                self.config.menu_bar_smart_hide,
+                bar_fullscreen,
+                front_rect,
+                bar.bounds(),
+            );
             if let Err(error) = bar.set_covered(&self.gfx, covered) {
                 muelle_shell::log::line(&format!("ocultación inteligente de la barra: {error:#}"));
             }
