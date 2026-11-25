@@ -20,7 +20,7 @@ use crate::{
     strings,
 };
 
-use super::{App, Role};
+use super::{App, Role, visibility::arm_fullscreen_recheck};
 
 pub(super) fn explorer_id() -> String {
     normalize_id(&format!(
@@ -309,8 +309,6 @@ impl App {
         self.update_fullscreen()
     }
 
-    /// Hides the dock while the foreground window covers the entire screen and
-    /// shows it again when it no longer does.
     /// Creates or removes the menu bar to match the settings.
     pub(super) fn apply_menu_bar_setting(&mut self) {
         let widgets = MenuBarWidgets {
@@ -348,8 +346,12 @@ impl App {
                 .and_then(|()| bar.set_media_enabled(&self.gfx, self.config.menu_bar_music))
                 .and_then(|()| bar.set_widgets(&self.gfx, widgets))
                 .and_then(|()| {
-                    let covered = primary_monitor()
-                        .is_some_and(|monitor| tracker::foreground_is_fullscreen(monitor.screen));
+                    let covered = primary_monitor().is_some_and(|monitor| {
+                        tracker::screen_is_covered_by_fullscreen(monitor.screen)
+                    });
+                    if covered {
+                        arm_fullscreen_recheck(self.visual);
+                    }
                     bar.set_visible(!covered)
                 })
                 .and_then(|()| {

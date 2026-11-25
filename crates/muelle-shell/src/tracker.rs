@@ -31,8 +31,9 @@ use windows::{
                 GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
                 IsWindowVisible, IsZoomed, PostMessageW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
                 SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-                SetWindowPos, WINDOWPLACEMENT, WM_CLOSE, WPF_RESTORETOMAXIMIZED, WS_EX_APPWINDOW,
-                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZE, WS_THICKFRAME,
+                SetWindowPos, WINDOW_EX_STYLE, WINDOWPLACEMENT, WM_CLOSE, WPF_RESTORETOMAXIMIZED,
+                WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_THICKFRAME,
             },
         },
     },
@@ -78,20 +79,7 @@ impl WindowTracker {
     /// Optionally includes shell-cloaked windows on other Windows/tiling-WM
     /// workspaces. App-cloaked and inherited-cloak windows remain excluded.
     pub fn list_with_workspaces(&mut self, show_other_workspaces: bool) -> Vec<TrackedWindow> {
-        unsafe extern "system" fn collect(hwnd: HWND, list: LPARAM) -> BOOL {
-            // SAFETY: `list` points to the Vec passed by `list` and remains
-            // alive for the entire synchronous enumeration.
-            unsafe { (*(list.0 as *mut Vec<HWND>)).push(hwnd) };
-            true.into()
-        }
-
-        let mut all: Vec<HWND> = Vec::new();
-        // SAFETY: The Vec pointer remains valid until EnumWindows returns.
-        unsafe {
-            let _ = EnumWindows(Some(collect), LPARAM(&raw mut all as isize));
-        }
-
-        let windows: Vec<TrackedWindow> = all
+        let windows: Vec<TrackedWindow> = top_level_windows()
             .into_iter()
             .filter(|&hwnd| is_app_window(hwnd, show_other_workspaces))
             .filter_map(|hwnd| {
@@ -477,32 +465,123 @@ fn recover_browser_z_order_with(
     }
 }
 
-/// Returns `true` if the foreground window covers the entire `screen`
-/// (for example, video, presentation, or game). The desktop does not count,
-/// and neither does a normally maximized window: its content still starts
-/// below the title bar. Custom-frame apps may retain maximize/resize style
-/// bits in full screen, so measure their content instead of those styles.
-#[must_use]
-pub fn foreground_is_fullscreen(screen: RECT) -> bool {
-    // SAFETY: Read-only queries on the foreground window.
+fn top_level_windows() -> Vec<HWND> {
+    unsafe extern "system" fn collect(hwnd: HWND, list: LPARAM) -> BOOL {
+        // SAFETY: The Vec lives until the synchronous enumeration returns.
+        unsafe { (*(list.0 as *mut Vec<HWND>)).push(hwnd) };
+        true.into()
+    }
+
+    let mut windows: Vec<HWND> = Vec::new();
+    // SAFETY: The callback's Vec pointer remains valid until EnumWindows returns.
     unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_invalid() || is_desktop(hwnd) || is_task_switcher(hwnd) {
-            return false;
+        let _ = EnumWindows(Some(collect), LPARAM(&raw mut windows as isize));
+    }
+    windows
+}
+
+/// Whether full-screen content covers this monitor, even when focus is on
+/// another display. A normally maximized window does not count.
+#[must_use]
+pub fn screen_is_covered_by_fullscreen(screen: RECT) -> bool {
+    // SAFETY: Both queries read handles or IDs without modifying windows.
+    let (front, own_pid) = unsafe { (GetForegroundWindow(), GetCurrentProcessId()) };
+    let foreground = fullscreen_window(front, own_pid);
+    if foreground.can_cover() && fullscreen_owner_chain(front, screen) {
+        return true;
+    }
+    if foreground.intersects(screen) {
+        return false;
+    }
+
+    // A maximized window on another display can have invisible borders on
+    // this one. Select by visible bounds, and stop at the first real window
+    // so a fullscreen window buried under another app cannot hide our UI.
+    let windows = top_level_windows()
+        .into_iter()
+        .take(1024)
+        .map(|hwnd| (hwnd, fullscreen_window(hwnd, own_pid)));
+    top_fullscreen_candidate(screen, windows).is_some_and(|hwnd| fills_screen(hwnd, screen))
+}
+
+#[derive(Default)]
+struct FullscreenCandidate {
+    bounds: Option<RECT>,
+    class: String,
+    ex_style: WINDOW_EX_STYLE,
+    own_process: bool,
+    shell_input_host: bool,
+    empty_frame_host: bool,
+}
+
+impl FullscreenCandidate {
+    fn can_cover(&self) -> bool {
+        let passive_overlay = WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+        self.bounds.is_some()
+            && !self.own_process
+            && !is_desktop_class(&self.class)
+            && !is_task_switcher_class(&self.class)
+            && !matches!(
+                self.class.as_str(),
+                "Shell_SecondaryTrayWnd" | "ForegroundStaging"
+            )
+            && !self.shell_input_host
+            && !self.empty_frame_host
+            && !self.ex_style.contains(WS_EX_TRANSPARENT)
+            && !self.ex_style.contains(passive_overlay)
+    }
+
+    fn intersects(&self, screen: RECT) -> bool {
+        self.bounds.is_some_and(|bounds| {
+            bounds.left.max(screen.left) < bounds.right.min(screen.right)
+                && bounds.top.max(screen.top) < bounds.bottom.min(screen.bottom)
+        })
+    }
+}
+
+fn top_fullscreen_candidate<T>(
+    screen: RECT,
+    mut windows: impl Iterator<Item = (T, FullscreenCandidate)>,
+) -> Option<T> {
+    windows
+        .find(|(_, window)| window.intersects(screen) && window.can_cover())
+        .map(|(id, _)| id)
+}
+
+fn fullscreen_window(hwnd: HWND, own_pid: u32) -> FullscreenCandidate {
+    // SAFETY: Read-only queries. The title-length query is limited to
+    // foreign frame hosts, for which Windows reads the cached caption.
+    unsafe {
+        if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
+            return FullscreenCandidate::default();
         }
-        // A window that is not on screen covers nothing. Right after signing
-        // in, the foreground is often a shell host (Start, Search, the text
-        // input host) whose screen-sized window is hidden or cloaked; taken
-        // for a full-screen app, it kept the dock and the bar hidden.
-        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || is_cloaked(hwnd) {
-            return false;
+        let Some(bounds) = visible_rect(hwnd.0 as isize) else {
+            return FullscreenCandidate::default();
+        };
+        let mut pid = 0;
+        if GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 {
+            return FullscreenCandidate::default();
         }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == GetCurrentProcessId() {
-            return false;
+        let own_process = pid == own_pid;
+        let class = class_name(hwnd);
+        // The text input host can have a screen-sized backing window. Match
+        // the host executable too, since real UWP apps share the class.
+        let shell_input_host = class == "Windows.UI.Core.CoreWindow"
+            && process_image(pid).is_some_and(|image| {
+                let name = image.rsplit('\\').next().unwrap_or_default();
+                name.eq_ignore_ascii_case("explorer.exe")
+                    || name.eq_ignore_ascii_case("TextInputHost.exe")
+            });
+        let empty_frame_host =
+            !own_process && class == FRAME_HOST_CLASS && GetWindowTextLengthW(hwnd) == 0;
+        FullscreenCandidate {
+            bounds: Some(bounds),
+            class,
+            ex_style: WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32),
+            own_process,
+            shell_input_host,
+            empty_frame_host,
         }
-        fullscreen_owner_chain(hwnd, screen)
     }
 }
 
@@ -647,8 +726,12 @@ pub fn caption_button_at(point: POINT, screen: RECT) -> bool {
 /// which share its window class). It covers the screen but is not a
 /// full-screen app.
 pub fn is_task_switcher(hwnd: HWND) -> bool {
+    is_task_switcher_class(&class_name(hwnd))
+}
+
+fn is_task_switcher_class(class: &str) -> bool {
     matches!(
-        class_name(hwnd).as_str(),
+        class,
         "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame"
     )
 }
@@ -698,10 +781,11 @@ fn workspace_cloak_allowed(cloaked: u32, show_other_workspaces: bool) -> bool {
 
 /// The desktop and the (hidden) taskbar: shell windows, not apps.
 pub fn is_desktop(hwnd: HWND) -> bool {
-    matches!(
-        class_name(hwnd).as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd"
-    )
+    is_desktop_class(&class_name(hwnd))
+}
+
+fn is_desktop_class(class: &str) -> bool {
+    matches!(class, "Progman" | "WorkerW" | "Shell_TrayWnd")
 }
 
 fn covers(window: RECT, screen: RECT) -> bool {
@@ -904,6 +988,110 @@ mod tests {
         ] {
             assert!(!workspace_cloak_allowed(flags, false), "flags={flags}");
             assert!(!workspace_cloak_allowed(flags, true), "flags={flags}");
+        }
+    }
+
+    #[test]
+    fn fullscreen_candidate_skips_the_focused_window_on_the_adjacent_monitor() {
+        let primary = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let secondary = RECT {
+            left: -1920,
+            right: 0,
+            ..primary
+        };
+        let windows = [
+            ("focused", fullscreen_candidate(secondary)),
+            ("video", fullscreen_candidate(primary)),
+        ];
+        assert_eq!(
+            top_fullscreen_candidate(primary, windows.into_iter()),
+            Some("video")
+        );
+    }
+
+    #[test]
+    fn fullscreen_candidate_keeps_a_partial_window_above_the_video() {
+        let screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let partial = RECT {
+            left: 100,
+            ..screen
+        };
+        let windows = [
+            ("normal window", fullscreen_candidate(partial)),
+            ("video", fullscreen_candidate(screen)),
+        ];
+        assert_eq!(
+            top_fullscreen_candidate(screen, windows.into_iter()),
+            Some("normal window")
+        );
+    }
+
+    #[test]
+    fn fullscreen_candidate_ignores_shell_surfaces_and_passive_overlays() {
+        let screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let excluded = [
+            FullscreenCandidate {
+                bounds: None,
+                ..fullscreen_candidate(screen)
+            },
+            FullscreenCandidate {
+                own_process: true,
+                ..fullscreen_candidate(screen)
+            },
+            FullscreenCandidate {
+                ex_style: WS_EX_TRANSPARENT,
+                ..fullscreen_candidate(screen)
+            },
+            FullscreenCandidate {
+                ex_style: WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                ..fullscreen_candidate(screen)
+            },
+            FullscreenCandidate {
+                class: "Windows.UI.Core.CoreWindow".into(),
+                shell_input_host: true,
+                ..fullscreen_candidate(screen)
+            },
+            FullscreenCandidate {
+                class: FRAME_HOST_CLASS.into(),
+                empty_frame_host: true,
+                ..fullscreen_candidate(screen)
+            },
+        ];
+        let shell_windows = [
+            "Progman",
+            "WorkerW",
+            "XamlExplorerHostIslandWindow",
+            "MultitaskingViewFrame",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+        ]
+        .map(|class| FullscreenCandidate {
+            class: class.into(),
+            ..fullscreen_candidate(screen)
+        });
+        let windows = excluded.into_iter().chain(shell_windows).enumerate();
+        assert_eq!(top_fullscreen_candidate(screen, windows), None);
+    }
+
+    fn fullscreen_candidate(bounds: RECT) -> FullscreenCandidate {
+        FullscreenCandidate {
+            bounds: Some(bounds),
+            ..Default::default()
         }
     }
 
