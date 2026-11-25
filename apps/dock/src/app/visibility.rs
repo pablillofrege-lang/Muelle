@@ -11,7 +11,7 @@ use muelle_shell::{
     taskbar, tracker,
 };
 use windows::Win32::{
-    Foundation::{POINT, RECT},
+    Foundation::{HWND, POINT, RECT},
     UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON},
         WindowsAndMessaging::{GetCursorPos, KillTimer, SetTimer},
@@ -57,6 +57,12 @@ pub(super) fn rects_overlap(a: RECT, b: RECT) -> bool {
         && b.left < a.right
         && a.top < b.bottom
         && b.top < a.bottom
+}
+
+pub(super) fn arm_fullscreen_recheck(visual: HWND) {
+    // SAFETY: This is the dock window on this UI thread, also used for
+    // coalescing foreground location changes with the same timer ID.
+    unsafe { SetTimer(Some(visual), FULLSCREEN_TIMER, FULLSCREEN_RECHECK_MS, None) };
 }
 
 impl App {
@@ -235,7 +241,7 @@ impl App {
             || !self.flights.is_empty()
             || mouse_down
             || monitor_at(point).is_none_or(|monitor| monitor.screen != screen)
-            || tracker::foreground_is_fullscreen(screen)
+            || tracker::screen_is_covered_by_fullscreen(screen)
         {
             return Ok(());
         }
@@ -314,12 +320,12 @@ impl App {
         let Some(monitor) = primary_monitor() else {
             return Ok(());
         };
-        let bar_fullscreen = tracker::foreground_is_fullscreen(monitor.screen);
+        let bar_fullscreen = tracker::screen_is_covered_by_fullscreen(monitor.screen);
         let fullscreen = self.dock_monitor().map_or(bar_fullscreen, |dock| {
             if dock.screen == monitor.screen {
                 bar_fullscreen
             } else {
-                tracker::foreground_is_fullscreen(dock.screen)
+                tracker::screen_is_covered_by_fullscreen(dock.screen)
             }
         });
         if let Some(bar) = &mut self.menubar {
@@ -357,16 +363,8 @@ impl App {
         }
         // Windows sometimes omits the shell event when a full-screen app
         // closes or switches desktops. Poll only while our UI is hidden.
-        // SAFETY: `self.input` is a live window on this UI thread.
-        unsafe {
-            if fullscreen || (bar_fullscreen && self.menubar.is_some()) {
-                SetTimer(
-                    Some(self.input),
-                    FULLSCREEN_TIMER,
-                    FULLSCREEN_RECHECK_MS,
-                    None,
-                );
-            }
+        if fullscreen || (bar_fullscreen && self.menubar.is_some()) {
+            arm_fullscreen_recheck(self.visual);
         }
         if fullscreen != self.fullscreen {
             muelle_shell::log::line(&format!(
@@ -395,7 +393,7 @@ impl App {
         if !fullscreen && (!bar_fullscreen || self.menubar.is_none()) {
             // SAFETY: This UI thread owns the timer.
             unsafe {
-                let _ = KillTimer(Some(self.input), FULLSCREEN_TIMER);
+                let _ = KillTimer(Some(self.visual), FULLSCREEN_TIMER);
             }
         }
         self.update_smart_hiding()?;
