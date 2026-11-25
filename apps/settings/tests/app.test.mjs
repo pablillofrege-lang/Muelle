@@ -231,7 +231,8 @@ test("retired Windows status-item overrides expose no controls and create no sav
       assert.deepEqual(controls.map((node) => node.props.label), [texts[language].menuBarShow,
         texts[language].menuBarMusic, texts[language].aiUsage,
         texts[language].accessoryBattery, texts[language].menuBarSystemMonitor,
-        texts[language].menuBarNotifications]);
+        texts[language].menuBarNotifications, texts[language].menuBarBare,
+        texts[language].menuBarEssentials]);
       view.fire(60);
       await settle();
       assert.deepEqual(view.calls, []);
@@ -378,7 +379,7 @@ test("the mascot is Claude's crab unless the cat is chosen, and only while it is
   } finally { unmount(); }
 });
 
-test("menu bar visibility is one choice of three, like the dock's", async () => {
+test("menu bar visibility is one choice of four, like the dock's plus ghost", async () => {
   const view = fixture("menubar");
   const unmount = await view.mount();
   try {
@@ -389,7 +390,22 @@ test("menu bar visibility is one choice of three, like the dock's", async () => 
     view.change(texts.en.menuBarHidingMode, "automatic");
     view.fire(60);
     await settle();
-    assert.deepEqual(view.calls, [{ menuBarAutoHide: true, menuBarSmartHide: false }]);
+    assert.deepEqual(view.calls, [{ menuBarAutoHide: true, menuBarSmartHide: false, menuBarGhost: false }]);
+  } finally { unmount(); }
+});
+
+test("ghost mode is a fourth visibility choice and both new switches save", async () => {
+  const view = fixture("menubar");
+  const unmount = await view.mount();
+  try {
+    view.change(texts.en.menuBarHidingMode, "ghost");
+    view.change(texts.en.menuBarBare, true);
+    view.change(texts.en.menuBarEssentials, true);
+    view.fire(60);
+    await settle();
+    assert.deepEqual(view.calls, [{ menuBarAutoHide: false, menuBarSmartHide: false,
+      menuBarGhost: true, menuBarBare: true, menuBarEssentials: true }]);
+    assert.equal(texts.es.menuBarHidingGhost, "Fantasma (solo la isla)");
   } finally { unmount(); }
 });
 

@@ -317,6 +317,8 @@ impl App {
             island_style: self.config.menu_bar_island_style,
             notifications: self.config.menu_bar_notifications,
             system_monitor: self.config.menu_bar_system_monitor,
+            essentials: self.config.menu_bar_essentials,
+            bare: self.config.menu_bar_bare,
         };
         if !self.config.menu_bar {
             self.menubar = None;
@@ -325,7 +327,8 @@ impl App {
                 &self.gfx,
                 self.config.ai_usage,
                 self.config.menu_bar_music,
-                self.config.menu_bar_auto_hide,
+                // Hidden from the first frame, or the whole ghost bar flashes.
+                self.config.menu_bar_auto_hide || self.config.menu_bar_ghost,
                 widgets,
             )
             .inspect_err(|error| eprintln!("muelle: barra superior: {error:#}"))
@@ -333,9 +336,14 @@ impl App {
         }
         if let Some(bar) = &mut self.menubar {
             bar.set_clock_target(self.config.menu_bar_clock_target.as_deref());
+            // All three at once: one at a time, a switch between two modes
+            // would pass through "always visible" and resize maximized windows.
             let applied = bar
-                .set_auto_hide(self.config.menu_bar_auto_hide)
-                .and_then(|()| bar.set_smart_hide(self.config.menu_bar_smart_hide))
+                .set_hiding(
+                    self.config.menu_bar_ghost,
+                    self.config.menu_bar_auto_hide,
+                    self.config.menu_bar_smart_hide,
+                )
                 .and_then(|()| bar.set_usage_enabled(&self.gfx, self.config.ai_usage))
                 .and_then(|()| bar.set_media_enabled(&self.gfx, self.config.menu_bar_music))
                 .and_then(|()| bar.set_widgets(&self.gfx, widgets))

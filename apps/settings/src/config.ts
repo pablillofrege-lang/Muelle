@@ -9,6 +9,8 @@ export type DockDensity = "compact" | "normal" | "spacious";
 export type DockAutoHideSpeed = "smooth" | "normal" | "fast";
 /** View of the existing two settings; saved atomically as a mutually exclusive pair. */
 export type DockHidingMode = "visible" | "automatic" | "intelligent";
+/** The menu bar also has the ghost bar: at rest only the island shows. */
+export type MenuBarHidingMode = DockHidingMode | "ghost";
 /** `auto` follows Windows' light or dark mode. */
 export type Appearance = "auto" | "light" | "dark" | "frosted" | "clear" | "liquidGlass";
 
@@ -46,6 +48,12 @@ export interface Config {
   menuBarClockTarget: string | null;
   accessoryBattery: boolean;
   menuBarSystemMonitor?: boolean;
+  /** At rest only the island shows; the top edge reveals the rest. */
+  menuBarGhost?: boolean;
+  /** No strip behind the bar: white text and icons with a dark halo. */
+  menuBarBare?: boolean;
+  /** Hides network speed and the Windows shell buttons. */
+  menuBarEssentials?: boolean;
   showIndicators: boolean;
   showRecents: boolean;
   bounceOnOpen: boolean;

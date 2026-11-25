@@ -114,6 +114,19 @@ pub struct Config {
     /// default: off, nothing is sampled; on, every 2 s only while the bar
     /// is on screen.
     pub menu_bar_system_monitor: bool,
+    /// Ghost bar: at rest only the island (music and AI usage) shows, and the
+    /// rest of the bar appears when the pointer reaches the top edge. Off by
+    /// default: off, the bar follows `menu_bar_auto_hide` and
+    /// `menu_bar_smart_hide` as always.
+    pub menu_bar_ghost: bool,
+    /// No strip behind the bar: white text and icons with a dark halo, right
+    /// on the wallpaper, and an opaque black island. Off by default: off, the
+    /// bar keeps its themed background.
+    pub menu_bar_bare: bool,
+    /// Only the essentials in the bar: no network speed, search, Task View,
+    /// widgets, hidden-icons arrow or notifications bell. Off by default: off,
+    /// every chosen item shows.
+    pub menu_bar_essentials: bool,
     /// Opt-in peripheral monitoring. Off means no accessory reader or queries.
     pub accessory_battery: bool,
     /// The dot under apps that have windows open.
@@ -385,6 +398,9 @@ impl Default for Config {
             menu_bar_island_style: IslandStyle::Notch,
             menu_bar_notifications: false,
             menu_bar_system_monitor: false,
+            menu_bar_ghost: false,
+            menu_bar_bare: false,
+            menu_bar_essentials: false,
             menu_bar_clock_target: None,
             accessory_battery: false,
             show_indicators: true,
@@ -977,6 +993,23 @@ mod tests {
         assert!(!older.menu_bar_system_monitor);
         let chosen: Config = serde_json::from_str(r#"{"menuBarSystemMonitor":true}"#)?;
         assert!(chosen.menu_bar_system_monitor);
+        Ok(())
+    }
+
+    #[test]
+    fn the_fork_menu_bar_options_are_off_unless_chosen() -> Result<(), serde_json::Error> {
+        let fresh = Config::default();
+        assert!(!fresh.menu_bar_ghost && !fresh.menu_bar_bare && !fresh.menu_bar_essentials);
+        let older: Config = serde_json::from_str("{}")?;
+        assert!(!older.menu_bar_ghost && !older.menu_bar_bare && !older.menu_bar_essentials);
+        let chosen: Config = serde_json::from_str(
+            r#"{"menuBarGhost":true,"menuBarBare":true,"menuBarEssentials":true}"#,
+        )?;
+        assert!(chosen.menu_bar_ghost && chosen.menu_bar_bare && chosen.menu_bar_essentials);
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&chosen)?)?,
+            chosen
+        );
         Ok(())
     }
 

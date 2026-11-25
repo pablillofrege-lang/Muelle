@@ -45,7 +45,10 @@ use windows::{
     },
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM},
-        Graphics::Dwm::{DWMWA_USE_HOSTBACKDROPBRUSH, DwmSetWindowAttribute},
+        Graphics::{
+            Dwm::{DWMWA_USE_HOSTBACKDROPBRUSH, DwmSetWindowAttribute},
+            Gdi::{CreateRectRgn, SetWindowRgn},
+        },
         System::{
             LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime,
             WinRT::Composition::ICompositorDesktopInterop,
@@ -210,6 +213,76 @@ pub struct MenuBarWidgets {
     pub notifications: bool,
     /// CPU, memory and network speed (`Config::menu_bar_system_monitor`).
     pub system_monitor: bool,
+    /// Only the essentials (`Config::menu_bar_essentials`): no network
+    /// speed and none of the Windows shell buttons (see `essential`).
+    pub essentials: bool,
+    /// No background (`Config::menu_bar_bare`): no strip behind the bar,
+    /// white text and icons with a dark halo, and an opaque black island.
+    pub bare: bool,
+}
+
+/// The halo under text and icons without a background: (blur, Y offset,
+/// alpha of the black), in logical pixels. A tight layer and a wide one.
+const HALO: [(f32, f32, u8); 2] = [(3.0, 1.0, 230), (12.0, 0.0, 115)];
+
+/// The island without a background: opaque, near black.
+const BARE_ISLAND: Color = Color {
+    A: 255,
+    R: 4,
+    G: 7,
+    B: 6,
+};
+
+/// The bar's background fills: none without a background, even without
+/// transparency, where the bar is otherwise solid.
+fn strip_fills(gfx: &Gfx, look: &Look) -> Result<Vec<CompositionBrush>> {
+    if look.widgets.bare {
+        return Ok(Vec::new());
+    }
+    Theme::for_bar(appearance::Look {
+        material: look.material,
+        light: look.light,
+        glass: look.glass,
+    })
+    .fills(gfx)
+}
+
+/// Dark shadows shaped like the item (`mask`), under it, so white text and
+/// icons stay legible on any wallpaper.
+fn add_halo(
+    c: &Compositor,
+    layers: &VisualCollection,
+    mask: &CompositionBrush,
+    size: Vector2,
+    offset: Vector3,
+    scale: f32,
+) -> Result<()> {
+    for (blur, lift, alpha) in HALO {
+        let shadow = c.CreateDropShadow()?;
+        shadow.SetMask(mask)?;
+        shadow.SetBlurRadius(blur * scale)?;
+        shadow.SetOffset(Vector3::new(0.0, (lift * scale).round(), 0.0))?;
+        shadow.SetColor(rgba(0, 0, 0, alpha))?;
+        let host = c.CreateSpriteVisual()?;
+        host.SetSize(size)?;
+        host.SetOffset(offset)?;
+        host.SetShadow(&shadow)?;
+        layers.InsertAtTop(&host)?;
+    }
+    Ok(())
+}
+
+/// What "Only the essentials" keeps: status and the clock, not the buttons
+/// that open Windows' own shell surfaces.
+fn essential(action: Action) -> bool {
+    !matches!(
+        action,
+        Action::Notifications
+            | Action::Search
+            | Action::TaskView
+            | Action::Widgets
+            | Action::HiddenIcons
+    )
 }
 
 impl Default for MenuBarWidgets {
@@ -218,6 +291,8 @@ impl Default for MenuBarWidgets {
             island_style: IslandStyle::Notch,
             notifications: false,
             system_monitor: false,
+            essentials: false,
+            bare: false,
         }
     }
 }
@@ -324,6 +399,58 @@ impl Span {
     fn width(self) -> f32 {
         self.right - self.left
     }
+}
+
+/// How much of the bar is on screen. With the ghost bar, at rest only the
+/// island shows (`IslandOnly`); the top edge reveals the rest (`Full`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presence {
+    Hidden,
+    IslandOnly,
+    Full,
+}
+
+fn presence(
+    visible: bool,
+    auto_hide: bool,
+    revealed: bool,
+    ghost: bool,
+    covered: bool,
+    has_island: bool,
+) -> Presence {
+    if !visible {
+        Presence::Hidden
+    } else if !auto_hide || revealed {
+        Presence::Full
+    } else if ghost && !covered && has_island {
+        Presence::IslandOnly
+    } else {
+        Presence::Hidden
+    }
+}
+
+/// Whether the pointer must be polled: while a popup is open, and while an
+/// auto-hiding bar shows more than the island at rest. Only the island
+/// resting arms nothing, so the ghost bar costs no CPU while idle.
+fn needs_pointer_timer(
+    on_screen: bool,
+    presence: Presence,
+    auto_hide: bool,
+    panel_open: bool,
+    hiding: bool,
+) -> bool {
+    on_screen && (panel_open || (auto_hide && (presence != Presence::IslandOnly || hiding)))
+}
+
+/// The window region that keeps only the island, in window pixels, so clicks
+/// along the rest of the top edge reach the windows below.
+fn ghost_region(triggers: Span, bar_height: f32) -> Option<RECT> {
+    (triggers.width() > 0.0).then(|| RECT {
+        left: triggers.left.floor() as i32,
+        top: 0,
+        right: triggers.right.ceil() as i32,
+        bottom: bar_height.round() as i32,
+    })
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -503,6 +630,18 @@ pub struct MenuBar {
     _target: DesktopWindowTarget,
     /// Stable parent: content refreshes must not restart reveal animations.
     surface: ContainerVisual,
+    /// Stable children of `surface`: the strip (fills, app name, status
+    /// items) and the island above it. The ghost bar animates only the strip.
+    strip_layer: ContainerVisual,
+    island_layer: ContainerVisual,
+    /// Ghost bar (`Config::menu_bar_ghost`): it auto-hides, but hidden, the
+    /// island stays on screen.
+    ghost: bool,
+    /// The window region set now, to call `SetWindowRgn` only on change.
+    window_region: Option<RECT>,
+    /// How many times `place` reserved the strip (tests watch mode changes).
+    #[cfg(test)]
+    strip_reservations: usize,
     appbar: Option<AppBar>,
     app_name: String,
     look: Option<Look>,
@@ -1188,6 +1327,10 @@ impl MenuBar {
         system::set_window_transitions(hwnd.0 as isize, false);
         let surface = gfx.compositor.CreateContainerVisual()?;
         target.SetRoot(&surface)?;
+        let strip_layer = gfx.compositor.CreateContainerVisual()?;
+        let island_layer = gfx.compositor.CreateContainerVisual()?;
+        surface.Children()?.InsertAtTop(&strip_layer)?;
+        surface.Children()?.InsertAtTop(&island_layer)?;
         let mut bar = Self {
             accessories: None,
             accessories_enabled: false,
@@ -1198,6 +1341,12 @@ impl MenuBar {
             hwnd,
             _target: target,
             surface,
+            strip_layer,
+            island_layer,
+            ghost: false,
+            window_region: None,
+            #[cfg(test)]
+            strip_reservations: 0,
             appbar: AppBar::register(hwnd, APPBAR_CALLBACK),
             app_name: String::new(),
             look: None,
@@ -1292,26 +1441,72 @@ impl MenuBar {
         self.place()
     }
 
+    #[cfg(test)]
     pub fn set_auto_hide(&mut self, auto_hide: bool) -> Result<()> {
-        if self.hide_setting == auto_hide {
-            return Ok(());
-        }
-        self.hide_setting = auto_hide;
-        self.apply_hiding()
+        self.set_hiding(self.ghost, auto_hide, self.smart)
     }
 
     /// Intelligent hiding on or off (see `smart`).
+    #[cfg(test)]
     pub fn set_smart_hide(&mut self, smart: bool) -> Result<()> {
-        if self.smart == smart {
+        self.set_hiding(self.ghost, self.hide_setting, smart)
+    }
+
+    /// The three ways the bar hides, set together and applied once: one at a
+    /// time, a switch between two of them passed through "always visible",
+    /// reserving the strip (resizing maximized windows) and showing the bar
+    /// for a moment.
+    pub fn set_hiding(&mut self, ghost: bool, auto_hide: bool, smart: bool) -> Result<()> {
+        if (self.ghost, self.hide_setting, self.smart) == (ghost, auto_hide, smart) {
             return Ok(());
         }
+        if self.ghost != ghost {
+            // Whichever layer animated so far starts over in its resting state.
+            self.animation_epoch = self.animation_epoch.wrapping_add(1);
+            self.exit_animation = None;
+            for layer in [&self.strip_layer, &self.surface] {
+                layer.StopAnimation(h!("Offset.Y"))?;
+                layer.StopAnimation(h!("Opacity"))?;
+                layer.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
+                layer.SetOpacity(1.0)?;
+            }
+        }
+        self.ghost = ghost;
+        self.hide_setting = auto_hide;
         self.smart = smart;
         self.apply_hiding()
     }
 
+    /// Ghost bar on or off (see `ghost`).
+    #[cfg(test)]
+    pub fn set_ghost(&mut self, ghost: bool) -> Result<()> {
+        self.set_hiding(ghost, self.hide_setting, self.smart)
+    }
+
+    fn presence_now(&self) -> Presence {
+        presence(
+            self.visible,
+            self.auto_hide,
+            self.revealed,
+            self.ghost,
+            self.covered,
+            self.triggers_span.width() > 0.0,
+        )
+    }
+
+    /// What slides and fades when the bar hides: the strip alone with the
+    /// ghost bar, so the island stays put; the whole bar otherwise.
+    fn motion_layer(&self) -> &ContainerVisual {
+        if self.ghost {
+            &self.strip_layer
+        } else {
+            &self.surface
+        }
+    }
+
     /// A change of setting applies at once, without animation.
     fn apply_hiding(&mut self) -> Result<()> {
-        self.auto_hide = self.hide_setting || (self.smart && self.covered);
+        self.auto_hide = self.ghost || self.hide_setting || (self.smart && self.covered);
         self.revealed = false;
         self.hide_until = None;
         // The reserved strip may change even when hiding does not.
@@ -1322,7 +1517,7 @@ impl MenuBar {
     /// are maximized below it: only while it neither auto-hides nor hides
     /// intelligently.
     fn reserves(&self) -> bool {
-        !self.hide_setting && !self.smart
+        !self.hide_setting && !self.smart && !self.ghost
     }
 
     /// Where the bar is on screen, shown or not.
@@ -1339,6 +1534,11 @@ impl MenuBar {
             return Ok(());
         }
         self.covered = covered;
+        if self.ghost {
+            // The ghost bar always auto-hides: covering it only takes the
+            // island away, and a revealed bar stays until the pointer leaves.
+            return self.place();
+        }
         if !self.smart || self.hide_setting {
             return Ok(());
         }
@@ -1368,9 +1568,9 @@ impl MenuBar {
         self.place()?;
         if was_hidden && self.visible && system::animations_enabled() {
             // `place` showed it in its final state; slide it in from there.
-            self.surface
+            self.motion_layer()
                 .SetOffset(Vector3::new(0.0, -self.reveal_lift(), 0.0))?;
-            self.surface.SetOpacity(0.0)?;
+            self.motion_layer().SetOpacity(0.0)?;
             if let Err(error) = self.animate_visibility(gfx, true) {
                 muelle_shell::log::line(&format!("animación de barra superior: {error:#}"));
                 self.reset_surface()?;
@@ -1475,9 +1675,9 @@ impl MenuBar {
         if !animated {
             self.reset_surface()?;
         } else if inside && !was_hiding {
-            self.surface
+            self.motion_layer()
                 .SetOffset(Vector3::new(0.0, -self.reveal_lift(), 0.0))?;
-            self.surface.SetOpacity(0.0)?;
+            self.motion_layer().SetOpacity(0.0)?;
         }
         self.place()?;
         if animated && let Err(error) = self.animate_visibility(gfx, inside) {
@@ -1529,8 +1729,8 @@ impl MenuBar {
             .then(|| c.CreateScopedBatch(CompositionBatchTypes::Animation))
             .transpose()?;
         let started = (|| -> Result<()> {
-            self.surface.StartAnimation(h!("Offset.Y"), &slide)?;
-            self.surface.StartAnimation(h!("Opacity"), &fade)?;
+            self.motion_layer().StartAnimation(h!("Offset.Y"), &slide)?;
+            self.motion_layer().StartAnimation(h!("Opacity"), &fade)?;
             Ok(())
         })();
         if let Some(batch) = batch {
@@ -1563,19 +1763,20 @@ impl MenuBar {
     }
 
     fn park_surface(&self) -> Result<()> {
-        self.surface.StopAnimation(h!("Offset.Y"))?;
-        self.surface.StopAnimation(h!("Opacity"))?;
-        self.surface
-            .SetOffset(Vector3::new(0.0, -self.reveal_lift(), 0.0))?;
-        self.surface.SetOpacity(0.0)?;
+        let layer = self.motion_layer();
+        layer.StopAnimation(h!("Offset.Y"))?;
+        layer.StopAnimation(h!("Opacity"))?;
+        layer.SetOffset(Vector3::new(0.0, -self.reveal_lift(), 0.0))?;
+        layer.SetOpacity(0.0)?;
         Ok(())
     }
 
     fn reset_surface(&self) -> Result<()> {
-        self.surface.StopAnimation(h!("Offset.Y"))?;
-        self.surface.StopAnimation(h!("Opacity"))?;
-        self.surface.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
-        self.surface.SetOpacity(1.0)?;
+        let layer = self.motion_layer();
+        layer.StopAnimation(h!("Offset.Y"))?;
+        layer.StopAnimation(h!("Opacity"))?;
+        layer.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
+        layer.SetOpacity(1.0)?;
         Ok(())
     }
 
@@ -1711,21 +1912,42 @@ impl MenuBar {
             self.hide_until = None;
             self.exit_animation = None;
         }
-        let on_screen = self.visible && (!hidden || self.hide_until.is_some());
+        let presence = self.presence_now();
+        let hiding = self.hide_until.is_some();
+        let on_screen = self.visible && (presence != Presence::Hidden || hiding);
+        let full = presence == Presence::Full;
         if let Some(monitor) = &self.accessories {
-            monitor.set_visible(on_screen && !hidden);
+            monitor.set_visible(full);
         }
-        self.sync_monitor(self.visible && !hidden);
+        self.sync_monitor(full);
         if !on_screen {
             // Keep the hidden tree transparent. Restoring opacity here races
             // HWND hiding and flashes its last opaque frame on the next show.
             self.park_surface()?;
+            if self.ghost {
+                self.surface.SetOpacity(0.0)?;
+            }
+        } else if self.ghost {
+            self.surface.StopAnimation(h!("Offset.Y"))?;
+            self.surface.StopAnimation(h!("Opacity"))?;
+            self.surface.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
+            self.surface.SetOpacity(1.0)?;
+            if presence == Presence::IslandOnly && !hiding {
+                self.park_surface()?;
+            }
         } else if !self.auto_hide {
             self.reset_surface()?;
         }
+        let region = (on_screen && presence == Presence::IslandOnly && !hiding)
+            .then(|| ghost_region(self.triggers_span, bar_height as f32))
+            .flatten();
         // An auto-hiding or intelligent bar leaves the whole screen to the
         // windows.
         let strip = if self.reserves() { bar_height } else { 0 };
+        #[cfg(test)]
+        if strip > 0 {
+            self.strip_reservations += 1;
+        }
         if let Some(appbar) = &mut self.appbar {
             appbar.reserve(Edge::Top, bounds, strip);
         }
@@ -1749,7 +1971,21 @@ impl MenuBar {
                 self.visual_height,
                 SWP_NOACTIVATE | show,
             )?;
-            if on_screen && (self.auto_hide || self.panel.is_some()) {
+            if region != self.window_region {
+                // After a successful call the system owns the region: it is
+                // not deleted here.
+                let handle = region.map(|r| CreateRectRgn(r.left, r.top, r.right, r.bottom));
+                if SetWindowRgn(self.hwnd, handle, true) != 0 {
+                    self.window_region = region;
+                }
+            }
+            if needs_pointer_timer(
+                on_screen,
+                presence,
+                self.auto_hide,
+                self.panel.is_some(),
+                hiding,
+            ) {
                 // TrackMouseEvent may report a leave immediately after showing
                 // a window. Check real geometry while revealed, including if
                 // no further WM_MOUSEMOVE reaches this window.
@@ -2066,8 +2302,7 @@ impl MenuBar {
             if let Some(usage) = &mut self.usage {
                 usage.mark_inactive();
             }
-        } else if self.visible
-            && (!self.auto_hide || self.revealed)
+        } else if self.presence_now() != Presence::Hidden
             && let Some(usage) = &mut self.usage
         {
             usage.refresh(false);
@@ -2082,7 +2317,9 @@ impl MenuBar {
             screen: monitor.screen,
             scale: monitor.scale,
             material: appearance.material,
-            light: appearance.light,
+            // Without a background the ink is white and the island dark,
+            // like its popups, whatever the Windows theme.
+            light: appearance.light && !self.widgets.bare,
             glass: appearance.glass,
             app_name: self.app_name.clone(),
             clock: system::clock_text(),
@@ -2171,11 +2408,22 @@ impl MenuBar {
                 },
             )
         };
+        // Without network speed the lines stay empty, so a changing speed
+        // does not redraw the bar.
+        let essentials = self.widgets.essentials;
         Some([
             share("CPU", reading.cpu),
             share("RAM", reading.memory),
-            speed('↑', reading.up),
-            speed('↓', reading.down),
+            if essentials {
+                String::new()
+            } else {
+                speed('↑', reading.up)
+            },
+            if essentials {
+                String::new()
+            } else {
+                speed('↓', reading.down)
+            },
         ])
     }
 
@@ -2248,9 +2496,12 @@ impl MenuBar {
     /// where it happens, or `None` when the bar does not show now.
     pub fn take_cue(&mut self) -> Option<(mascot::Act, Option<POINT>)> {
         let (act, x) = self.cue.take()?;
+        // The moment sits under the island, on screen also while only the
+        // island shows.
+        let island_shown = self.presence_now() != Presence::Hidden;
         Some((
             act,
-            self.shown().then_some(POINT {
+            island_shown.then_some(POINT {
                 x,
                 y: self.bounds.bottom,
             }),
@@ -2356,14 +2607,17 @@ impl MenuBar {
             Y: visual_height,
         })?;
         let layers = root.Children()?;
+        // The island has its own root, so the ghost bar can hide the strip
+        // while the island stays.
+        let island_root = c.CreateContainerVisual()?;
+        island_root.SetSize(Vector2 {
+            X: width,
+            Y: visual_height,
+        })?;
+        let island_layers = island_root.Children()?;
         // Without transparency the bar is solid, as macOS draws it with
         // "Reduce transparency".
-        let fills = Theme::for_bar(appearance::Look {
-            material: look.material,
-            light: look.light,
-            glass: look.glass,
-        })
-        .fills(gfx)?;
+        let fills = strip_fills(gfx, look)?;
         for brush in &fills {
             let fill = c.CreateSpriteVisual()?;
             fill.SetSize(Vector2 {
@@ -2383,12 +2637,17 @@ impl MenuBar {
                 X: item.width,
                 Y: item.height,
             })?;
-            visual.SetOffset(Vector3 {
+            let offset = Vector3 {
                 X: left.round(),
                 Y: ((height - item.height) / 2.0).round(),
                 Z: 0.0,
-            })?;
+            };
+            visual.SetOffset(offset)?;
             visual.SetBrush(&item.brush)?;
+            if look.widgets.bare {
+                let size = Vector2::new(item.width, item.height);
+                add_halo(c, layers, &item.brush.cast()?, size, offset, scale)?;
+            }
             layers.InsertAtTop(&visual)?;
             Ok(visual)
         };
@@ -2414,8 +2673,11 @@ impl MenuBar {
         let status = look.status;
         let symbol = |layers: &[(char, f32)]| gfx.glyph_brush(layers, scale, ink);
         let mut items: Vec<(LabelBrush, Action)> = Vec::new();
+        // Checked at each push, not filtered afterwards: the battery and
+        // accessory labels remember indexes into `items`.
+        let wanted = |action: Action| !look.widgets.essentials || essential(action);
         // The notification bell, when chosen, takes the very end of the bar.
-        if look.widgets.notifications {
+        if look.widgets.notifications && wanted(Action::Notifications) {
             items.push((
                 symbol(&[(glyph::NOTIFICATIONS, 1.0)])?,
                 Action::Notifications,
@@ -2437,7 +2699,7 @@ impl MenuBar {
                 items.push((symbol(&[(glyph, 1.0)])?, action));
             }
         }
-        if status.buttons.search {
+        if status.buttons.search && wanted(Action::Search) {
             items.push((symbol(&[(glyph::SEARCH, 1.0)])?, Action::Search));
         }
         if status.bluetooth_on {
@@ -2500,11 +2762,13 @@ impl MenuBar {
         }
         // The notification area (antivirus, OneDrive, apps in the background)
         // lives only in the hidden taskbar; this arrow opens its flyout.
-        items.push((symbol(&[(glyph::HIDDEN_ICONS, 1.0)])?, Action::HiddenIcons));
-        if status.buttons.task_view {
+        if wanted(Action::HiddenIcons) {
+            items.push((symbol(&[(glyph::HIDDEN_ICONS, 1.0)])?, Action::HiddenIcons));
+        }
+        if status.buttons.task_view && wanted(Action::TaskView) {
             items.push((symbol(&[(glyph::TASK_VIEW, 1.0)])?, Action::TaskView));
         }
-        if status.buttons.widgets {
+        if status.buttons.widgets && wanted(Action::Widgets) {
             items.push((symbol(&[(glyph::WIDGETS, 1.0)])?, Action::Widgets));
         }
         for (index, (item, action)) in items.iter().enumerate() {
@@ -2531,7 +2795,13 @@ impl MenuBar {
         // The system monitor (issue #64), left of the status icons: two
         // small stacked columns, CPU over memory, then upload over download.
         if let Some(lines) = &look.monitor {
-            let brushes = lines
+            // "Only the essentials" keeps CPU over memory, without speeds.
+            let columns: &[usize] = if look.widgets.essentials {
+                &[0]
+            } else {
+                &[1, 0]
+            };
+            let brushes = lines[..columns.len() * 2]
                 .iter()
                 .map(|line| gfx.text_brush_sized(line, scale, MONITOR_FONT, false, ink))
                 .collect::<Result<Vec<_>>>()?;
@@ -2545,7 +2815,7 @@ impl MenuBar {
             let widths = self.monitor_widths.1;
             let zone_right = right;
             let mut left = right;
-            for column in [1, 0] {
+            for &column in columns {
                 left -= widths[column];
                 for (row, brush) in brushes[column * 2..column * 2 + 2].iter().enumerate() {
                     let top = if row == 0 {
@@ -2558,12 +2828,17 @@ impl MenuBar {
                         X: brush.width,
                         Y: brush.height,
                     })?;
-                    visual.SetOffset(Vector3 {
+                    let offset = Vector3 {
                         X: left.round(),
                         Y: top.round(),
                         Z: 0.0,
-                    })?;
+                    };
+                    visual.SetOffset(offset)?;
                     visual.SetBrush(&brush.brush)?;
+                    if look.widgets.bare {
+                        let size = Vector2::new(brush.width, brush.height);
+                        add_halo(c, &layers, &brush.brush.cast()?, size, offset, scale)?;
+                    }
                     layers.InsertAtTop(&visual)?;
                 }
                 if column == 1 {
@@ -2581,7 +2856,7 @@ impl MenuBar {
         self.usage_viewport = None;
         self.triggers_span = Span::default();
         self.panel_span = Span::default();
-        self.draw_island(gfx, look, &layers, width, height, left_end, right)?;
+        self.draw_island(gfx, look, &island_layers, width, height, left_end, right)?;
         if let Some(drag) = self.volume_drag {
             let new_span = self.island_hits.iter().find_map(|hit| match hit.action {
                 IslandAction::Volume(span) => Some(span),
@@ -2595,9 +2870,18 @@ impl MenuBar {
             X: width,
             Y: visual_height,
         })?;
-        let contents = self.surface.Children()?;
-        contents.RemoveAll()?;
-        contents.InsertAtTop(&root)?;
+        for (layer, content) in [
+            (&self.strip_layer, &root),
+            (&self.island_layer, &island_root),
+        ] {
+            layer.SetSize(Vector2 {
+                X: width,
+                Y: visual_height,
+            })?;
+            let children = layer.Children()?;
+            children.RemoveAll()?;
+            children.InsertAtTop(content)?;
+        }
         self.visual_height = if self.panel_span.width() > 0.0 {
             visual_height
         } else {
@@ -3850,13 +4134,15 @@ fn island_surface(
     let silhouette = gfx.island_mask(island_width, island_height, scale)?;
     content.InsertAtTop(&island_shadow(c, &silhouette.cast()?, size, geometry)?)?;
 
-    let tint = match (look.light, look.glass) {
-        (true, true) => rgba(247, 249, 252, 243),
-        (false, true) => rgba(7, 9, 13, 242),
-        (true, false) => rgba(247, 249, 252, 255),
-        (false, false) => rgba(10, 12, 17, 255),
+    let tint = match (look.widgets.bare, look.light, look.glass) {
+        (true, _, _) => BARE_ISLAND,
+        (false, true, true) => rgba(247, 249, 252, 243),
+        (false, false, true) => rgba(7, 9, 13, 242),
+        (false, true, false) => rgba(247, 249, 252, 255),
+        (false, false, false) => rgba(10, 12, 17, 255),
     };
-    if look.glass {
+    // Without a background the island is opaque, not glass.
+    if look.glass && !look.widgets.bare {
         // The backdrop cannot be used as a mask-brush source. Inset its
         // rounded clip so it stays entirely inside the curved silhouette.
         let inset = (12.0 * scale)
@@ -4393,6 +4679,353 @@ mod island_tests {
     use super::*;
 
     #[test]
+    #[ignore = "Requires Windows desktop composition"]
+    fn native_ghost_mode_changes_reserve_nothing_and_keep_island_cues() -> Result<()> {
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        // SAFETY: The dispatcher and bar belong to this test thread.
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, true, true, MenuBarWidgets::default())?;
+        bar.audio = None; // This fixture can never change the user's audio.
+        bar.media = Some(media::Watch::test_snapshot(Track::test_fixture()));
+        bar.refresh(&gfx)?;
+        bar.set_hiding(true, false, false)?;
+        assert_eq!(bar.presence_now(), Presence::IslandOnly);
+        // A moment of the AI plan reaches the crab while only the island shows.
+        bar.cue = Some((mascot::Act::Fresh, 960));
+        let (_, point) = bar.take_cue().ok_or_else(|| anyhow::anyhow!("cue"))?;
+        assert!(point.is_some(), "the island is on screen");
+        // Ghost to Automatic or Intelligent never reserves the strip on the way.
+        for (auto, smart) in [(true, false), (false, true)] {
+            bar.set_hiding(true, false, false)?;
+            bar.strip_reservations = 0;
+            bar.set_hiding(false, auto, smart)?;
+            assert_eq!(bar.strip_reservations, 0, "auto={auto} smart={smart}");
+            assert!(bar.reserved_strip().is_none());
+        }
+        bar.set_hiding(false, false, false)?;
+        assert!(bar.strip_reservations > 0);
+        assert!(bar.reserved_strip().is_some());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Hidden compositor fixture; synthetic preferences, nothing is opened"]
+    fn native_bare_bar_draws_no_strip_and_halos_every_item() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, false, true, MenuBarWidgets::default())?;
+        bar.set_visible(false)?;
+        let mut look = bar.look.clone().context("initial look")?;
+        look.screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        look.app_name = "Prueba".to_owned();
+        look.track = Some(Track::test_fixture());
+        for glass in [true, false] {
+            for bare in [false, true] {
+                look.glass = glass;
+                look.widgets.bare = bare;
+                assert_eq!(
+                    strip_fills(&gfx, &look)?.is_empty(),
+                    bare,
+                    "glass={glass} bare={bare}"
+                );
+                bar.apply_look(&gfx, look.clone())?;
+                let root: ContainerVisual = bar.content_root()?.cast()?;
+                let mut halos = 0;
+                for child in root.Children()? {
+                    if let Ok(sprite) = child.cast::<SpriteVisual>()
+                        && sprite.Shadow().is_ok()
+                    {
+                        halos += 1;
+                    }
+                }
+                if bare {
+                    assert!(halos > 0 && halos % 2 == 0, "glass={glass}: {halos}");
+                } else {
+                    assert_eq!(halos, 0, "glass={glass}");
+                }
+            }
+        }
+        // White ink and a dark island whatever the Windows theme.
+        let widgets = MenuBarWidgets {
+            bare: true,
+            ..MenuBarWidgets::default()
+        };
+        bar.set_widgets(&gfx, widgets)?;
+        assert!(!bar.look.as_ref().context("look")?.light);
+        Ok(())
+    }
+
+    #[test]
+    fn essentials_keep_status_but_drop_shell_buttons() {
+        for action in [
+            Action::Notifications,
+            Action::Search,
+            Action::TaskView,
+            Action::Widgets,
+            Action::HiddenIcons,
+        ] {
+            assert!(!essential(action), "{action:?}");
+        }
+        for action in [
+            Action::Clock,
+            Action::QuickSettings,
+            Action::Network,
+            Action::Sound,
+            Action::Bluetooth,
+            Action::Power,
+            Action::AccessoryIndicator,
+            Action::SystemMonitor,
+            Action::Microphone,
+            Action::Camera,
+            Action::InputLanguage,
+        ] {
+            assert!(essential(action), "{action:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "Hidden compositor fixture; synthetic preferences, nothing is opened"]
+    fn native_essentials_drop_buttons_and_network_speed() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, false, true, MenuBarWidgets::default())?;
+        bar.set_visible(false)?;
+        let mut look = bar.look.clone().context("initial look")?;
+        look.screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        look.widgets.notifications = true;
+        look.status.buttons.search = true;
+        look.status.buttons.task_view = true;
+        look.status.buttons.widgets = true;
+        look.monitor = Some([
+            "CPU 12%".to_owned(),
+            "RAM 48%".to_owned(),
+            "↑ 12 KB/s".to_owned(),
+            "↓ 35,5 MB/s".to_owned(),
+        ]);
+        let dropped = [
+            Action::Notifications,
+            Action::Search,
+            Action::TaskView,
+            Action::Widgets,
+            Action::HiddenIcons,
+        ];
+        let monitor_width = |bar: &MenuBar| {
+            bar.zones
+                .iter()
+                .find(|(_, _, a)| *a == Action::SystemMonitor)
+                .map(|(left, right, _)| right - left)
+        };
+        look.widgets.essentials = false;
+        bar.apply_look(&gfx, look.clone())?;
+        let actions: Vec<Action> = bar.zones.iter().map(|(_, _, a)| *a).collect();
+        for action in dropped {
+            assert!(actions.contains(&action), "{action:?}");
+        }
+        let full = monitor_width(&bar).context("monitor zone")?;
+        look.widgets.essentials = true;
+        bar.apply_look(&gfx, look.clone())?;
+        let actions: Vec<Action> = bar.zones.iter().map(|(_, _, a)| *a).collect();
+        for action in dropped {
+            assert!(!actions.contains(&action), "{action:?}");
+        }
+        for action in [Action::Clock, Action::QuickSettings, Action::SystemMonitor] {
+            assert!(actions.contains(&action), "{action:?}");
+        }
+        let essential_width = monitor_width(&bar).context("monitor zone")?;
+        assert!(essential_width < full, "{essential_width} < {full}");
+        Ok(())
+    }
+
+    impl MenuBar {
+        /// The root the last build drew the strip into.
+        fn content_root(&self) -> Result<windows::UI::Composition::Visual> {
+            Ok(self.strip_layer.Children()?.First()?.Current()?)
+        }
+    }
+
+    #[test]
+    fn presence_follows_the_ghost_table() {
+        use Presence::*;
+        // (visible, auto_hide, revealed, ghost, covered, has_island) -> esperado
+        for (args, expected) in [
+            ((false, true, true, true, false, true), Hidden),
+            ((true, false, false, false, false, true), Full),
+            ((true, true, true, true, true, true), Full),
+            ((true, true, false, true, false, true), IslandOnly),
+            ((true, true, false, true, true, true), Hidden),
+            ((true, true, false, true, false, false), Hidden),
+            ((true, true, false, false, false, true), Hidden),
+        ] {
+            let (v, a, r, g, c, i) = args;
+            assert_eq!(presence(v, a, r, g, c, i), expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn needs_pointer_timer_is_off_while_only_the_island_rests() {
+        use Presence::*;
+        assert!(!needs_pointer_timer(true, IslandOnly, true, false, false));
+        assert!(needs_pointer_timer(true, IslandOnly, true, true, false));
+        assert!(needs_pointer_timer(true, IslandOnly, true, false, true));
+        assert!(needs_pointer_timer(true, Full, true, false, false));
+        assert!(!needs_pointer_timer(true, Full, false, false, false));
+        assert!(!needs_pointer_timer(false, Hidden, true, false, false));
+    }
+
+    #[test]
+    fn ghost_region_covers_only_the_island() {
+        let island = Span {
+            left: 740.4,
+            right: 1179.6,
+        };
+        assert_eq!(
+            ghost_region(island, 28.0),
+            Some(RECT {
+                left: 740,
+                top: 0,
+                right: 1180,
+                bottom: 28
+            })
+        );
+        assert_eq!(ghost_region(Span::default(), 28.0), None);
+    }
+
+    #[test]
+    #[ignore = "Requires Windows desktop composition"]
+    fn native_ghost_bar_rests_on_the_island_and_reveals_the_strip() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::{
+            Graphics::Gdi::{GDI_REGION_TYPE, GetWindowRgnBox, RGN_ERROR},
+            System::WinRT::{
+                CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+                DispatcherQueueOptions,
+            },
+            UI::WindowsAndMessaging::IsWindowVisible,
+        };
+        // SAFETY: The dispatcher and bar belong to this test thread.
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let region_of = |bar: &MenuBar| -> (GDI_REGION_TYPE, RECT) {
+            let mut r = RECT::default();
+            // SAFETY: Read-only query of our own window.
+            let kind = unsafe { GetWindowRgnBox(bar.hwnd, &mut r) };
+            (kind, r)
+        };
+        let visible = |bar: &MenuBar| unsafe { IsWindowVisible(bar.hwnd) }.as_bool();
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, true, true, MenuBarWidgets::default())?;
+        bar.audio = None; // This fixture can never change the user's audio.
+        // Redraws read the track from here, so the island survives them.
+        bar.media = Some(media::Watch::test_snapshot(Track::test_fixture()));
+        let mut look = bar.look.clone().context("initial look")?;
+        look.track = Some(Track::test_fixture());
+        look.screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        bar.apply_look(&gfx, look.clone())?;
+        let height = |bar: &MenuBar| (bar.bounds.bottom - bar.bounds.top) as f32;
+
+        bar.set_ghost(true)?;
+        assert!(bar.auto_hide);
+        assert!(bar.reserved_strip().is_none());
+        assert_eq!(bar.presence_now(), Presence::IslandOnly);
+        assert!(visible(&bar));
+        assert_eq!(bar.strip_layer.Opacity()?, 0.0);
+        assert_eq!(bar.surface.Opacity()?, 1.0);
+        let (kind, r) = region_of(&bar);
+        assert_ne!(kind, RGN_ERROR);
+        assert_eq!(Some(r), ghost_region(bar.triggers_span, height(&bar)));
+
+        bar.edge_rested(&gfx, POINT { x: 10, y: 0 })?;
+        assert_eq!(bar.presence_now(), Presence::Full);
+        assert_eq!(region_of(&bar).0, RGN_ERROR, "revealed, no region");
+
+        let below = POINT {
+            x: 10,
+            y: bar.bounds.bottom + 50,
+        };
+        bar.pointer_left_at(&gfx, below)?;
+        if bar.hide_until.is_some() {
+            bar.finish_hide_at(&gfx, Instant::now() + Duration::from_secs(1), below, None)?;
+        }
+        assert_eq!(bar.presence_now(), Presence::IslandOnly);
+        let (kind, r) = region_of(&bar);
+        assert_ne!(kind, RGN_ERROR);
+        assert_eq!(Some(r), ghost_region(bar.triggers_span, height(&bar)));
+
+        bar.set_covered(&gfx, true)?;
+        assert_eq!(bar.presence_now(), Presence::Hidden);
+        assert!(!visible(&bar));
+        bar.set_covered(&gfx, false)?;
+        assert_eq!(bar.presence_now(), Presence::IslandOnly);
+        assert!(visible(&bar));
+
+        let mut scaled = bar.look.clone().context("look")?;
+        scaled.scale = 1.5;
+        bar.apply_look(&gfx, scaled)?;
+        let (kind, r) = region_of(&bar);
+        assert_ne!(kind, RGN_ERROR);
+        assert_eq!(Some(r), ghost_region(bar.triggers_span, height(&bar)));
+
+        bar.set_auto_hide(false)?;
+        bar.set_smart_hide(false)?;
+        bar.set_ghost(false)?;
+        assert!(!bar.auto_hide);
+        assert!(bar.reserved_strip().is_some());
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "Hidden compositor fixture; synthetic preferences, no Windows settings writes"]
     fn native_status_items_follow_windows_preferences_without_overrides() -> Result<()> {
         use anyhow::Context;
@@ -4816,11 +5449,11 @@ mod island_tests {
                     assert!(maximum > 0.0);
                     let body = viewport.content.clone();
                     let down = viewport.down.clone();
-                    let root = bar.surface.Children()?.First()?.Current()?;
+                    let root = bar.content_root()?;
                     for _ in 0..20 {
                         assert!(bar.scroll_usage(48.0)?);
                     }
-                    assert_eq!(bar.surface.Children()?.First()?.Current()?, root);
+                    assert_eq!(bar.content_root()?, root);
                     assert_eq!(bar.usage_scroll, maximum);
                     assert_eq!(body.Offset()?.Y, -(maximum * scale).round());
                     assert_eq!(down.Opacity()?, 0.22);
@@ -4838,7 +5471,7 @@ mod island_tests {
                     );
                     bar.click(&gfx, (left + right) / 2.0, (top + bottom) / 2.0)?;
                     assert!(bar.usage_scroll < maximum);
-                    assert_eq!(bar.surface.Children()?.First()?.Current()?, root);
+                    assert_eq!(bar.content_root()?, root);
                     assert!(bar.scroll_usage(-10_000.0)?);
                     assert_eq!(bar.usage_scroll, 0.0);
                 }
@@ -5155,13 +5788,13 @@ mod island_tests {
         }
         let full_redraw = started.elapsed();
         bar.look = Some(look.clone());
-        let root = bar.surface.Children()?.First()?.Current()?;
+        let root = bar.content_root()?;
         let mut update = look.track.clone().context("track for progress update")?;
         update.timeline = Track::test_fixture().timeline;
         bar.media = Some(media::Watch::test_snapshot(update));
         bar.media_changed(&gfx)?;
         assert_eq!(
-            bar.surface.Children()?.First()?.Current()?,
+            bar.content_root()?,
             root,
             "position events retain the visual tree"
         );
@@ -5185,7 +5818,7 @@ mod island_tests {
                     percent: 40 + step % 20,
                 }),
             )?;
-            assert_eq!(bar.surface.Children()?.First()?.Current()?, root);
+            assert_eq!(bar.content_root()?, root);
             assert_eq!(
                 bar.volume_controls
                     .as_ref()
@@ -5207,9 +5840,9 @@ mod island_tests {
         bar.volume_drag = Some(span); // No SetCapture in a test.
         bar.queue_volume(span, 260.0);
         bar.pointer_moved(&gfx, 999.0, 140.0)?;
-        let player = bar.surface.Children()?.First()?.Current()?;
+        let player = bar.content_root()?;
         bar.refresh_backdrops(&gfx)?;
-        assert_eq!(bar.surface.Children()?.First()?.Current()?, player);
+        assert_eq!(bar.content_root()?, player);
         assert!(bar.volume_drag.is_some());
         assert_eq!(bar.pending_volume, Some(80));
         assert_eq!(
@@ -5254,7 +5887,7 @@ mod island_tests {
                 .position_percent,
             Some(80)
         );
-        assert_eq!(bar.surface.Children()?.First()?.Current()?, root);
+        assert_eq!(bar.content_root()?, root);
         assert!(bar.release_volume(Some(300.0))?);
         assert!(bar.pending_volume.is_none() && bar.volume_drag.is_none());
         assert!(!bar.release_volume(None)?);
@@ -5265,14 +5898,11 @@ mod island_tests {
         // Wallpaper/DWM changes renew only the host sample. Cached content and
         // the open music popup remain intact when the theme itself is unchanged.
         bar.look = Some(look.clone());
-        let previous_material = bar.surface.Children()?.First()?.Current()?;
+        let previous_material = bar.content_root()?;
         bar.refresh_backdrops(&gfx)?;
         assert!(bar.look.as_ref() == Some(&look));
         bar.apply_look(&gfx, look.clone())?;
-        assert_eq!(
-            bar.surface.Children()?.First()?.Current()?,
-            previous_material
-        );
+        assert_eq!(bar.content_root()?, previous_material);
         bar.build(&gfx, &look)?;
         assert!(
             !bar.island_hits
@@ -5483,8 +6113,7 @@ mod island_tests {
                     look.glass = glass;
                     look.accessories = [None, None];
                     bar.build(&gfx, &look)?;
-                    let root: ContainerVisual =
-                        bar.surface.Children()?.First()?.Current()?.cast()?;
+                    let root: ContainerVisual = bar.content_root()?.cast()?;
                     let empty_visuals = root.Children()?.Count()?;
                     let controls = bar.zones.len();
                     look.accessories = [
@@ -5498,8 +6127,7 @@ mod island_tests {
                         }),
                     ];
                     bar.build(&gfx, &look)?;
-                    let root: ContainerVisual =
-                        bar.surface.Children()?.First()?.Current()?.cast()?;
+                    let root: ContainerVisual = bar.content_root()?.cast()?;
                     assert_eq!(root.Children()?.Count()?, empty_visuals + 4);
                     assert_eq!(bar.zones.len(), controls);
                     assert!(bar.island_hits.is_empty());
@@ -5550,12 +6178,12 @@ mod island_tests {
             Language::Pt,
             Language::Es,
         ] {
-            let previous = bar.surface.Children()?.First()?.Current()?;
+            let previous = bar.content_root()?;
             strings::set_language(language);
             bar.refresh(&gfx)?;
             assert_ne!(
                 previous,
-                bar.surface.Children()?.First()?.Current()?,
+                bar.content_root()?,
                 "translation-only changes must rebuild the content"
             );
             assert!(

@@ -9,6 +9,7 @@ import {
   type DockDensity,
   type DockAutoHideSpeed,
   type DockHidingMode,
+  type MenuBarHidingMode,
   type GenieSpeed,
   type MascotCharacter,
   type IslandStyle,
@@ -623,18 +624,19 @@ export function App() {
                 </Row>
                 <SubRow
                   label={t.menuBarHidingMode}
-                  hint={config.menuBarAutoHide ? t.menuBarAutoHideHint : config.menuBarSmartHide ? t.menuBarHidingIntelligentHint : t.menuBarHidingVisibleHint}
+                  hint={config.menuBarGhost ? t.menuBarHidingGhostHint : config.menuBarAutoHide ? t.menuBarAutoHideHint : config.menuBarSmartHide ? t.menuBarHidingIntelligentHint : t.menuBarHidingVisibleHint}
                   open={config.menuBar}
                 >
-                  <Select<DockHidingMode>
+                  <Select<MenuBarHidingMode>
                     label={t.menuBarHidingMode}
-                    value={config.menuBarAutoHide ? "automatic" : config.menuBarSmartHide ? "intelligent" : "visible"}
+                    value={config.menuBarGhost ? "ghost" : config.menuBarAutoHide ? "automatic" : config.menuBarSmartHide ? "intelligent" : "visible"}
                     options={[
                       { value: "visible", label: t.dockHidingVisible },
                       { value: "automatic", label: t.dockHidingAutomatic },
                       { value: "intelligent", label: t.dockHidingIntelligent },
+                      { value: "ghost", label: t.menuBarHidingGhost },
                     ]}
-                    onChange={(mode) => update({ menuBarAutoHide: mode === "automatic", menuBarSmartHide: mode === "intelligent" })}
+                    onChange={(mode) => update({ menuBarAutoHide: mode === "automatic", menuBarSmartHide: mode === "intelligent", menuBarGhost: mode === "ghost" })}
                   />
                 </SubRow>
                 <SubRow label={t.menuBarMusic} hint={t.menuBarMusicHint} open={config.menuBar}>
@@ -686,6 +688,20 @@ export function App() {
                     label={t.menuBarNotifications}
                     checked={config.menuBarNotifications ?? false}
                     onChange={(menuBarNotifications) => update({ menuBarNotifications })}
+                  />
+                </SubRow>
+                <SubRow label={t.menuBarBare} hint={t.menuBarBareHint} open={config.menuBar}>
+                  <Toggle
+                    label={t.menuBarBare}
+                    checked={config.menuBarBare ?? false}
+                    onChange={(menuBarBare) => update({ menuBarBare })}
+                  />
+                </SubRow>
+                <SubRow label={t.menuBarEssentials} hint={t.menuBarEssentialsHint} open={config.menuBar}>
+                  <Toggle
+                    label={t.menuBarEssentials}
+                    checked={config.menuBarEssentials ?? false}
+                    onChange={(menuBarEssentials) => update({ menuBarEssentials })}
                   />
                 </SubRow>
                 <SubRow label={t.clockTarget} hint={config.menuBarClockTarget ?? t.clockTargetDefault} open={config.menuBar}>

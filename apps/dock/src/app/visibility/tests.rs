@@ -1,5 +1,6 @@
 //! Regression harness: hidden test-owned HWNDs, no taskbar takeover or settings writes.
 use super::super::{ASSETS_READY, App, HOVER_OMEGA, Press, PreviewOrder};
+use super::menu_bar_covered;
 use crate::{assets::Visuals, gfx::Gfx, thumbnails::Thumbnails};
 use anyhow::Result;
 use muelle_config::Config;
@@ -8,7 +9,7 @@ use muelle_shell::{power, tracker::WindowTracker};
 use std::{collections::HashMap, time::Instant};
 use windows::{
     Win32::{
-        Foundation::{HWND, POINT},
+        Foundation::{HWND, POINT, RECT},
         System::WinRT::{
             Composition::ICompositorDesktopInterop, CreateDispatcherQueueController, DQTAT_COM_STA,
             DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
@@ -275,4 +276,70 @@ fn native_hiding_clears_overlap_when_automatic_hiding_takes_precedence() -> Resu
         "smart-only mode shows an unobstructed desktop"
     );
     Ok(())
+}
+
+#[test]
+fn menu_bar_cover_follows_the_ghost_rules() {
+    let bar = RECT {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 28,
+    };
+    let maximized = RECT {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1040,
+    };
+    let near_top = RECT {
+        left: 100,
+        top: 10,
+        right: 900,
+        bottom: 700,
+    };
+    let other_screen = RECT {
+        left: -1920,
+        top: 0,
+        right: 0,
+        bottom: 1040,
+    };
+    assert!(menu_bar_covered(
+        true,
+        false,
+        false,
+        Some((maximized, true)),
+        bar
+    ));
+    assert!(menu_bar_covered(true, false, true, None, bar));
+    assert!(!menu_bar_covered(
+        true,
+        false,
+        false,
+        Some((near_top, false)),
+        bar
+    ));
+    assert!(!menu_bar_covered(
+        true,
+        false,
+        false,
+        Some((other_screen, true)),
+        bar
+    ));
+    assert!(!menu_bar_covered(true, false, false, None, bar));
+    // Sin fantasma, el inteligente de siempre: basta con solaparse.
+    assert!(menu_bar_covered(
+        false,
+        true,
+        false,
+        Some((near_top, false)),
+        bar
+    ));
+    assert!(!menu_bar_covered(
+        false,
+        false,
+        true,
+        Some((maximized, true)),
+        bar
+    ));
 }
