@@ -639,6 +639,9 @@ pub struct MenuBar {
     ghost: bool,
     /// The window region set now, to call `SetWindowRgn` only on change.
     window_region: Option<RECT>,
+    /// How many times `place` reserved the strip (tests watch mode changes).
+    #[cfg(test)]
+    strip_reservations: usize,
     appbar: Option<AppBar>,
     app_name: String,
     look: Option<Look>,
@@ -1342,6 +1345,8 @@ impl MenuBar {
             island_layer,
             ghost: false,
             window_region: None,
+            #[cfg(test)]
+            strip_reservations: 0,
             appbar: AppBar::register(hwnd, APPBAR_CALLBACK),
             app_name: String::new(),
             look: None,
@@ -1436,39 +1441,46 @@ impl MenuBar {
         self.place()
     }
 
+    #[cfg(test)]
     pub fn set_auto_hide(&mut self, auto_hide: bool) -> Result<()> {
-        if self.hide_setting == auto_hide {
-            return Ok(());
-        }
-        self.hide_setting = auto_hide;
-        self.apply_hiding()
+        self.set_hiding(self.ghost, auto_hide, self.smart)
     }
 
     /// Intelligent hiding on or off (see `smart`).
+    #[cfg(test)]
     pub fn set_smart_hide(&mut self, smart: bool) -> Result<()> {
-        if self.smart == smart {
+        self.set_hiding(self.ghost, self.hide_setting, smart)
+    }
+
+    /// The three ways the bar hides, set together and applied once: one at a
+    /// time, a switch between two of them passed through "always visible",
+    /// reserving the strip (resizing maximized windows) and showing the bar
+    /// for a moment.
+    pub fn set_hiding(&mut self, ghost: bool, auto_hide: bool, smart: bool) -> Result<()> {
+        if (self.ghost, self.hide_setting, self.smart) == (ghost, auto_hide, smart) {
             return Ok(());
         }
+        if self.ghost != ghost {
+            // Whichever layer animated so far starts over in its resting state.
+            self.animation_epoch = self.animation_epoch.wrapping_add(1);
+            self.exit_animation = None;
+            for layer in [&self.strip_layer, &self.surface] {
+                layer.StopAnimation(h!("Offset.Y"))?;
+                layer.StopAnimation(h!("Opacity"))?;
+                layer.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
+                layer.SetOpacity(1.0)?;
+            }
+        }
+        self.ghost = ghost;
+        self.hide_setting = auto_hide;
         self.smart = smart;
         self.apply_hiding()
     }
 
     /// Ghost bar on or off (see `ghost`).
+    #[cfg(test)]
     pub fn set_ghost(&mut self, ghost: bool) -> Result<()> {
-        if self.ghost == ghost {
-            return Ok(());
-        }
-        // Whichever layer animated so far starts over in its resting state.
-        self.animation_epoch = self.animation_epoch.wrapping_add(1);
-        self.exit_animation = None;
-        for layer in [&self.strip_layer, &self.surface] {
-            layer.StopAnimation(h!("Offset.Y"))?;
-            layer.StopAnimation(h!("Opacity"))?;
-            layer.SetOffset(Vector3::new(0.0, 0.0, 0.0))?;
-            layer.SetOpacity(1.0)?;
-        }
-        self.ghost = ghost;
-        self.apply_hiding()
+        self.set_hiding(ghost, self.hide_setting, self.smart)
     }
 
     fn presence_now(&self) -> Presence {
@@ -1932,6 +1944,10 @@ impl MenuBar {
         // An auto-hiding or intelligent bar leaves the whole screen to the
         // windows.
         let strip = if self.reserves() { bar_height } else { 0 };
+        #[cfg(test)]
+        if strip > 0 {
+            self.strip_reservations += 1;
+        }
         if let Some(appbar) = &mut self.appbar {
             appbar.reserve(Edge::Top, bounds, strip);
         }
@@ -2480,9 +2496,12 @@ impl MenuBar {
     /// where it happens, or `None` when the bar does not show now.
     pub fn take_cue(&mut self) -> Option<(mascot::Act, Option<POINT>)> {
         let (act, x) = self.cue.take()?;
+        // The moment sits under the island, on screen also while only the
+        // island shows.
+        let island_shown = self.presence_now() != Presence::Hidden;
         Some((
             act,
-            self.shown().then_some(POINT {
+            island_shown.then_some(POINT {
                 x,
                 y: self.bounds.bottom,
             }),
@@ -4658,6 +4677,46 @@ impl Drop for MenuBar {
 #[cfg(test)]
 mod island_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Requires Windows desktop composition"]
+    fn native_ghost_mode_changes_reserve_nothing_and_keep_island_cues() -> Result<()> {
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        // SAFETY: The dispatcher and bar belong to this test thread.
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, true, true, MenuBarWidgets::default())?;
+        bar.audio = None; // This fixture can never change the user's audio.
+        bar.media = Some(media::Watch::test_snapshot(Track::test_fixture()));
+        bar.refresh(&gfx)?;
+        bar.set_hiding(true, false, false)?;
+        assert_eq!(bar.presence_now(), Presence::IslandOnly);
+        // A moment of the AI plan reaches the crab while only the island shows.
+        bar.cue = Some((mascot::Act::Fresh, 960));
+        let (_, point) = bar.take_cue().ok_or_else(|| anyhow::anyhow!("cue"))?;
+        assert!(point.is_some(), "the island is on screen");
+        // Ghost to Automatic or Intelligent never reserves the strip on the way.
+        for (auto, smart) in [(true, false), (false, true)] {
+            bar.set_hiding(true, false, false)?;
+            bar.strip_reservations = 0;
+            bar.set_hiding(false, auto, smart)?;
+            assert_eq!(bar.strip_reservations, 0, "auto={auto} smart={smart}");
+            assert!(bar.reserved_strip().is_none());
+        }
+        bar.set_hiding(false, false, false)?;
+        assert!(bar.strip_reservations > 0);
+        assert!(bar.reserved_strip().is_some());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "Hidden compositor fixture; synthetic preferences, nothing is opened"]

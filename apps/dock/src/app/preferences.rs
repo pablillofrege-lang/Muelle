@@ -336,12 +336,14 @@ impl App {
         }
         if let Some(bar) = &mut self.menubar {
             bar.set_clock_target(self.config.menu_bar_clock_target.as_deref());
-            // Ghost first: the other way round, the whole bar would show for
-            // a moment.
+            // All three at once: one at a time, a switch between two modes
+            // would pass through "always visible" and resize maximized windows.
             let applied = bar
-                .set_ghost(self.config.menu_bar_ghost)
-                .and_then(|()| bar.set_auto_hide(self.config.menu_bar_auto_hide))
-                .and_then(|()| bar.set_smart_hide(self.config.menu_bar_smart_hide))
+                .set_hiding(
+                    self.config.menu_bar_ghost,
+                    self.config.menu_bar_auto_hide,
+                    self.config.menu_bar_smart_hide,
+                )
                 .and_then(|()| bar.set_usage_enabled(&self.gfx, self.config.ai_usage))
                 .and_then(|()| bar.set_media_enabled(&self.gfx, self.config.menu_bar_music))
                 .and_then(|()| bar.set_widgets(&self.gfx, widgets))
