@@ -48,7 +48,7 @@ use windows::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM},
         Graphics::{
             Dwm::{DWMWA_USE_HOSTBACKDROPBRUSH, DwmSetWindowAttribute},
-            Gdi::{CreateRectRgn, SetWindowRgn},
+            Gdi::{CreateRectRgn, DeleteObject, HRGN, SetWindowRgn},
         },
         System::{
             LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime,
@@ -452,6 +452,25 @@ fn ghost_region(triggers: Span, bar_height: f32) -> Option<RECT> {
         right: triggers.right.ceil() as i32,
         bottom: bar_height.round() as i32,
     })
+}
+
+/// Installs a new region and consumes its handle. `None` removes the clip.
+fn install_window_region(hwnd: HWND, handle: Option<HRGN>) -> bool {
+    // A null result from CreateRectRgn must not remove the existing clip.
+    if handle.is_some_and(|region| region.is_invalid()) {
+        return false;
+    }
+    // SAFETY: A live window in production. Region ownership transfers to
+    // Windows only on success, so release our handle on failure.
+    unsafe {
+        if SetWindowRgn(hwnd, handle, true) != 0 {
+            return true;
+        }
+        if let Some(region) = handle {
+            let _ = DeleteObject(region.into());
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -2054,10 +2073,8 @@ impl MenuBar {
                 SWP_NOACTIVATE | show,
             )?;
             if region != self.window_region {
-                // After a successful call the system owns the region: it is
-                // not deleted here.
                 let handle = region.map(|r| CreateRectRgn(r.left, r.top, r.right, r.bottom));
-                if SetWindowRgn(self.hwnd, handle, true) != 0 {
+                if install_window_region(self.hwnd, handle) {
                     self.window_region = region;
                 }
             }
@@ -5080,6 +5097,10 @@ mod island_tests {
         let (kind, r) = region_of(&bar);
         assert_ne!(kind, RGN_ERROR);
         assert_eq!(Some(r), ghost_region(bar.triggers_span, height(&bar)));
+        // CreateRectRgn returns a null handle on failure. It must not be
+        // forwarded to SetWindowRgn, where it would remove this clip.
+        assert!(!install_window_region(bar.hwnd, Some(HRGN::default())));
+        assert_eq!(region_of(&bar), (kind, r));
 
         bar.edge_rested(&gfx, POINT { x: 10, y: 0 })?;
         assert_eq!(bar.presence_now(), Presence::Full);
