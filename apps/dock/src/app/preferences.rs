@@ -317,6 +317,7 @@ impl App {
             island_style: self.config.menu_bar_island_style,
             notifications: self.config.menu_bar_notifications,
             system_monitor: self.config.menu_bar_system_monitor,
+            essentials: self.config.menu_bar_essentials,
         };
         if !self.config.menu_bar {
             self.menubar = None;

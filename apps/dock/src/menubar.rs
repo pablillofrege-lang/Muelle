@@ -213,6 +213,22 @@ pub struct MenuBarWidgets {
     pub notifications: bool,
     /// CPU, memory and network speed (`Config::menu_bar_system_monitor`).
     pub system_monitor: bool,
+    /// Only the essentials (`Config::menu_bar_essentials`): no network
+    /// speed and none of the Windows shell buttons (see `essential`).
+    pub essentials: bool,
+}
+
+/// What "Only the essentials" keeps: status and the clock, not the buttons
+/// that open Windows' own shell surfaces.
+fn essential(action: Action) -> bool {
+    !matches!(
+        action,
+        Action::Notifications
+            | Action::Search
+            | Action::TaskView
+            | Action::Widgets
+            | Action::HiddenIcons
+    )
 }
 
 impl Default for MenuBarWidgets {
@@ -221,6 +237,7 @@ impl Default for MenuBarWidgets {
             island_style: IslandStyle::Notch,
             notifications: false,
             system_monitor: false,
+            essentials: false,
         }
     }
 }
@@ -2318,11 +2335,22 @@ impl MenuBar {
                 },
             )
         };
+        // Without network speed the lines stay empty, so a changing speed
+        // does not redraw the bar.
+        let essentials = self.widgets.essentials;
         Some([
             share("CPU", reading.cpu),
             share("RAM", reading.memory),
-            speed('↑', reading.up),
-            speed('↓', reading.down),
+            if essentials {
+                String::new()
+            } else {
+                speed('↑', reading.up)
+            },
+            if essentials {
+                String::new()
+            } else {
+                speed('↓', reading.down)
+            },
         ])
     }
 
@@ -2569,8 +2597,11 @@ impl MenuBar {
         let status = look.status;
         let symbol = |layers: &[(char, f32)]| gfx.glyph_brush(layers, scale, ink);
         let mut items: Vec<(LabelBrush, Action)> = Vec::new();
+        // Checked at each push, not filtered afterwards: the battery and
+        // accessory labels remember indexes into `items`.
+        let wanted = |action: Action| !look.widgets.essentials || essential(action);
         // The notification bell, when chosen, takes the very end of the bar.
-        if look.widgets.notifications {
+        if look.widgets.notifications && wanted(Action::Notifications) {
             items.push((
                 symbol(&[(glyph::NOTIFICATIONS, 1.0)])?,
                 Action::Notifications,
@@ -2592,7 +2623,7 @@ impl MenuBar {
                 items.push((symbol(&[(glyph, 1.0)])?, action));
             }
         }
-        if status.buttons.search {
+        if status.buttons.search && wanted(Action::Search) {
             items.push((symbol(&[(glyph::SEARCH, 1.0)])?, Action::Search));
         }
         if status.bluetooth_on {
@@ -2655,11 +2686,13 @@ impl MenuBar {
         }
         // The notification area (antivirus, OneDrive, apps in the background)
         // lives only in the hidden taskbar; this arrow opens its flyout.
-        items.push((symbol(&[(glyph::HIDDEN_ICONS, 1.0)])?, Action::HiddenIcons));
-        if status.buttons.task_view {
+        if wanted(Action::HiddenIcons) {
+            items.push((symbol(&[(glyph::HIDDEN_ICONS, 1.0)])?, Action::HiddenIcons));
+        }
+        if status.buttons.task_view && wanted(Action::TaskView) {
             items.push((symbol(&[(glyph::TASK_VIEW, 1.0)])?, Action::TaskView));
         }
-        if status.buttons.widgets {
+        if status.buttons.widgets && wanted(Action::Widgets) {
             items.push((symbol(&[(glyph::WIDGETS, 1.0)])?, Action::Widgets));
         }
         for (index, (item, action)) in items.iter().enumerate() {
@@ -2686,7 +2719,13 @@ impl MenuBar {
         // The system monitor (issue #64), left of the status icons: two
         // small stacked columns, CPU over memory, then upload over download.
         if let Some(lines) = &look.monitor {
-            let brushes = lines
+            // "Only the essentials" keeps CPU over memory, without speeds.
+            let columns: &[usize] = if look.widgets.essentials {
+                &[0]
+            } else {
+                &[1, 0]
+            };
+            let brushes = lines[..columns.len() * 2]
                 .iter()
                 .map(|line| gfx.text_brush_sized(line, scale, MONITOR_FONT, false, ink))
                 .collect::<Result<Vec<_>>>()?;
@@ -2700,7 +2739,7 @@ impl MenuBar {
             let widths = self.monitor_widths.1;
             let zone_right = right;
             let mut left = right;
-            for column in [1, 0] {
+            for &column in columns {
                 left -= widths[column];
                 for (row, brush) in brushes[column * 2..column * 2 + 2].iter().enumerate() {
                     let top = if row == 0 {
@@ -4555,6 +4594,103 @@ impl Drop for MenuBar {
 #[cfg(test)]
 mod island_tests {
     use super::*;
+
+    #[test]
+    fn essentials_keep_status_but_drop_shell_buttons() {
+        for action in [
+            Action::Notifications,
+            Action::Search,
+            Action::TaskView,
+            Action::Widgets,
+            Action::HiddenIcons,
+        ] {
+            assert!(!essential(action), "{action:?}");
+        }
+        for action in [
+            Action::Clock,
+            Action::QuickSettings,
+            Action::Network,
+            Action::Sound,
+            Action::Bluetooth,
+            Action::Power,
+            Action::AccessoryIndicator,
+            Action::SystemMonitor,
+            Action::Microphone,
+            Action::Camera,
+            Action::InputLanguage,
+        ] {
+            assert!(essential(action), "{action:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "Hidden compositor fixture; synthetic preferences, nothing is opened"]
+    fn native_essentials_drop_buttons_and_network_speed() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, false, true, MenuBarWidgets::default())?;
+        bar.set_visible(false)?;
+        let mut look = bar.look.clone().context("initial look")?;
+        look.screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        look.widgets.notifications = true;
+        look.status.buttons.search = true;
+        look.status.buttons.task_view = true;
+        look.status.buttons.widgets = true;
+        look.monitor = Some([
+            "CPU 12%".to_owned(),
+            "RAM 48%".to_owned(),
+            "↑ 12 KB/s".to_owned(),
+            "↓ 35,5 MB/s".to_owned(),
+        ]);
+        let dropped = [
+            Action::Notifications,
+            Action::Search,
+            Action::TaskView,
+            Action::Widgets,
+            Action::HiddenIcons,
+        ];
+        let monitor_width = |bar: &MenuBar| {
+            bar.zones
+                .iter()
+                .find(|(_, _, a)| *a == Action::SystemMonitor)
+                .map(|(left, right, _)| right - left)
+        };
+        look.widgets.essentials = false;
+        bar.apply_look(&gfx, look.clone())?;
+        let actions: Vec<Action> = bar.zones.iter().map(|(_, _, a)| *a).collect();
+        for action in dropped {
+            assert!(actions.contains(&action), "{action:?}");
+        }
+        let full = monitor_width(&bar).context("monitor zone")?;
+        look.widgets.essentials = true;
+        bar.apply_look(&gfx, look.clone())?;
+        let actions: Vec<Action> = bar.zones.iter().map(|(_, _, a)| *a).collect();
+        for action in dropped {
+            assert!(!actions.contains(&action), "{action:?}");
+        }
+        for action in [Action::Clock, Action::QuickSettings, Action::SystemMonitor] {
+            assert!(actions.contains(&action), "{action:?}");
+        }
+        let essential_width = monitor_width(&bar).context("monitor zone")?;
+        assert!(essential_width < full, "{essential_width} < {full}");
+        Ok(())
+    }
 
     impl MenuBar {
         /// The root the last build drew the strip into.
