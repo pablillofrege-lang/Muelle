@@ -1443,20 +1443,26 @@ impl MenuBar {
 
     #[cfg(test)]
     pub fn set_auto_hide(&mut self, auto_hide: bool) -> Result<()> {
-        self.set_hiding(self.ghost, auto_hide, self.smart)
+        self.set_hiding(self.ghost, auto_hide, self.smart, self.covered)
     }
 
     /// Intelligent hiding on or off (see `smart`).
     #[cfg(test)]
     pub fn set_smart_hide(&mut self, smart: bool) -> Result<()> {
-        self.set_hiding(self.ghost, self.hide_setting, smart)
+        self.set_hiding(self.ghost, self.hide_setting, smart, self.covered)
     }
 
     /// The three ways the bar hides, set together and applied once: one at a
     /// time, a switch between two of them passed through "always visible",
     /// reserving the strip (resizing maximized windows) and showing the bar
     /// for a moment.
-    pub fn set_hiding(&mut self, ghost: bool, auto_hide: bool, smart: bool) -> Result<()> {
+    pub fn set_hiding(
+        &mut self,
+        ghost: bool,
+        auto_hide: bool,
+        smart: bool,
+        covered: bool,
+    ) -> Result<()> {
         if (self.ghost, self.hide_setting, self.smart) == (ghost, auto_hide, smart) {
             return Ok(());
         }
@@ -1474,13 +1480,14 @@ impl MenuBar {
         self.ghost = ghost;
         self.hide_setting = auto_hide;
         self.smart = smart;
+        self.covered = covered;
         self.apply_hiding()
     }
 
     /// Ghost bar on or off (see `ghost`).
     #[cfg(test)]
     pub fn set_ghost(&mut self, ghost: bool) -> Result<()> {
-        self.set_hiding(ghost, self.hide_setting, self.smart)
+        self.set_hiding(ghost, self.hide_setting, self.smart, self.covered)
     }
 
     fn presence_now(&self) -> Presence {
@@ -4698,7 +4705,7 @@ mod island_tests {
         bar.audio = None; // This fixture can never change the user's audio.
         bar.media = Some(media::Watch::test_snapshot(Track::test_fixture()));
         bar.refresh(&gfx)?;
-        bar.set_hiding(true, false, false)?;
+        bar.set_hiding(true, false, false, false)?;
         assert_eq!(bar.presence_now(), Presence::IslandOnly);
         // A moment of the AI plan reaches the crab while only the island shows.
         bar.cue = Some((mascot::Act::Fresh, 960));
@@ -4706,13 +4713,17 @@ mod island_tests {
         assert!(point.is_some(), "the island is on screen");
         // Ghost to Automatic or Intelligent never reserves the strip on the way.
         for (auto, smart) in [(true, false), (false, true)] {
-            bar.set_hiding(true, false, false)?;
+            bar.set_hiding(true, false, false, false)?;
             bar.strip_reservations = 0;
-            bar.set_hiding(false, auto, smart)?;
+            bar.set_hiding(false, auto, smart, smart)?;
             assert_eq!(bar.strip_reservations, 0, "auto={auto} smart={smart}");
             assert!(bar.reserved_strip().is_none());
+            assert_eq!(bar.presence_now(), Presence::Hidden);
+            // A window under the intelligent strip need not be maximized.
+            bar.set_hiding(true, false, false, false)?;
+            assert_eq!(bar.presence_now(), Presence::IslandOnly);
         }
-        bar.set_hiding(false, false, false)?;
+        bar.set_hiding(false, false, false, false)?;
         assert!(bar.strip_reservations > 0);
         assert!(bar.reserved_strip().is_some());
         Ok(())
