@@ -216,6 +216,60 @@ pub struct MenuBarWidgets {
     /// Only the essentials (`Config::menu_bar_essentials`): no network
     /// speed and none of the Windows shell buttons (see `essential`).
     pub essentials: bool,
+    /// No background (`Config::menu_bar_bare`): no strip behind the bar,
+    /// white text and icons with a dark halo, and an opaque black island.
+    pub bare: bool,
+}
+
+/// The halo under text and icons without a background: (blur, Y offset,
+/// alpha of the black), in logical pixels. A tight layer and a wide one.
+const HALO: [(f32, f32, u8); 2] = [(3.0, 1.0, 230), (12.0, 0.0, 115)];
+
+/// The island without a background: opaque, near black.
+const BARE_ISLAND: Color = Color {
+    A: 255,
+    R: 4,
+    G: 7,
+    B: 6,
+};
+
+/// The bar's background fills: none without a background, even without
+/// transparency, where the bar is otherwise solid.
+fn strip_fills(gfx: &Gfx, look: &Look) -> Result<Vec<CompositionBrush>> {
+    if look.widgets.bare {
+        return Ok(Vec::new());
+    }
+    Theme::for_bar(appearance::Look {
+        material: look.material,
+        light: look.light,
+        glass: look.glass,
+    })
+    .fills(gfx)
+}
+
+/// Dark shadows shaped like the item (`mask`), under it, so white text and
+/// icons stay legible on any wallpaper.
+fn add_halo(
+    c: &Compositor,
+    layers: &VisualCollection,
+    mask: &CompositionBrush,
+    size: Vector2,
+    offset: Vector3,
+    scale: f32,
+) -> Result<()> {
+    for (blur, lift, alpha) in HALO {
+        let shadow = c.CreateDropShadow()?;
+        shadow.SetMask(mask)?;
+        shadow.SetBlurRadius(blur * scale)?;
+        shadow.SetOffset(Vector3::new(0.0, (lift * scale).round(), 0.0))?;
+        shadow.SetColor(rgba(0, 0, 0, alpha))?;
+        let host = c.CreateSpriteVisual()?;
+        host.SetSize(size)?;
+        host.SetOffset(offset)?;
+        host.SetShadow(&shadow)?;
+        layers.InsertAtTop(&host)?;
+    }
+    Ok(())
 }
 
 /// What "Only the essentials" keeps: status and the clock, not the buttons
@@ -238,6 +292,7 @@ impl Default for MenuBarWidgets {
             notifications: false,
             system_monitor: false,
             essentials: false,
+            bare: false,
         }
     }
 }
@@ -2246,7 +2301,9 @@ impl MenuBar {
             screen: monitor.screen,
             scale: monitor.scale,
             material: appearance.material,
-            light: appearance.light,
+            // Without a background the ink is white and the island dark,
+            // like its popups, whatever the Windows theme.
+            light: appearance.light && !self.widgets.bare,
             glass: appearance.glass,
             app_name: self.app_name.clone(),
             clock: system::clock_text(),
@@ -2541,12 +2598,7 @@ impl MenuBar {
         let island_layers = island_root.Children()?;
         // Without transparency the bar is solid, as macOS draws it with
         // "Reduce transparency".
-        let fills = Theme::for_bar(appearance::Look {
-            material: look.material,
-            light: look.light,
-            glass: look.glass,
-        })
-        .fills(gfx)?;
+        let fills = strip_fills(gfx, look)?;
         for brush in &fills {
             let fill = c.CreateSpriteVisual()?;
             fill.SetSize(Vector2 {
@@ -2566,12 +2618,17 @@ impl MenuBar {
                 X: item.width,
                 Y: item.height,
             })?;
-            visual.SetOffset(Vector3 {
+            let offset = Vector3 {
                 X: left.round(),
                 Y: ((height - item.height) / 2.0).round(),
                 Z: 0.0,
-            })?;
+            };
+            visual.SetOffset(offset)?;
             visual.SetBrush(&item.brush)?;
+            if look.widgets.bare {
+                let size = Vector2::new(item.width, item.height);
+                add_halo(c, layers, &item.brush.cast()?, size, offset, scale)?;
+            }
             layers.InsertAtTop(&visual)?;
             Ok(visual)
         };
@@ -2752,12 +2809,17 @@ impl MenuBar {
                         X: brush.width,
                         Y: brush.height,
                     })?;
-                    visual.SetOffset(Vector3 {
+                    let offset = Vector3 {
                         X: left.round(),
                         Y: top.round(),
                         Z: 0.0,
-                    })?;
+                    };
+                    visual.SetOffset(offset)?;
                     visual.SetBrush(&brush.brush)?;
+                    if look.widgets.bare {
+                        let size = Vector2::new(brush.width, brush.height);
+                        add_halo(c, &layers, &brush.brush.cast()?, size, offset, scale)?;
+                    }
                     layers.InsertAtTop(&visual)?;
                 }
                 if column == 1 {
@@ -4053,13 +4115,15 @@ fn island_surface(
     let silhouette = gfx.island_mask(island_width, island_height, scale)?;
     content.InsertAtTop(&island_shadow(c, &silhouette.cast()?, size, geometry)?)?;
 
-    let tint = match (look.light, look.glass) {
-        (true, true) => rgba(247, 249, 252, 243),
-        (false, true) => rgba(7, 9, 13, 242),
-        (true, false) => rgba(247, 249, 252, 255),
-        (false, false) => rgba(10, 12, 17, 255),
+    let tint = match (look.widgets.bare, look.light, look.glass) {
+        (true, _, _) => BARE_ISLAND,
+        (false, true, true) => rgba(247, 249, 252, 243),
+        (false, false, true) => rgba(7, 9, 13, 242),
+        (false, true, false) => rgba(247, 249, 252, 255),
+        (false, false, false) => rgba(10, 12, 17, 255),
     };
-    if look.glass {
+    // Without a background the island is opaque, not glass.
+    if look.glass && !look.widgets.bare {
         // The backdrop cannot be used as a mask-brush source. Inset its
         // rounded clip so it stays entirely inside the curved silhouette.
         let inset = (12.0 * scale)
@@ -4594,6 +4658,69 @@ impl Drop for MenuBar {
 #[cfg(test)]
 mod island_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Hidden compositor fixture; synthetic preferences, nothing is opened"]
+    fn native_bare_bar_draws_no_strip_and_halos_every_item() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, false, true, MenuBarWidgets::default())?;
+        bar.set_visible(false)?;
+        let mut look = bar.look.clone().context("initial look")?;
+        look.screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        look.app_name = "Prueba".to_owned();
+        look.track = Some(Track::test_fixture());
+        for glass in [true, false] {
+            for bare in [false, true] {
+                look.glass = glass;
+                look.widgets.bare = bare;
+                assert_eq!(
+                    strip_fills(&gfx, &look)?.is_empty(),
+                    bare,
+                    "glass={glass} bare={bare}"
+                );
+                bar.apply_look(&gfx, look.clone())?;
+                let root: ContainerVisual = bar.content_root()?.cast()?;
+                let mut halos = 0;
+                for child in root.Children()? {
+                    if let Ok(sprite) = child.cast::<SpriteVisual>()
+                        && sprite.Shadow().is_ok()
+                    {
+                        halos += 1;
+                    }
+                }
+                if bare {
+                    assert!(halos > 0 && halos % 2 == 0, "glass={glass}: {halos}");
+                } else {
+                    assert_eq!(halos, 0, "glass={glass}");
+                }
+            }
+        }
+        // White ink and a dark island whatever the Windows theme.
+        let widgets = MenuBarWidgets {
+            bare: true,
+            ..MenuBarWidgets::default()
+        };
+        bar.set_widgets(&gfx, widgets)?;
+        assert!(!bar.look.as_ref().context("look")?.light);
+        Ok(())
+    }
 
     #[test]
     fn essentials_keep_status_but_drop_shell_buttons() {

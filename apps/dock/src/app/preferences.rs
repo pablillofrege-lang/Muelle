@@ -318,6 +318,7 @@ impl App {
             notifications: self.config.menu_bar_notifications,
             system_monitor: self.config.menu_bar_system_monitor,
             essentials: self.config.menu_bar_essentials,
+            bare: self.config.menu_bar_bare,
         };
         if !self.config.menu_bar {
             self.menubar = None;
