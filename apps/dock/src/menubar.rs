@@ -1988,6 +1988,10 @@ impl MenuBar {
             self.queue_volume(span, y);
             return self.paint_volume_preview(gfx);
         }
+        if self.ghost && !self.revealed && self.hide_until.is_none() {
+            // The edge watcher applies the same dwell to the resting island.
+            return Ok(());
+        }
         let span = if y < (self.bounds.bottom - self.bounds.top) as f32 {
             self.triggers_span
         } else {
@@ -2125,7 +2129,12 @@ impl MenuBar {
                 );
             }
         }
-        edge_watch::set_menu_bar((self.visible && hidden).then_some(bounds));
+        let island = (presence == Presence::IslandOnly).then(|| RECT {
+            left: bounds.left + self.triggers_span.left.floor() as i32,
+            right: bounds.left + self.triggers_span.right.ceil() as i32,
+            ..bounds
+        });
+        edge_watch::set_menu_bar((self.visible && hidden).then_some(bounds), island);
         self.sync_outside_click_hook()
     }
 
@@ -2295,9 +2304,18 @@ impl MenuBar {
     }
 
     pub fn click(&mut self, gfx: &Gfx, x: f32, y: f32) -> Result<()> {
+        let resting_island = self.presence_now() == Presence::IslandOnly;
+        if self.ghost && !self.revealed && !resting_island && self.hide_until.is_none() {
+            // Only the fading island can still be on screen here.
+            return Ok(());
+        }
         if let Some(hit) = self.island_hits.iter().find(|hit| hit.at(x, y)) {
             match hit.action {
                 IslandAction::Toggle(island) => {
+                    if resting_island {
+                        // An explicit click can open the panel immediately.
+                        self.hover(gfx, true)?;
+                    }
                     self.panel = toggle_panel(self.panel, island);
                     if self.panel.is_some() {
                         let mut track = TRACKMOUSEEVENT {
@@ -2337,7 +2355,7 @@ impl MenuBar {
             }
             return self.refresh(gfx);
         }
-        if y >= (self.bounds.bottom - self.bounds.top) as f32 {
+        if resting_island || y >= (self.bounds.bottom - self.bounds.top) as f32 {
             return Ok(());
         }
         self.dismiss_island(gfx)?;
@@ -4786,7 +4804,7 @@ impl Drop for MenuBar {
         self.media = None;
         ISLAND_HOOK_WINDOW.store(0, Ordering::Relaxed);
         ISLAND_REGION_ACTIVE.store(false, Ordering::Relaxed);
-        edge_watch::set_menu_bar(None);
+        edge_watch::set_menu_bar(None, None);
         if let Some(hook) = self.outside_click_hook.take() {
             // SAFETY: Do not leave a callback pointing at a destroyed window.
             unsafe {
