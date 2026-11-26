@@ -344,30 +344,57 @@ pub fn battery() -> Option<Battery> {
         })
 }
 
+/// Current date with weekday, day and month in the user's language.
+pub fn date_text() -> String {
+    use windows::Win32::Globalization::GetDateFormatEx;
+    let mut date = [0u16; 64];
+    // SAFETY: The buffer lives for the call. The returned length includes the terminator.
+    let len = unsafe {
+        GetDateFormatEx(
+            None,
+            Default::default(),
+            None,
+            w!("ddd d MMM"),
+            Some(&mut date),
+            None,
+        )
+    };
+    String::from_utf16_lossy(&date[..(len - 1).max(0) as usize])
+}
+
+fn format_time(format: windows::core::PCWSTR) -> String {
+    use windows::Win32::Globalization::{GetTimeFormatEx, TIME_NOSECONDS};
+    let mut time = [0u16; 32];
+    let flags = if format.is_null() {
+        TIME_NOSECONDS
+    } else {
+        Default::default()
+    };
+    // SAFETY: The buffer and any explicit format live for the call.
+    let len = unsafe { GetTimeFormatEx(None, flags, None, format, Some(&mut time)) };
+    String::from_utf16_lossy(&time[..(len - 1).max(0) as usize])
+}
+
+/// Regional time, optionally padded to HH:mm when Windows uses a 24-hour clock.
+pub fn time_text(pad_24_hour: bool) -> String {
+    use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_ITIME};
+    if !pad_24_hour {
+        return format_time(windows::core::PCWSTR::null());
+    }
+    let mut mode = [0u16; 2];
+    // SAFETY: The buffer lives for the call and fits the one-digit setting and terminator.
+    let len = unsafe { GetLocaleInfoEx(None, LOCALE_ITIME, Some(&mut mode)) };
+    format_time(if len == 2 && mode[0] == u16::from(b'1') {
+        w!("HH':'mm")
+    } else {
+        windows::core::PCWSTR::null()
+    })
+}
+
 /// Current date and time in the regional format of the user, e.g. "vie 13 nov  19:42".
 #[must_use]
 pub fn clock_text() -> String {
-    use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
-    let mut date = [0u16; 64];
-    let mut time = [0u16; 32];
-    // SAFETY: The buffers live for the calls, which return the length written
-    // including the terminator (0 on failure).
-    let (date_len, time_len) = unsafe {
-        (
-            GetDateFormatEx(
-                None,
-                Default::default(),
-                None,
-                w!("ddd d MMM"),
-                Some(&mut date),
-                None,
-            ),
-            GetTimeFormatEx(None, TIME_NOSECONDS, None, None, Some(&mut time)),
-        )
-    };
-    let text =
-        |buffer: &[u16], len: i32| String::from_utf16_lossy(&buffer[..(len - 1).max(0) as usize]);
-    format!("{}  {}", text(&date, date_len), text(&time, time_len))
+    format!("{}  {}", date_text(), time_text(false))
 }
 
 #[cfg(test)]

@@ -88,6 +88,7 @@ use crate::{
     usage::{
         self, ActiveProviders, Monitor as UsageMonitor, Provider, ProviderUsage, Snapshot, State,
     },
+    weather,
 };
 
 // Logical pixels.
@@ -349,7 +350,8 @@ struct Look {
     glass: bool,
     zoned: bool,
     app_name: String,
-    clock: String,
+    clock: ClockLabels,
+    weather: Option<weather::Reading>,
     /// The input language indicator, when more than one is installed.
     input: Option<String>,
     battery: Option<Battery>,
@@ -361,6 +363,26 @@ struct Look {
     panel: Option<Island>,
     usage_refreshing: bool,
     track: Option<Track>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClockLabels {
+    left: Option<String>,
+    right: String,
+}
+
+fn clock_labels(zoned: bool, date: String, time: String) -> ClockLabels {
+    if zoned {
+        ClockLabels {
+            left: Some(time),
+            right: date,
+        }
+    } else {
+        ClockLabels {
+            left: None,
+            right: format!("{date}  {time}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -474,14 +496,18 @@ struct RevealedSides {
     right: bool,
 }
 
+impl RevealedSides {
+    const ON_ENTRY: Self = Self {
+        left: true,
+        right: false,
+    };
+}
+
 fn revealed_at(sides: Option<RevealedSides>, zone: PointerZone) -> Option<RevealedSides> {
     match zone {
         PointerZone::Outside => None,
-        PointerZone::Center => Some(sides.unwrap_or_default()),
-        PointerZone::Left => sides.map(|sides| RevealedSides {
-            left: true,
-            ..sides
-        }),
+        PointerZone::Center => sides.or(Some(RevealedSides::ON_ENTRY)),
+        PointerZone::Left => sides,
         PointerZone::Right => sides.map(|sides| RevealedSides {
             right: true,
             ..sides
@@ -924,6 +950,8 @@ pub struct MenuBar {
     appbar: Option<AppBar>,
     app_name: String,
     look: Option<Look>,
+    weather: weather::Cache,
+    clock_running: bool,
     /// Clickable spans, in window pixels.
     zones: Vec<(f32, f32, Action)>,
     visible: bool,
@@ -1639,6 +1667,8 @@ impl MenuBar {
             appbar: AppBar::register(hwnd, APPBAR_CALLBACK),
             app_name: String::new(),
             look: None,
+            weather: weather::Cache::default(),
+            clock_running: false,
             zones: Vec::new(),
             visible: true,
             auto_hide,
@@ -1697,7 +1727,6 @@ impl MenuBar {
         AUDIO_TICK_PENDING.store(false, Ordering::Relaxed);
         bar.update_status();
         bar.refresh(gfx)?;
-        bar.schedule_next_minute();
         Ok(bar)
     }
 
@@ -1706,7 +1735,11 @@ impl MenuBar {
             return Ok(());
         }
         name.clone_into(&mut self.app_name);
-        self.refresh(gfx)
+        if self.zoned() {
+            Ok(())
+        } else {
+            self.refresh(gfx)
+        }
     }
 
     /// Hidden while an app is full screen.
@@ -1985,6 +2018,13 @@ impl MenuBar {
         }
     }
 
+    pub fn set_weather(&mut self, gfx: &Gfx, settings: muelle_config::Weather) -> Result<()> {
+        if self.weather.configure(settings) && self.zoned() && self.revealed {
+            self.refresh(gfx)?;
+        }
+        Ok(())
+    }
+
     /// The pointer reached the top edge or left the bar.
     pub fn hover(&mut self, gfx: &Gfx, inside: bool) -> Result<()> {
         if self.volume_drag.is_some() && !inside {
@@ -2002,7 +2042,12 @@ impl MenuBar {
         self.exit_animation = None;
         self.revealed = inside;
         if inside && self.zoned() && !was_hiding {
-            self.revealed_sides = RevealedSides::default();
+            self.revealed_sides = RevealedSides::ON_ENTRY;
+        }
+        let zoned_reveal = inside && self.zoned() && self.visible;
+        if zoned_reveal {
+            self.weather.reveal();
+            self.weather.poll();
         }
         self.hide_until = (!inside && animated)
             .then(|| Instant::now() + Duration::from_millis(u64::from(HIDE_FALLBACK_MS)));
@@ -2012,6 +2057,10 @@ impl MenuBar {
             self.motion_layer()
                 .SetOffset(Vector3::new(0.0, -self.reveal_lift(), 0.0))?;
             self.motion_layer().SetOpacity(0.0)?;
+        }
+        if zoned_reveal {
+            // Lay out the clock before showing the capsule, especially with animations off.
+            self.refresh_with_usage(gfx, usage::Refresh::Reveal)?;
         }
         self.place()?;
         if animated && let Err(error) = self.animate_visibility(gfx, inside) {
@@ -2030,12 +2079,15 @@ impl MenuBar {
             // SAFETY: `track` is a valid structure with its size initialized.
             unsafe { TrackMouseEvent(&mut track)? };
         }
-        let reason = if inside && self.ghost && self.visible {
-            usage::Refresh::Reveal
-        } else {
-            usage::Refresh::Scheduled
-        };
-        self.refresh_with_usage(gfx, reason)
+        if !zoned_reveal {
+            let reason = if inside && self.ghost && self.visible {
+                usage::Refresh::Reveal
+            } else {
+                usage::Refresh::Scheduled
+            };
+            self.refresh_with_usage(gfx, reason)?;
+        }
+        Ok(())
     }
 
     fn reveal_lift(&self) -> f32 {
@@ -2232,7 +2284,11 @@ impl MenuBar {
         let mut point = POINT::default();
         // SAFETY: Read-only cursor query in the same DPI context as `bounds`.
         unsafe { GetCursorPos(&mut point)? };
-        self.pointer_left_at(gfx, point)
+        self.pointer_left_at(gfx, point)?;
+        if self.zoned() && self.visible && self.revealed && self.weather.poll() {
+            self.refresh(gfx)?;
+        }
+        Ok(())
     }
 
     fn pointer_left_at(&mut self, gfx: &Gfx, point: POINT) -> Result<()> {
@@ -2409,6 +2465,7 @@ impl MenuBar {
         let on_screen = show_bar || island_hiding;
         let full = presence == Presence::Full;
         let zoned = self.zoned();
+        self.sync_clock(!zoned || full);
         let sides = self.visible_sides(presence, hiding);
         if let Some([left, right]) = &self.capsule_layers {
             left.SetIsVisible(sides.left)?;
@@ -2635,7 +2692,9 @@ impl MenuBar {
         if self.accessories_enabled && (audio_changed || retry_due) {
             self.restart_accessories(gfx)?;
         }
-        self.schedule_next_minute();
+        if self.clock_running {
+            self.schedule_next_minute();
+        }
         self.refresh(gfx)
     }
 
@@ -2707,6 +2766,21 @@ impl MenuBar {
             privacy: status::privacy(),
             battery_percentage: status::battery_percentage_enabled(),
         };
+    }
+
+    fn sync_clock(&mut self, running: bool) {
+        if running == self.clock_running {
+            return;
+        }
+        self.clock_running = running;
+        if running {
+            self.schedule_next_minute();
+        } else {
+            // SAFETY: The timer belongs to our live window.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), CLOCK_TIMER);
+            }
+        }
     }
 
     /// One wake-up per minute, aligned to the minute, instead of polling.
@@ -2873,6 +2947,16 @@ impl MenuBar {
             usage.refresh(reason);
         }
         let appearance = appearance::menu_bar();
+        let zoned = self.zoned();
+        let date = system::date_text();
+        let time = if zoned && !self.revealed {
+            self.look
+                .as_ref()
+                .and_then(|look| look.clock.left.clone())
+                .unwrap_or_default()
+        } else {
+            system::time_text(zoned)
+        };
         let look = Look {
             accessories: self.accessories.as_ref().map_or([None, None], |monitor| {
                 accessory_readings(&monitor.snapshot())
@@ -2886,9 +2970,14 @@ impl MenuBar {
             // like its popups, whatever the Windows theme.
             light: appearance.light && !self.widgets.bare,
             glass: appearance.glass,
-            zoned: self.zoned(),
-            app_name: self.app_name.clone(),
-            clock: system::clock_text(),
+            zoned,
+            app_name: if zoned {
+                String::new()
+            } else {
+                self.app_name.clone()
+            },
+            clock: clock_labels(zoned, date, time),
+            weather: self.weather.reading().filter(|_| zoned),
             input: system::input_language(),
             battery: system::battery(),
             status: self.status,
@@ -3243,8 +3332,44 @@ impl MenuBar {
         };
 
         self.zones.clear();
+        let slop = px(HIT_SLOP);
         let mut left_end = px(LEFT_MARGIN);
-        if !look.app_name.is_empty() {
+        if let Some(time) = look.clock.left.as_deref().filter(|time| !time.is_empty()) {
+            let clock = gfx.text_brush(time, scale, true, ink)?;
+            if let Some(reading) = look.weather {
+                let glyph = reading
+                    .glyph()
+                    .map(|glyph| gfx.symbol_brush(glyph, scale, ink))
+                    .transpose()?;
+                let gap = px(6.0);
+                let glyph_width = glyph.as_ref().map_or(0.0, |glyph| glyph.width + gap);
+                let budget = px(220.0).min(width * 0.22) - clock.width - glyph_width - px(10.0);
+                let current = format!("{} °C", reading.temperature);
+                let mut temperature = gfx.text_brush(&current, scale, true, ink)?;
+                if let Some((high, low)) = reading.high_low {
+                    let range = format!("{current}  {high}°/{low}°");
+                    let extended = gfx.text_brush(&range, scale, true, ink)?;
+                    if extended.width <= budget {
+                        temperature = extended;
+                    }
+                }
+                if temperature.width <= budget {
+                    if let Some(glyph) = glyph {
+                        place(&left_layers, &glyph, left_end)?;
+                        left_end += glyph_width;
+                    }
+                    place(&left_layers, &temperature, left_end)?;
+                    left_end += temperature.width + px(10.0);
+                }
+            }
+            place(&left_layers, &clock, left_end)?;
+            self.zones.push((
+                left_end - slop,
+                left_end + clock.width + slop,
+                Action::Clock,
+            ));
+            left_end += clock.width;
+        } else if !look.zoned && !look.app_name.is_empty() {
             let name = gfx.text_brush_fitted(
                 &look.app_name,
                 scale,
@@ -3258,7 +3383,6 @@ impl MenuBar {
         }
 
         // Right side, from the edge inward.
-        let slop = px(HIT_SLOP);
         let right_margin = if look.zoned {
             BARE_RIGHT_MARGIN
         } else {
@@ -3279,7 +3403,7 @@ impl MenuBar {
             ));
         }
         items.push((
-            gfx.text_brush(&look.clock, scale, look.zoned, ink)?,
+            gfx.text_brush(&look.clock.right, scale, look.zoned, ink)?,
             Action::Clock,
         ));
         items.push((gfx.control_center_brush(scale, ink)?, Action::QuickSettings));
@@ -5695,6 +5819,25 @@ mod island_tests {
     }
 
     #[test]
+    fn zoned_capsules_split_the_combined_clock_into_time_and_date() {
+        let labels = |zoned| clock_labels(zoned, "jue 26 nov".into(), "09:42".into());
+        assert_eq!(
+            labels(true),
+            ClockLabels {
+                left: Some("09:42".into()),
+                right: "jue 26 nov".into(),
+            }
+        );
+        assert_eq!(
+            labels(false),
+            ClockLabels {
+                left: None,
+                right: "jue 26 nov  09:42".into(),
+            }
+        );
+    }
+
+    #[test]
     fn needs_pointer_timer_is_off_while_only_the_island_rests() {
         use Presence::*;
         assert!(!needs_pointer_timer(
@@ -5791,7 +5934,7 @@ mod island_tests {
     }
 
     #[test]
-    fn sides_require_center_entry_and_stay_revealed_until_exit() {
+    fn center_reveals_the_left_capsule_and_only_the_right_adds_a_capsule() {
         let bounds = RECT {
             left: -1920,
             top: -30,
@@ -5812,38 +5955,23 @@ mod island_tests {
             left: true,
             right: true,
         });
-        let center_only = Some(RevealedSides::default());
+        let center_reveal = Some(RevealedSides {
+            left: true,
+            right: false,
+        });
         let mut sides = None;
         for (point, expected) in [
             (left, None),
             (right, None),
-            (center, center_only),
-            (
-                right,
-                Some(RevealedSides {
-                    left: false,
-                    right: true,
-                }),
-            ),
-            (
-                center,
-                Some(RevealedSides {
-                    left: false,
-                    right: true,
-                }),
-            ),
+            (center, center_reveal),
+            (right, both),
+            (center, both),
             (left, both),
             (right, both),
             (below, None),
             (left, None),
-            (center, center_only),
-            (
-                left,
-                Some(RevealedSides {
-                    left: true,
-                    right: false,
-                }),
-            ),
+            (center, center_reveal),
+            (left, center_reveal),
         ] {
             sides = revealed_at(sides, strip_zone(bounds, entrance, point));
             assert_eq!(sides, expected, "pointer at {point:?}");

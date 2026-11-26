@@ -1059,11 +1059,25 @@ impl Gfx {
     /// in a square. Layers are drawn in order with their opacity, so a dim full
     /// Wi-Fi fan can sit behind the bars actually received.
     pub fn glyph_brush(&self, layers: &[(char, f32)], scale: f32, ink: Ink) -> Result<LabelBrush> {
+        self.glyph_brush_with_font(layers, scale, ink, icon_font())
+    }
+
+    pub fn symbol_brush(&self, symbol: char, scale: f32, ink: Ink) -> Result<LabelBrush> {
+        self.glyph_brush_with_font(&[(symbol, 1.0)], scale, ink, w!("Segoe UI Symbol"))
+    }
+
+    fn glyph_brush_with_font(
+        &self,
+        layers: &[(char, f32)],
+        scale: f32,
+        ink: Ink,
+        font: windows::core::PCWSTR,
+    ) -> Result<LabelBrush> {
         let side = (18.0 * scale).round();
         // SAFETY: The format lives for the drawing below.
         let format = unsafe {
             let format = self.dwrite.CreateTextFormat(
-                icon_font(),
+                font,
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
