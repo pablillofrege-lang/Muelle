@@ -130,13 +130,13 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn configure(&mut self, settings: Weather) -> bool {
-        if self.settings == settings {
+    pub fn configure(&mut self, settings: &Weather) -> bool {
+        if &self.settings == settings {
             return false;
         }
         // New coordinates, or the weather turned on: ask on the next reveal.
         *self = Self {
-            settings,
+            settings: settings.clone(),
             ..Self::default()
         };
         true
@@ -160,7 +160,7 @@ impl Cache {
         now: Instant,
         start: impl FnOnce(f64, f64) -> Option<Receiver<Option<Reading>>>,
     ) {
-        let settings = self.settings;
+        let settings = &self.settings;
         if !settings.enabled
             || !settings.has_valid_coordinates()
             || self.pending.is_some()
@@ -402,7 +402,7 @@ mod tests {
     /// A cache with coordinates other than the default ones.
     fn cache() -> Cache {
         let mut cache = Cache::default();
-        cache.configure(Weather {
+        cache.configure(&Weather {
             latitude: 40.0,
             ..Weather::default()
         });
@@ -505,11 +505,11 @@ mod tests {
         let mut queries = Queries::default();
         assert!(queries.fetch(&mut cache, t0, Some(SUNNY)));
         assert!(cache.poll_at(t0));
-        let settings = cache.settings;
-        assert!(!cache.configure(settings), "unchanged");
+        let settings = cache.settings.clone();
+        assert!(!cache.configure(&settings), "unchanged");
         assert_eq!(cache.reading_at(t0), Some(SUNNY));
 
-        assert!(cache.configure(Weather {
+        assert!(cache.configure(&Weather {
             longitude: -3.0,
             ..settings
         }));
@@ -520,11 +520,11 @@ mod tests {
         // Off, nothing is asked; turned back on, the next reveal asks.
         let off = Weather {
             enabled: false,
-            ..cache.settings
+            ..cache.settings.clone()
         };
-        assert!(cache.configure(off));
+        assert!(cache.configure(&off));
         assert!(!queries.reveal(&mut cache, moved));
-        assert!(cache.configure(Weather {
+        assert!(cache.configure(&Weather {
             enabled: true,
             ..off
         }));
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn coordinates_out_of_range_never_start_a_query() {
         let mut cache = Cache::default();
-        cache.configure(Weather {
+        cache.configure(&Weather {
             latitude: 91.0,
             ..Weather::default()
         });

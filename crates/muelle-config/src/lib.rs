@@ -64,6 +64,7 @@ pub struct Config {
     /// The screen edge the dock sits on. Bottom by default, as on macOS;
     /// never the top, which belongs to the menu bar.
     pub dock_position: DockPosition,
+    pub dock_style: DockStyle,
     pub dock_density: DockDensity,
     pub dock_auto_hide_speed: DockAutoHideSpeed,
     pub show_start: bool,
@@ -110,7 +111,9 @@ pub struct Config {
     /// (e.g. the Clock app or a calendar). `None` keeps the notification
     /// center and calendar, as on the Windows taskbar.
     pub menu_bar_clock_target: Option<String>,
-    /// Weather shown in the left capsule of the zoned ghost bar.
+    /// Show the date, time and forecast on the primary desktop.
+    pub desktop_clock: bool,
+    /// Forecast shown by the desktop clock and in the left capsule of the zoned ghost bar.
     pub weather: Weather,
     /// CPU, memory and network speed in the menu bar (issue #64). Off by
     /// default: off, nothing is sampled; on, every 2 s only while the bar
@@ -173,11 +176,14 @@ pub struct Config {
     // button.
 }
 
-/// Forecast coordinates and display preference for the zoned bar.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Forecast location and display preferences.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Weather {
     pub enabled: bool,
+    /// Ask Windows for the current location. Manual coordinates are the fallback.
+    pub auto: bool,
+    pub city: String,
     pub latitude: f64,
     pub longitude: f64,
 }
@@ -186,6 +192,8 @@ impl Default for Weather {
     fn default() -> Self {
         Self {
             enabled: true,
+            auto: false,
+            city: "Jaén".into(),
             latitude: 37.7796,
             longitude: -3.7849,
         }
@@ -223,6 +231,16 @@ pub enum DockPosition {
     #[default]
     #[serde(other)]
     Bottom,
+}
+
+/// The dock background and accents. Independent of the menu bar appearance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockStyle {
+    A,
+    #[default]
+    #[serde(other)]
+    Original,
 }
 
 /// Which mascot comes out for the moments worth it.
@@ -411,6 +429,7 @@ impl Default for Config {
             icon_size: 48,
             magnification: true,
             dock_position: DockPosition::Bottom,
+            dock_style: DockStyle::Original,
             dock_density: DockDensity::Normal,
             dock_auto_hide_speed: DockAutoHideSpeed::Normal,
             show_start: true,
@@ -436,6 +455,7 @@ impl Default for Config {
             menu_bar_ai_alerts: false,
             menu_bar_essentials: false,
             menu_bar_clock_target: None,
+            desktop_clock: false,
             weather: Weather::default(),
             accessory_battery: false,
             show_indicators: true,
@@ -1078,11 +1098,31 @@ mod tests {
     }
 
     #[test]
+    fn desktop_clock_and_glass_a_are_opt_in() -> Result<(), serde_json::Error> {
+        let legacy: Config = serde_json::from_str(r#"{"weather":{"enabled":false}}"#)?;
+        assert!(!legacy.desktop_clock);
+        assert_eq!(legacy.dock_style, DockStyle::Original);
+        assert!(!legacy.weather.auto);
+        assert_eq!(legacy.weather.city, "Jaén");
+        let selected: Config = serde_json::from_str(
+            r#"{"desktopClock":true,"dockStyle":"a","weather":{"auto":true,"city":"Málaga"}}"#,
+        )?;
+        assert!(selected.desktop_clock && selected.weather.auto);
+        assert_eq!(selected.dock_style, DockStyle::A);
+        assert_eq!(selected.weather.city, "Málaga");
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&selected)?)?,
+            selected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn weather_coordinates_out_of_range_are_flagged() {
         let at = |latitude, longitude| Weather {
-            enabled: true,
             latitude,
             longitude,
+            ..Weather::default()
         };
         assert!(at(90.0, -180.0).has_valid_coordinates());
         assert!(at(-90.0, 180.0).has_valid_coordinates());

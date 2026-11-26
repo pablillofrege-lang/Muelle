@@ -2359,7 +2359,7 @@ impl MenuBar {
         }
     }
 
-    pub fn set_weather(&mut self, gfx: &Gfx, settings: muelle_config::Weather) -> Result<()> {
+    pub fn set_weather(&mut self, gfx: &Gfx, settings: &muelle_config::Weather) -> Result<()> {
         if self.weather.configure(settings) && self.zoned() && self.revealed {
             // Changed while revealed: this counts as the reveal that asks.
             self.weather.reveal();

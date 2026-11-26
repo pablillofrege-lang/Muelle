@@ -392,7 +392,7 @@ impl App {
                 .and_then(|()| {
                     bar.set_accessories_enabled(&self.gfx, self.config.accessory_battery)
                 })
-                .and_then(|()| bar.set_weather(&self.gfx, self.config.weather));
+                .and_then(|()| bar.set_weather(&self.gfx, &self.config.weather));
             if let Err(error) = applied {
                 eprintln!("muelle: barra superior: {error:#}");
             }
