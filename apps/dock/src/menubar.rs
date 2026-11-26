@@ -427,6 +427,21 @@ impl Span {
     }
 }
 
+fn island_or_panel_span(
+    x: f32,
+    y: f32,
+    bar_height: f32,
+    island_height: f32,
+    island: Span,
+    panel: Span,
+) -> Span {
+    if y < bar_height || (y < island_height && x >= island.left && x < island.right) {
+        island
+    } else {
+        panel
+    }
+}
+
 /// How much of the bar is on screen. With the ghost bar, at rest only the
 /// island shows (`IslandOnly`); the top edge reveals the rest (`Full`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2081,11 +2096,14 @@ impl MenuBar {
             // The edge watcher applies the same dwell to the resting island.
             return Ok(());
         }
-        let span = if y < self.island_height {
-            self.triggers_span
-        } else {
-            self.panel_span
-        };
+        let span = island_or_panel_span(
+            x,
+            y,
+            (self.bounds.bottom - self.bounds.top) as f32,
+            self.island_height,
+            self.triggers_span,
+            self.panel_span,
+        );
         if self.panel.is_some() && (x < span.left || x >= span.right) {
             self.dismiss_island(gfx)?;
         }
