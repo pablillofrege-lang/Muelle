@@ -3,17 +3,21 @@
 use std::{
     env,
     io::Read,
-    os::windows::process::CommandExt,
-    process::Command,
+    os::windows::{io::AsRawHandle, process::CommandExt},
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use muelle_config::Weather;
 use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
+use windows::Win32::{
+    Foundation::{HANDLE, WAIT_OBJECT_0},
+    System::Threading::WaitForSingleObject,
+};
 
 pub const WORKER_FLAG: &str = "--weather-worker";
 const VALID_FOR: Duration = Duration::from_secs(30 * 60);
@@ -22,6 +26,9 @@ const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 /// A reading older than this is no longer shown when a query fails.
 const KEEP_FOR: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_ERROR_BYTES: usize = 1024;
+/// The worker's own HTTP timeout is 6 s; this bounds a hung process.
+const WORKER_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Condition {
@@ -211,16 +218,64 @@ impl Cache {
 }
 
 fn fetch_in_child(latitude: f64, longitude: f64) -> Option<Reading> {
+    run_child(latitude, longitude)
+        .inspect_err(|error| muelle_shell::log::line(&format!("tiempo: {error:#}")))
+        .ok()
+}
+
+fn run_child(latitude: f64, longitude: f64) -> Result<Reading> {
     // Like the usage worker, release the HTTP runtime and TLS heap on exit.
-    let output = Command::new(env::current_exe().ok()?)
+    let mut child = Command::new(env::current_exe()?)
         .args([WORKER_FLAG, &latitude.to_string(), &longitude.to_string()])
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("no se pudo iniciar la consulta")?;
+    // Both outputs are a few hundred bytes, well within the pipe buffers,
+    // so the child never blocks on them before it exits.
+    // SAFETY: The handle belongs to the live child until `wait` below.
+    let finished = unsafe {
+        WaitForSingleObject(
+            HANDLE(child.as_raw_handle()),
+            WORKER_DEADLINE.as_millis() as u32,
+        )
+    } == WAIT_OBJECT_0;
+    if !finished {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "la consulta no respondió en {} s y se cerró",
+            WORKER_DEADLINE.as_secs()
+        );
     }
-    serde_json::from_slice(&output.stdout).ok()
+    let status = child.wait()?;
+    let stdout = read_capped(child.stdout.take(), MAX_RESPONSE_BYTES);
+    if !status.success() {
+        let stderr = read_capped(child.stderr.take(), MAX_ERROR_BYTES);
+        bail!("la consulta falló ({status}): {}", error_summary(&stderr));
+    }
+    serde_json::from_slice(&stdout).context("respuesta de la consulta no válida")
+}
+
+fn read_capped(pipe: Option<impl Read>, limit: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if let Some(pipe) = pipe {
+        let _ = pipe.take(limit as u64).read_to_end(&mut bytes);
+    }
+    bytes
+}
+
+/// The worker's error on one line. It never holds the coordinates: the
+/// worker strips the request URL from its errors.
+fn error_summary(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim().trim_start_matches("Error:").trim();
+    if text.is_empty() {
+        return "sin detalles".into();
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn worker_main(latitude: &str, longitude: &str) -> Result<()> {
@@ -234,17 +289,20 @@ pub fn worker_main(latitude: &str, longitude: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(6))
         .redirect(Policy::none())
-        .build()?;
+        .build()
+        .map_err(reqwest::Error::without_url)?;
     let url = format!(
         "https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}\
          &current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min\
          &temperature_unit=celsius&timezone=auto&forecast_days=1"
     );
     let mut body = Vec::new();
+    // The dock logs this error: keep the URL, with the coordinates, out of it.
     client
         .get(url)
-        .send()?
-        .error_for_status()?
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(reqwest::Error::without_url)?
         .take((MAX_RESPONSE_BYTES + 1) as u64)
         .read_to_end(&mut body)?;
     ensure!(
@@ -484,5 +542,15 @@ mod tests {
         let mut queries = Queries::default();
         assert!(!queries.reveal(&mut cache, Instant::now()));
         assert_eq!(queries.started, 0);
+    }
+
+    #[test]
+    fn the_logged_worker_error_fits_on_one_line() {
+        let stderr = b"Error: error sending request\n\nCaused by:\n    0: dns error\n";
+        assert_eq!(
+            error_summary(stderr),
+            "error sending request Caused by: 0: dns error"
+        );
+        assert_eq!(error_summary(b"  \r\n"), "sin detalles");
     }
 }
