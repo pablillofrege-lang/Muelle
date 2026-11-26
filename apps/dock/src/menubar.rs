@@ -229,6 +229,20 @@ pub struct MenuBarWidgets {
 /// alpha of the black), in logical pixels.
 const HALO: [(f32, f32, u8); 3] = [(1.5, 0.0, 230), (4.0, 1.0, 170), (12.0, 0.0, 140)];
 
+const BARE_NOTCH_EXTRA_HEIGHT: f32 = 2.0;
+const BARE_VEIL_ALPHA: u8 = 215;
+const BARE_PLAYER_WIDTH: f32 = 152.0;
+const BARE_PLAYER_COVER_INSET: f32 = 14.0;
+const BARE_PLAYER_TITLE_GAP: f32 = 6.0;
+const BARE_PLAYER_TITLE_SIZE: f32 = 12.5;
+const BARE_PLAYER_TRAILING_INSET: f32 = 8.0;
+const BARE_PROVIDER_WIDTH: f32 = 80.0;
+const BARE_PROVIDER_RING_MIN_WIDTH: f32 = 52.0;
+const BARE_PROVIDER_LOGO_SIZE: f32 = 15.0;
+const BARE_PROVIDER_LABEL_SIZE: f32 = 13.0;
+const BARE_PROVIDER_ITEM_GAP: f32 = 6.0;
+const BARE_PROVIDER_GROUP_GAP: f32 = 14.0;
+
 /// The island without a background: opaque, near black.
 const BARE_ISLAND: Color = Color {
     A: 255,
@@ -239,7 +253,7 @@ const BARE_ISLAND: Color = Color {
 
 fn strip_veil(bare: bool, covered: bool) -> Option<Color> {
     (bare && covered).then_some(Color {
-        A: 215,
+        A: BARE_VEIL_ALPHA,
         ..BARE_ISLAND
     })
 }
@@ -374,7 +388,7 @@ fn accessory_readings(snapshot: &AccessorySnapshot) -> [Option<AccessoryReading>
 impl Look {
     fn island_height(&self, bar_height: f32) -> f32 {
         let extra = if self.widgets.bare && self.widgets.island_style == IslandStyle::Notch {
-            (2.0 * self.scale).round()
+            (BARE_NOTCH_EXTRA_HEIGHT * self.scale).round()
         } else {
             0.0
         };
@@ -727,6 +741,14 @@ impl Drop for ExitAnimation {
     }
 }
 
+#[derive(Default)]
+struct MonitorWidths {
+    scale: f32,
+    /// Stacked CPU/RAM and network speeds.
+    stacked: [f32; 2],
+    combined_cpu_ram: f32,
+}
+
 pub struct MenuBar {
     bluetooth: Option<bluetooth::Monitor>,
     accessories: Option<accessories::Monitor>,
@@ -737,8 +759,7 @@ pub struct MenuBar {
     monitor_reading: muelle_shell::monitor::Reading,
     /// Widest each monitor column has been at this scale: digits changing
     /// width must not shift the rest of the bar every two seconds.
-    // CPU/RAM stacked, network speeds stacked, CPU/RAM combined.
-    monitor_widths: (f32, [f32; 3]),
+    monitor_widths: MonitorWidths,
     hwnd: HWND,
     _target: DesktopWindowTarget,
     /// Stable parent: content refreshes must not restart reveal animations.
@@ -1457,7 +1478,7 @@ impl MenuBar {
             accessory_retry_at: Instant::now() + Duration::from_secs(60),
             monitor: None,
             monitor_reading: muelle_shell::monitor::Reading::default(),
-            monitor_widths: (0.0, [0.0; 3]),
+            monitor_widths: MonitorWidths::default(),
             hwnd,
             _target: target,
             surface,
@@ -3085,29 +3106,33 @@ impl MenuBar {
                 .iter()
                 .map(|line| gfx.text_brush_sized(line, scale, MONITOR_FONT, false, ink))
                 .collect::<Result<Vec<_>>>()?;
-            if self.monitor_widths.0 != scale {
-                self.monitor_widths = (scale, [0.0; 3]);
+            if self.monitor_widths.scale != scale {
+                self.monitor_widths = MonitorWidths {
+                    scale,
+                    ..MonitorWidths::default()
+                };
             }
             for (column, pair) in brushes.chunks(2).enumerate() {
                 let widest = pair.iter().map(|brush| brush.width).fold(0.0, f32::max);
                 let index = first_column + column;
-                self.monitor_widths.1[index] = self.monitor_widths.1[index].max(widest);
+                let width = &mut self.monitor_widths.stacked[index];
+                *width = width.max(widest);
             }
             if let Some(brush) = &cpu_ram {
-                self.monitor_widths.1[2] = self.monitor_widths.1[2].max(brush.width);
+                let width = &mut self.monitor_widths.combined_cpu_ram;
+                *width = width.max(brush.width);
             }
-            let widths = self.monitor_widths.1;
             let zone_right = right;
             let mut left = right;
             for &column in columns {
                 if column == 0
                     && let Some(brush) = &cpu_ram
                 {
-                    left -= widths[2];
+                    left -= self.monitor_widths.combined_cpu_ram;
                     place(&layers, brush, left)?;
                     continue;
                 }
-                left -= widths[column];
+                left -= self.monitor_widths.stacked[column];
                 let start = (column - first_column) * 2;
                 for (row, brush) in brushes[start..start + 2].iter().enumerate() {
                     let top = if row == 0 {
@@ -4253,13 +4278,13 @@ fn trigger_layout(
     let mut result = [(Island::Music, None), (Island::Usage, None)];
     let gap = if music && providers > 0 { px(8.0) } else { 0.0 };
     let music_width = if music {
-        px(if bare { 152.0 } else { 214.0 })
+        px(if bare { BARE_PLAYER_WIDTH } else { 214.0 })
     } else {
         0.0
     };
     let usage_width = match providers {
         0 => 0.0,
-        count if bare => px(80.0 * count as f32),
+        count if bare => px(BARE_PROVIDER_WIDTH * count as f32),
         1 => px(ISLAND_SINGLE_WIDTH),
         count => px(134.0 * count as f32),
     };
@@ -4648,17 +4673,22 @@ fn draw_compact_usage(
             .map(|(provider, ..)| (*provider, centre))
             .collect());
     }
-    let icon_size = px(if bare { 15.0 } else { 18.0 }) as u32;
-    let with_ring = half >= px(if bare { 52.0 } else { 84.0 });
-    let ring_size = px(16.0);
-    let max_gap = px(6.0);
+    let icon_size = px(if bare { BARE_PROVIDER_LOGO_SIZE } else { 18.0 }) as u32;
+    let with_ring = half
+        >= px(if bare {
+            BARE_PROVIDER_RING_MIN_WIDTH
+        } else {
+            84.0
+        });
+    let ring_size = Gfx::usage_ring_size(scale, bare);
+    let max_gap = px(BARE_PROVIDER_ITEM_GAP);
     let show_labels = if bare { with_ring } else { half > px(106.0) };
     let mut labels = [const { None }; Provider::COUNT];
     if show_labels {
         for (slot, (_, usage, _)) in labels.iter_mut().zip(providers) {
             let has_reading = usage.main_window().is_some();
             let font = if bare {
-                13.0
+                BARE_PROVIDER_LABEL_SIZE
             } else if has_reading {
                 14.0
             } else {
@@ -4691,7 +4721,8 @@ fn draw_compact_usage(
         0.0
     };
     let breaks = providers.len().saturating_sub(1) as f32;
-    let provider_gap = ((geometry.width - groups_width) / breaks.max(1.0)).clamp(0.0, px(14.0));
+    let provider_gap =
+        ((geometry.width - groups_width) / breaks.max(1.0)).clamp(0.0, px(BARE_PROVIDER_GROUP_GAP));
     let mut bare_left = (geometry.width - groups_width - provider_gap * breaks) / 2.0;
     let mut anchors = Vec::with_capacity(providers.len());
     for (index, ((provider, usage, accent), label)) in providers.iter().zip(labels).enumerate() {
@@ -4879,9 +4910,13 @@ fn draw_compact_player(
     let px = |v| geometry.px(v);
     let ink = geometry.ink();
     let side = px(18.0).min(height).min(width);
-    let note_left = px(if geometry.bare { 14.0 } else { 18.0 });
+    let note_left = px(if geometry.bare {
+        BARE_PLAYER_COVER_INSET
+    } else {
+        18.0
+    });
     let x = if geometry.bare {
-        note_left + px(6.0)
+        note_left + px(BARE_PLAYER_TITLE_GAP)
     } else {
         px(23.0)
     } + side;
@@ -4907,10 +4942,20 @@ fn draw_compact_player(
         let label = gfx.text_brush_fitted(
             track_title(track),
             geometry.scale,
-            if geometry.bare { 12.5 } else { 11.5 },
+            if geometry.bare {
+                BARE_PLAYER_TITLE_SIZE
+            } else {
+                11.5
+            },
             true,
             ink,
-            width - x - px(if geometry.bare { 8.0 } else { 13.0 }),
+            width
+                - x
+                - px(if geometry.bare {
+                    BARE_PLAYER_TRAILING_INSET
+                } else {
+                    13.0
+                }),
         )?;
         add_visual(
             c,
