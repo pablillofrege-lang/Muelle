@@ -268,18 +268,16 @@ impl Gfx {
         })
     }
 
-    /// Opaque island silhouette with curved shoulders at the screen edge.
+    /// Opaque island silhouette, with straight sides in bare mode.
     pub fn island_mask(
         &self,
         width: f32,
         height: f32,
         scale: f32,
+        bare: bool,
     ) -> Result<CompositionSurfaceBrush> {
+        let (shoulder, corner) = island_radii(width, height, scale, bare);
         self.draw(width.ceil() as u32, height.ceil() as u32, |dc| {
-            let shoulder = (12.0 * scale).min(width / 5.0).min(height / 2.0);
-            let corner = (22.0 * scale)
-                .min(width / 2.0 - shoulder)
-                .min(height - shoulder);
             // SAFETY: The geometries, sink and brush stay alive through the drawing calls.
             unsafe {
                 let white = dc.CreateSolidColorBrush(&WHITE, None)?;
@@ -365,11 +363,13 @@ impl Gfx {
         used_percent: Option<u8>,
         scale: f32,
         accent: Color,
+        bare: bool,
     ) -> Result<LabelBrush> {
-        let side = (18.0 * scale).round();
+        let (diameter, stroke) = if bare { (16.0, 3.0) } else { (18.0, 2.4) };
+        let side = (diameter * scale).round();
         let center = side / 2.0;
         let radius = center - 2.0 * scale;
-        let stroke = (2.4 * scale).max(1.0);
+        let stroke = (stroke * scale).max(1.0);
         let brush = self.draw(side as u32, side as u32, |dc| {
             // SAFETY: Brushes remain alive for the drawing calls.
             unsafe {
@@ -1427,6 +1427,15 @@ const fn rgb(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
+fn island_radii(width: f32, height: f32, scale: f32, bare: bool) -> (f32, f32) {
+    let (shoulder, corner) = if bare { (0.0, 15.0) } else { (12.0, 22.0) };
+    let shoulder = (shoulder * scale).min(width / 5.0).min(height / 2.0);
+    let corner = (corner * scale)
+        .min(width / 2.0 - shoulder)
+        .min(height - shoulder);
+    (shoulder, corner)
+}
+
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
@@ -1438,6 +1447,13 @@ mod recovery_tests {
             DispatcherQueueOptions,
         },
     };
+
+    #[test]
+    fn bare_island_mask_has_no_shoulders_and_uses_smaller_corners() {
+        assert_eq!(island_radii(320.0, 30.0, 1.0, true), (0.0, 15.0));
+        assert_eq!(island_radii(480.0, 45.0, 1.5, true), (0.0, 22.5));
+        assert_eq!(island_radii(490.0, 28.0, 1.0, false), (12.0, 16.0));
+    }
 
     #[test]
     fn labels_follow_the_first_letter_instead_of_the_ui_locale() {

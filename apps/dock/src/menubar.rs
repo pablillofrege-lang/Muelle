@@ -155,6 +155,7 @@ const SPI_SETWORKAREA: usize = 0x002F;
 static TICK_PENDING: AtomicBool = AtomicBool::new(false);
 static AUDIO_TICK_PENDING: AtomicBool = AtomicBool::new(false);
 static TRIGGERS_LEFT: AtomicI32 = AtomicI32::new(0);
+static TRIGGERS_BOTTOM: AtomicI32 = AtomicI32::new(0);
 static TRIGGERS_RIGHT: AtomicI32 = AtomicI32::new(0);
 static PANEL_LEFT: AtomicI32 = AtomicI32::new(0);
 static PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
@@ -356,6 +357,15 @@ fn accessory_readings(snapshot: &AccessorySnapshot) -> [Option<AccessoryReading>
 }
 
 impl Look {
+    fn island_height(&self, bar_height: f32) -> f32 {
+        let extra = if self.widgets.bare && self.widgets.island_style == IslandStyle::Notch {
+            (2.0 * self.scale).round()
+        } else {
+            0.0
+        };
+        bar_height + extra
+    }
+
     fn panel_content_height(&self) -> f32 {
         match self.panel {
             Some(Island::Music) => 180.0,
@@ -445,12 +455,12 @@ fn needs_pointer_timer(
 
 /// The window region that keeps only the island, in window pixels, so clicks
 /// along the rest of the top edge reach the windows below.
-fn ghost_region(triggers: Span, bar_height: f32) -> Option<RECT> {
+fn ghost_region(triggers: Span, island_height: f32) -> Option<RECT> {
     (triggers.width() > 0.0).then(|| RECT {
         left: triggers.left.floor() as i32,
         top: 0,
         right: triggers.right.ceil() as i32,
-        bottom: bar_height.round() as i32,
+        bottom: island_height.round() as i32,
     })
 }
 
@@ -661,6 +671,7 @@ pub struct MenuBar {
     ghost: bool,
     /// The window region set now, to call `SetWindowRgn` only on change.
     window_region: Option<RECT>,
+    island_height: f32,
     /// How many times `place` reserved the strip (tests watch mode changes).
     #[cfg(test)]
     strip_reservations: usize,
@@ -815,7 +826,11 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_NCHITTEST => {
             let x = (l.0 & 0xFFFF) as i16 as i32;
             let y = (l.0 >> 16) as i16 as i32;
+            let in_island_extension = y < TRIGGERS_BOTTOM.load(Ordering::Relaxed)
+                && x >= TRIGGERS_LEFT.load(Ordering::Relaxed)
+                && x < TRIGGERS_RIGHT.load(Ordering::Relaxed);
             if y >= BAR_BOTTOM.load(Ordering::Relaxed)
+                && !in_island_extension
                 && (y >= PANEL_BOTTOM.load(Ordering::Relaxed)
                     || x < PANEL_LEFT.load(Ordering::Relaxed)
                     || x >= PANEL_RIGHT.load(Ordering::Relaxed))
@@ -871,7 +886,7 @@ unsafe extern "system" fn outside_click_proc(code: i32, w: WPARAM, l: LPARAM) ->
         // SAFETY: Windows provides an MSLLHOOKSTRUCT for mouse hook actions.
         let point = unsafe { (*(l.0 as *const MSLLHOOKSTRUCT)).pt };
         let in_triggers = point.y >= BAR_TOP.load(Ordering::Relaxed)
-            && point.y < BAR_BOTTOM.load(Ordering::Relaxed)
+            && point.y < TRIGGERS_BOTTOM.load(Ordering::Relaxed)
             && point.x >= TRIGGERS_LEFT.load(Ordering::Relaxed)
             && point.x < TRIGGERS_RIGHT.load(Ordering::Relaxed);
         let in_panel = point.y >= BAR_BOTTOM.load(Ordering::Relaxed)
@@ -1369,6 +1384,7 @@ impl MenuBar {
             island_hide_until: None,
             ghost: false,
             window_region: None,
+            island_height: 0.0,
             #[cfg(test)]
             strip_reservations: 0,
             appbar: AppBar::register(hwnd, APPBAR_CALLBACK),
@@ -1954,6 +1970,10 @@ impl MenuBar {
             && point.x < self.bounds.right
             && point.y >= self.bounds.top
             && point.y < self.bounds.bottom;
+        let within_island = point.y >= self.bounds.bottom
+            && point.y < self.bounds.top + self.island_height as i32
+            && x >= self.triggers_span.left
+            && x < self.triggers_span.right;
         // Include the gap between the island and its popup so crossing it
         // does not close the popup before the pointer reaches its controls.
         let within_panel = self.panel.is_some()
@@ -1961,9 +1981,10 @@ impl MenuBar {
             && x < self.panel_span.right
             && point.y >= self.bounds.bottom
             && point.y < PANEL_BOTTOM.load(Ordering::Relaxed);
-        if (within_bar || within_panel) && self.hide_until.is_some() {
+        let inside = within_bar || within_island || within_panel;
+        if inside && self.hide_until.is_some() {
             self.hover(gfx, true)?;
-        } else if !within_bar && !within_panel {
+        } else if !inside {
             self.hover(gfx, false)?;
         }
         Ok(())
@@ -1979,7 +2000,7 @@ impl MenuBar {
             // The edge watcher applies the same dwell to the resting island.
             return Ok(());
         }
-        let span = if y < (self.bounds.bottom - self.bounds.top) as f32 {
+        let span = if y < self.island_height {
             self.triggers_span
         } else {
             self.panel_span
@@ -2047,7 +2068,7 @@ impl MenuBar {
             self.reset_surface()?;
         }
         let region = (!hiding && (presence == Presence::IslandOnly || island_hiding))
-            .then(|| ghost_region(self.triggers_span, bar_height as f32))
+            .then(|| ghost_region(self.triggers_span, self.island_height))
             .flatten();
         // An auto-hiding or intelligent bar leaves the whole screen to the
         // windows.
@@ -2722,11 +2743,12 @@ impl MenuBar {
         let px = |logical: f32| (logical * scale).round();
         let screen = look.screen;
         let (width, height) = ((screen.right - screen.left) as f32, px(HEIGHT));
+        let island_height = look.island_height(height);
         let panel_bottom = height + px(PANEL_GAP) + px(look.panel_height());
         let visual_height = if look.panel.is_some() {
             panel_bottom + px(PANEL_SHADOW_MARGIN)
         } else {
-            height
+            island_height
         };
         let ink = if look.light { Ink::Dark } else { Ink::Light };
 
@@ -2986,6 +3008,11 @@ impl MenuBar {
         self.triggers_span = Span::default();
         self.panel_span = Span::default();
         self.draw_island(gfx, look, &island_layers, width, height, left_end, right)?;
+        self.island_height = if self.triggers_span.width() > 0.0 {
+            island_height
+        } else {
+            height
+        };
         if let Some(drag) = self.volume_drag {
             let new_span = self.island_hits.iter().find_map(|hit| match hit.action {
                 IslandAction::Volume(span) => Some(span),
@@ -3014,7 +3041,7 @@ impl MenuBar {
         self.visual_height = if self.panel_span.width() > 0.0 {
             visual_height
         } else {
-            height
+            self.island_height
         } as i32;
         self.bounds = RECT {
             bottom: screen.top + height as i32,
@@ -3035,6 +3062,7 @@ impl MenuBar {
         );
         BAR_TOP.store(screen.top, Ordering::Relaxed);
         BAR_BOTTOM.store(screen.top + height as i32, Ordering::Relaxed);
+        TRIGGERS_BOTTOM.store(screen.top + self.island_height as i32, Ordering::Relaxed);
         let clickable_height = if self.panel_span.width() > 0.0 {
             panel_bottom
         } else {
@@ -3102,6 +3130,7 @@ impl MenuBar {
                 look.scale,
                 look.track.is_some(),
                 look.active_providers.count(),
+                look.widgets.bare,
             ),
             IslandStyle::Bubble => bubble_trigger_layout(
                 Span {
@@ -3123,11 +3152,18 @@ impl MenuBar {
         };
         let geometry = IslandGeometry::new(self.triggers_span, 0.0, look);
         let (compact, compact_height, divider_inset) = match style {
-            IslandStyle::Notch => (
-                island_surface(gfx, look, layers, geometry, bar_height)?,
-                bar_height,
-                px(7.0),
-            ),
+            IslandStyle::Notch => {
+                let height = look.island_height(bar_height);
+                (
+                    island_surface(gfx, look, layers, geometry, height)?,
+                    height,
+                    if look.widgets.bare {
+                        (height - px(14.0)) / 2.0
+                    } else {
+                        px(7.0)
+                    },
+                )
+            }
             IslandStyle::Bubble => {
                 let (surface, pill_height) =
                     bubble_surface(gfx, look, layers, geometry, bar_height)?;
@@ -3209,7 +3245,7 @@ impl MenuBar {
                 Island::Usage => (divider.unwrap_or(span.left), span.right),
             };
             self.island_hits.push(IslandHit {
-                bounds: (left, 0.0, right, bar_height),
+                bounds: (left, 0.0, right, bar_height.max(compact_height)),
                 action: IslandAction::Toggle(kind),
             });
             if look.panel != Some(kind) {
@@ -4007,6 +4043,7 @@ struct IslandGeometry {
     width: f32,
     scale: f32,
     light: bool,
+    bare: bool,
 }
 
 impl IslandGeometry {
@@ -4017,6 +4054,7 @@ impl IslandGeometry {
             width: span.width(),
             scale: look.scale,
             light: look.light,
+            bare: look.widgets.bare,
         }
     }
 
@@ -4068,13 +4106,19 @@ fn trigger_layout(
     scale: f32,
     music: bool,
     providers: usize,
+    bare: bool,
 ) -> [(Island, Option<Span>); 2] {
     let px = |v: f32| (v * scale).round();
     let mut result = [(Island::Music, None), (Island::Usage, None)];
     let gap = if music && providers > 0 { px(8.0) } else { 0.0 };
-    let music_width = if music { px(214.0) } else { 0.0 };
+    let music_width = if music {
+        px(if bare { 152.0 } else { 214.0 })
+    } else {
+        0.0
+    };
     let usage_width = match providers {
         0 => 0.0,
+        count if bare => px(80.0 * count as f32),
         1 => px(ISLAND_SINGLE_WIDTH),
         count => px(134.0 * count as f32),
     };
@@ -4260,7 +4304,7 @@ fn island_surface(
     island.SetSize(size)?;
     island.SetOffset(Vector3::new(island_left.round(), 0.0, 0.0))?;
     let content = island.Children()?;
-    let silhouette = gfx.island_mask(island_width, island_height, scale)?;
+    let silhouette = gfx.island_mask(island_width, island_height, scale, look.widgets.bare)?;
     content.InsertAtTop(&island_shadow(c, &silhouette.cast()?, size, geometry)?)?;
 
     let tint = match (look.widgets.bare, look.light, look.glass) {
@@ -4443,7 +4487,8 @@ fn draw_compact_usage(
     let px = |v| geometry.px(v);
     let ink = geometry.ink();
     let scale = geometry.scale;
-    let inset = px(13.0);
+    let bare = geometry.bare;
+    let inset = if bare { 0.0 } else { px(13.0) };
     let half = (geometry.width - 2.0 * inset) / providers.len().max(1) as f32;
     if half < px(20.0) {
         let icon = gfx.glyph_brush(&[('\u{E9D9}', 1.0)], scale, ink)?;
@@ -4462,21 +4507,75 @@ fn draw_compact_usage(
             .map(|(provider, ..)| (*provider, centre))
             .collect());
     }
-    let mut anchors = Vec::with_capacity(providers.len());
-    for (index, (provider, usage, accent)) in providers.iter().enumerate() {
-        anchors.push((*provider, inset + (index as f32 + 0.5) * half));
-        // When space is tight the full list is still available in the panel.
-        if half < px(20.0) {
-            break;
+    let icon_size = px(if bare { 15.0 } else { 18.0 }) as u32;
+    let with_ring = half >= px(if bare { 52.0 } else { 84.0 });
+    let ring_size = px(16.0);
+    let gap = px(6.0);
+    let show_labels = if bare {
+        half >= px(76.0)
+    } else {
+        half > px(106.0)
+    };
+    let mut labels = [const { None }; Provider::COUNT];
+    if show_labels {
+        for (slot, (_, usage, _)) in labels.iter_mut().zip(providers) {
+            let has_reading = usage.main_window().is_some();
+            let font = if bare {
+                13.0
+            } else if has_reading {
+                14.0
+            } else {
+                12.0
+            };
+            let label = gfx.text_brush_sized(&usage.compact_text(), scale, font, true, ink)?;
+            let reserve = if bare {
+                icon_size as f32 + 2.0 * gap + ring_size
+            } else {
+                px(if has_reading { 74.0 } else { 50.0 })
+            };
+            *slot = (label.width <= half - reserve).then_some(label);
         }
-        let icon_size = px(18.0) as u32;
-        let start = inset
-            + index as f32 * half
-            + if half < px(84.0) {
+    }
+    let bare_group_width = |label: &Option<LabelBrush>| {
+        icon_size as f32
+            + label.as_ref().map_or(0.0, |label| gap + label.width)
+            + if with_ring { gap + ring_size } else { 0.0 }
+    };
+    // Keep the design's spacing when it fits and give wide percentages priority.
+    let groups_width: f32 = if bare {
+        labels[..providers.len()].iter().map(bare_group_width).sum()
+    } else {
+        0.0
+    };
+    let breaks = providers.len().saturating_sub(1) as f32;
+    let provider_gap = ((geometry.width - groups_width) / breaks.max(1.0)).clamp(0.0, px(14.0));
+    let mut bare_left = (geometry.width - groups_width - provider_gap * breaks) / 2.0;
+    let label_offset = if bare {
+        icon_size as f32 + gap
+    } else {
+        px(25.0)
+    };
+    let mut anchors = Vec::with_capacity(providers.len());
+    for (index, ((provider, usage, accent), label)) in providers.iter().zip(labels).enumerate() {
+        let slot = inset + index as f32 * half;
+        let group_width = bare_group_width(&label);
+        let start = if bare {
+            let left = bare_left;
+            bare_left += group_width + provider_gap;
+            left
+        } else {
+            slot + if !with_ring {
                 (half - icon_size as f32) / 2.0
             } else {
                 px(21.0)
-            };
+            }
+        };
+        let anchor = if bare {
+            start + group_width / 2.0
+        } else {
+            inset + (index as f32 + 0.5) * half
+        };
+        anchors.push((*provider, anchor));
         if let Some(image) = usage::logo(*provider) {
             let image_brush = gfx.icon_brush(image, icon_size)?;
             let brush: CompositionBrush =
@@ -4498,42 +4597,34 @@ fn draw_compact_usage(
                 icon_size as f32,
             )?;
         }
-        let percent = usage.compact_text();
-        if half > px(106.0) {
-            let font = if usage.main_window().is_some() {
-                14.0
-            } else {
-                12.0
-            };
-            let label = gfx.text_brush_sized(&percent, scale, font, true, ink)?;
-            let reserve = if usage.main_window().is_some() {
-                74.0
-            } else {
-                50.0
-            };
-            if label.width <= half - px(reserve) {
-                add_visual(
-                    c,
-                    content,
-                    &label.brush.cast()?,
-                    start + px(25.0),
-                    (bar_height - label.height) / 2.0,
-                    label.width,
-                    label.height,
-                )?;
-            }
+        if let Some(label) = label {
+            add_visual(
+                c,
+                content,
+                &label.brush.cast()?,
+                start + label_offset,
+                (bar_height - label.height) / 2.0,
+                label.width,
+                label.height,
+            )?;
         }
-        if half >= px(84.0) {
+        if with_ring {
             let ring = gfx.usage_ring(
                 usage.main_window().map(|window| window.used_percent),
                 scale,
                 *accent,
+                bare,
             )?;
+            let x = if bare {
+                start + group_width - ring.width
+            } else {
+                inset + (index + 1) as f32 * half - px(16.0) - ring.width
+            };
             add_visual(
                 c,
                 content,
                 &ring.brush.cast()?,
-                inset + (index + 1) as f32 * half - px(16.0) - ring.width,
+                x,
                 (bar_height - ring.height) / 2.0,
                 ring.width,
                 ring.height,
@@ -4645,10 +4736,15 @@ fn draw_compact_player(
     let px = |v| geometry.px(v);
     let ink = geometry.ink();
     let side = px(18.0).min(height).min(width);
-    let x = px(23.0) + side;
+    let note_left = px(if geometry.bare { 14.0 } else { 18.0 });
+    let x = if geometry.bare {
+        note_left + px(6.0)
+    } else {
+        px(23.0)
+    } + side;
     let show_title = width > x + px(18.0);
     let note_x = if show_title {
-        px(18.0)
+        note_left
     } else {
         (width - side) / 2.0
     };
@@ -4668,10 +4764,10 @@ fn draw_compact_player(
         let label = gfx.text_brush_fitted(
             track_title(track),
             geometry.scale,
-            11.5,
+            if geometry.bare { 12.5 } else { 11.5 },
             true,
             ink,
-            width - x - px(13.0),
+            width - x - px(if geometry.bare { 8.0 } else { 13.0 }),
         )?;
         add_visual(
             c,
@@ -5053,15 +5149,17 @@ mod island_tests {
             left: 740.4,
             right: 1179.6,
         };
-        assert_eq!(
-            ghost_region(island, 28.0),
-            Some(RECT {
-                left: 740,
-                top: 0,
-                right: 1180,
-                bottom: 28
-            })
-        );
+        for height in [28, 30] {
+            assert_eq!(
+                ghost_region(island, height as f32),
+                Some(RECT {
+                    left: 740,
+                    top: 0,
+                    right: 1180,
+                    bottom: height,
+                })
+            );
+        }
         assert_eq!(ghost_region(Span::default(), 28.0), None);
     }
 
@@ -6555,6 +6653,7 @@ mod island_tests {
             1.25,
             true,
             5,
+            false,
         );
         let Some(usage) = triggers[1].1 else {
             panic!("Usage trigger should fit");
@@ -6569,13 +6668,36 @@ mod island_tests {
             left: 200.0,
             right: 390.0,
         };
-        let [(_, Some(music)), (_, Some(usage))] = trigger_layout(bounds, 300.0, 1.5, true, 3)
+        let [(_, Some(music)), (_, Some(usage))] =
+            trigger_layout(bounds, 300.0, 1.5, true, 3, false)
         else {
             panic!("Both triggers should fit");
         };
         assert!(
             music.left >= bounds.left && music.right < usage.left && usage.right <= bounds.right
         );
+    }
+
+    #[test]
+    fn bare_notch_is_320_pixels_wide_with_music_and_two_providers() {
+        let bounds = Span {
+            left: 0.0,
+            right: 1920.0,
+        };
+        for (providers, bare_width, original_width) in [(1, 80.0, 145.0), (2, 160.0, 268.0)] {
+            for (bare, music_width, usage_width) in
+                [(true, 152.0, bare_width), (false, 214.0, original_width)]
+            {
+                let [(_, Some(music)), (_, Some(usage))] =
+                    trigger_layout(bounds, 960.0, 1.0, true, providers, bare)
+                else {
+                    panic!("Both triggers should fit");
+                };
+                assert_eq!(music.width(), music_width);
+                assert_eq!(usage.width(), usage_width);
+                assert_eq!(usage.left - music.right, 8.0);
+            }
+        }
     }
 
     #[test]
@@ -6646,6 +6768,7 @@ mod island_tests {
                 width: 360.0,
                 scale: 1.0,
                 light,
+                bare: false,
             };
             popup_surface(
                 &gfx,
