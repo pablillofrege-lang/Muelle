@@ -377,6 +377,14 @@ pub fn menu_bar_alert_done(generation: usize) {
     });
 }
 
+/// The pointer rested on the usage island long enough to open its detail.
+pub fn menu_bar_usage_hover() {
+    with_app("detalle de uso de IA", |app| match &mut app.menubar {
+        Some(bar) => bar.usage_hover_fired(&app.gfx),
+        None => Ok(()),
+    });
+}
+
 pub fn menu_bar_pointer_moved(x: f32, y: f32) {
     with_app("barra superior", |app| match &mut app.menubar {
         Some(bar) => bar.pointer_moved(&app.gfx, x, y),

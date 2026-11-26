@@ -373,8 +373,27 @@ impl Gfx {
         accent: Color,
         bare: bool,
     ) -> Result<LabelBrush> {
-        let stroke = if bare { 3.0 } else { 2.4 };
-        let side = Self::usage_ring_size(scale, bare);
+        let diameter = if bare { BARE_USAGE_RING_DIAMETER } else { 18.0 };
+        self.usage_ring_sized(
+            used_percent,
+            scale,
+            accent,
+            diameter,
+            if bare { 3.0 } else { 2.4 },
+        )
+    }
+
+    /// The usage ring at any logical `diameter` and `stroke`: the dials of
+    /// the usage detail are 28 px.
+    pub fn usage_ring_sized(
+        &self,
+        used_percent: Option<u8>,
+        scale: f32,
+        accent: Color,
+        diameter: f32,
+        stroke: f32,
+    ) -> Result<LabelBrush> {
+        let side = (diameter * scale).round();
         let center = side / 2.0;
         let radius = center - 2.0 * scale;
         let stroke = (stroke * scale).max(1.0);

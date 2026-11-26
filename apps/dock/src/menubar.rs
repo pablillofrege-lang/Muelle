@@ -128,6 +128,10 @@ const MONITOR_COLUMN_GAP: f32 = 8.0;
 /// The network lost this long is worth a word from the mascot; shorter
 /// drops (Wi-Fi roaming, a router restarting) say nothing.
 const NETWORK_TIMER: usize = 7;
+/// Hovering the usage opens its detail (`ai_alerts`): one one-shot timer,
+/// armed only while the pointer is over the usage and nothing is open.
+const USAGE_HOVER_TIMER: usize = 8;
+const USAGE_HOVER_DELAY_MS: u32 = 300;
 const OFFLINE_GRACE: Duration = Duration::from_secs(8);
 const ACCESSORIES_CHANGED: u32 = WM_APP + 30;
 
@@ -431,7 +435,9 @@ impl Look {
                 74.0 + Provider::ALL
                     .into_iter()
                     .filter(|provider| self.active_providers.has(*provider))
-                    .map(|provider| usage_row_height(self.usage.get(provider)))
+                    .map(|provider| {
+                        usage_row_height(self.usage.get(provider), self.widgets.ai_alerts)
+                    })
                     .sum::<f32>()
             }
             None => 0.0,
@@ -1088,6 +1094,12 @@ pub struct MenuBar {
     volume_controls: Option<VolumeControls>,
     progress_controls: Option<ProgressControls>,
     progress_timer: bool,
+    /// Hover on the usage (`ai_alerts`): its one-shot timer is armed, the
+    /// pointer is over the usage, and a click or dismissal closed the detail
+    /// so it must leave the usage before hovering can open it again.
+    usage_hover_armed: bool,
+    usage_hover_over: bool,
+    usage_hover_blocked: bool,
     usage_scroll: f32,
     usage_viewport: Option<UsageViewport>,
     suppress_volume_release: bool,
@@ -1144,6 +1156,7 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_TIMER if w.0 == VOLUME_TIMER => app::menu_bar_volume_flush(),
         WM_TIMER if w.0 == PROGRESS_TIMER => app::menu_bar_progress_tick(),
         WM_TIMER if w.0 == MONITOR_TIMER => app::menu_bar_monitor_tick(),
+        WM_TIMER if w.0 == USAGE_HOVER_TIMER => app::menu_bar_usage_hover(),
         WM_CAPTURECHANGED => {
             // Avoid reentering the app borrow inside Set/ReleaseCapture.
             unsafe {
@@ -1501,6 +1514,9 @@ fn draw_usage_row(
         ink,
         1.0,
     )?;
+    if ai_alerts && !usage.windows.is_empty() {
+        return draw_usage_dials(gfx, layers, usage, accent, scale, ink, left, width, y);
+    }
     if let Some(main) = shown_window(usage, ai_alerts) {
         let level = shown_level(usage, ai_alerts);
         let accent = alert_ink(level, accent);
@@ -1691,7 +1707,121 @@ fn draw_usage_row(
     Ok(())
 }
 
-fn usage_row_height(usage: &ProviderUsage) -> f32 {
+/// The detail of a provider with `ai_alerts`: one dial per window (the 5 h
+/// and the weekly one, side by side), each with its percentage in the color
+/// of its level and the hour it comes back.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "A row of dials takes its data, colors and measured rectangle"
+)]
+fn draw_usage_dials(
+    gfx: &Gfx,
+    layers: &VisualCollection,
+    usage: &ProviderUsage,
+    accent: Color,
+    scale: f32,
+    ink: Ink,
+    left: f32,
+    width: f32,
+    y: f32,
+) -> Result<()> {
+    let c = &gfx.compositor;
+    let px = |logical: f32| (logical * scale).round();
+    let text = strings::text();
+    let now = chrono::Local::now();
+    let dials = dial_windows(&usage.windows);
+    let column = (width - px(28.0)) / dials.len().max(1) as f32;
+    for (index, window) in dials.into_iter().enumerate() {
+        // Only a reading that is current colors its dial.
+        let level = if usage.state == State::Ready {
+            usage::level(window.used_percent)
+        } else {
+            Level::Normal
+        };
+        let x = left + px(14.0) + index as f32 * column;
+        let dial = gfx.usage_ring_sized(
+            Some(window.used_percent),
+            scale,
+            alert_ink(level, accent),
+            28.0,
+            3.0,
+        )?;
+        add_visual(
+            c,
+            layers,
+            &dial.brush.cast()?,
+            x,
+            y + px(56.0),
+            dial.width,
+            dial.height,
+        )?;
+        let text_left = x + dial.width + px(9.0);
+        let percent = format!("{}%", window.used_percent);
+        let figure = usage_label(gfx, &percent, scale, 14.0, ink, level)?;
+        add_visual(
+            c,
+            layers,
+            &figure.brush.cast()?,
+            text_left,
+            y + px(55.0),
+            figure.width,
+            figure.height,
+        )?;
+        add_panel_text(
+            gfx,
+            layers,
+            &window.title(),
+            text_left + figure.width + px(6.0),
+            y + px(58.0),
+            scale,
+            11.5,
+            false,
+            ink,
+            0.72,
+        )?;
+        // When it returns, or the raw reset time if there is no phrase for it.
+        let comes_back = usage::back_phrase(window.resets_at, now, true).or_else(|| {
+            window
+                .reset_text()
+                .map(|reset| format!("{} {reset}", text.usage_resets))
+        });
+        if let Some(line) = comes_back {
+            let room = (column - dial.width - px(9.0) - px(10.0)).max(px(24.0));
+            let label = gfx.text_brush_fitted(&line, scale, 11.0, false, ink, room)?;
+            add_visual(
+                c,
+                layers,
+                &label.brush.cast()?,
+                text_left,
+                y + px(77.0),
+                label.width,
+                label.height,
+            )?
+            .SetOpacity(0.78)?;
+        }
+    }
+    if usage.state == State::Unavailable || usage.age_minutes().is_some_and(|minutes| minutes > 5) {
+        add_panel_text(
+            gfx,
+            layers,
+            text.usage_stale,
+            left + px(14.0),
+            y + px(98.0),
+            scale,
+            11.0,
+            false,
+            ink,
+            0.7,
+        )?;
+    }
+    Ok(())
+}
+
+fn usage_row_height(usage: &ProviderUsage, ai_alerts: bool) -> f32 {
+    if ai_alerts {
+        // Dials sit side by side: a row never needs more than its two lines.
+        return ISLAND_ROW_HEIGHT;
+    }
     ISLAND_ROW_HEIGHT + usage.windows.len().saturating_sub(2) as f32 * 26.0
 }
 
@@ -1835,6 +1965,9 @@ impl MenuBar {
             volume_controls: None,
             progress_controls: None,
             progress_timer: false,
+            usage_hover_armed: false,
+            usage_hover_over: false,
+            usage_hover_blocked: false,
             usage_scroll: 0.0,
             usage_viewport: None,
             suppress_volume_release: false,
@@ -2426,6 +2559,7 @@ impl MenuBar {
 
     fn pointer_left_at(&mut self, gfx: &Gfx, point: POINT) -> Result<()> {
         let x = (point.x - self.bounds.left) as f32;
+        self.track_usage_hover(self.over_usage(x, (point.y - self.bounds.top) as f32));
         if let Some(span) = self.volume_drag {
             let y = (point.y - self.bounds.top) as f32;
             self.queue_volume(span, y);
@@ -2511,6 +2645,7 @@ impl MenuBar {
             self.queue_volume(span, y);
             return self.paint_volume_preview(gfx);
         }
+        self.track_usage_hover(self.over_usage(x, y));
         if self.zoned() {
             return self.pointer_left_at(
                 gfx,
@@ -2541,9 +2676,89 @@ impl MenuBar {
     pub fn dismiss_island(&mut self, gfx: &Gfx) -> Result<()> {
         self.release_volume(None)?;
         if self.panel.take().is_some() {
+            // Closed with the pointer still on the usage: not again until it leaves.
+            self.usage_hover_blocked = self.usage_hover_over;
             self.refresh(gfx)?;
         }
         Ok(())
+    }
+
+    /// Whether a point of the bar window is over the usage trigger.
+    fn over_usage(&self, x: f32, y: f32) -> bool {
+        self.island_hits
+            .iter()
+            .any(|hit| matches!(hit.action, IslandAction::Toggle(Island::Usage)) && hit.at(x, y))
+    }
+
+    /// Follows the pointer over the usage: arms the one-shot timer when it
+    /// rests there with nothing open, and disarms it when it leaves.
+    fn track_usage_hover(&mut self, over: bool) {
+        let alerts = self
+            .look
+            .as_ref()
+            .is_some_and(|look| look.widgets.ai_alerts);
+        let over = over && alerts && self.presence_now() != Presence::Hidden;
+        self.usage_hover_over = over;
+        if !over {
+            self.usage_hover_blocked = false;
+        }
+        if over && !self.usage_hover_blocked && hover_opens_usage(alerts, over, self.panel) {
+            if !self.usage_hover_armed {
+                // SAFETY: A one-shot timer on our own window.
+                self.usage_hover_armed = unsafe {
+                    SetTimer(
+                        Some(self.hwnd),
+                        USAGE_HOVER_TIMER,
+                        USAGE_HOVER_DELAY_MS,
+                        None,
+                    )
+                } != 0;
+            }
+        } else {
+            self.stop_usage_hover();
+        }
+    }
+
+    fn stop_usage_hover(&mut self) {
+        if self.usage_hover_armed {
+            // SAFETY: Our own window's timer.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), USAGE_HOVER_TIMER);
+            }
+            self.usage_hover_armed = false;
+        }
+    }
+
+    /// The pointer rested on the usage for `USAGE_HOVER_DELAY_MS`: opens its
+    /// detail, as a click would.
+    pub fn usage_hover_fired(&mut self, gfx: &Gfx) -> Result<()> {
+        self.stop_usage_hover();
+        let alerts = self
+            .look
+            .as_ref()
+            .is_some_and(|look| look.widgets.ai_alerts);
+        if self.usage_hover_blocked || !hover_opens_usage(alerts, self.usage_hover_over, self.panel)
+        {
+            return Ok(());
+        }
+        let Some(mut look) = self.look.clone() else {
+            return Ok(());
+        };
+        if self.presence_now() == Presence::IslandOnly {
+            // As an explicit click: the resting island reveals its panel at once.
+            self.hover(gfx, true)?;
+        }
+        self.panel = Some(Island::Usage);
+        look.panel = self.panel;
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.hwnd,
+            dwHoverTime: 0,
+        };
+        // SAFETY: `track` describes our live window.
+        unsafe { TrackMouseEvent(&mut track)? };
+        self.apply_look(gfx, look)
     }
 
     /// The strip of the screen the bar covers for good, if any: none while it
@@ -2952,6 +3167,11 @@ impl MenuBar {
         if let Some(hit) = self.island_hits.iter().find(|hit| hit.at(x, y)) {
             match hit.action {
                 IslandAction::Toggle(island) => {
+                    if island == Island::Usage {
+                        // Clicked: closing it must stick while the pointer stays.
+                        self.usage_hover_blocked = true;
+                        self.stop_usage_hover();
+                    }
                     if resting_island {
                         // An explicit click can open the panel immediately.
                         self.hover(gfx, true)?;
@@ -3318,6 +3538,7 @@ impl MenuBar {
                 self.alerts = AlertTracker::default();
             }
             self.cancel_alerts();
+            self.stop_usage_hover();
             look.announcing = None;
             return;
         }
@@ -4418,7 +4639,7 @@ impl MenuBar {
         let mut row_top = 6.0;
         for (provider, usage, accent) in providers {
             let y = px(row_top);
-            row_top += usage_row_height(usage);
+            row_top += usage_row_height(usage, look.widgets.ai_alerts);
             let inset = px(23.0);
             add_visual(
                 c,
@@ -5125,6 +5346,20 @@ impl IslandGeometry {
             rgba(223, 237, 255, 37)
         }
     }
+}
+
+/// Whether resting on the usage opens its detail: only with `ai_alerts`, and
+/// only while neither panel is open.
+fn hover_opens_usage(ai_alerts: bool, over_usage: bool, open: Option<Island>) -> bool {
+    ai_alerts && over_usage && open.is_none()
+}
+
+/// The windows the detail draws as dials: the shortest first, three at most.
+fn dial_windows(windows: &[Window]) -> Vec<&Window> {
+    let mut dials: Vec<&Window> = windows.iter().collect();
+    dials.sort_by_key(|window| window.minutes);
+    dials.truncate(3);
+    dials
 }
 
 fn toggle_panel(open: Option<Island>, clicked: Island) -> Option<Island> {
@@ -8723,6 +8958,182 @@ mod island_tests {
         bar.alert_done(&gfx, bar.alert_generation)?;
         assert!(bar.announcing.is_none());
         assert!(bar.triggers_span.width() > normal, "the short phrases stay");
+        Ok(())
+    }
+
+    #[test]
+    fn hovering_opens_the_usage_detail_only_with_alerts_and_nothing_open() {
+        assert!(hover_opens_usage(true, true, None));
+        assert!(!hover_opens_usage(false, true, None), "the key off: today");
+        assert!(!hover_opens_usage(true, false, None));
+        assert!(!hover_opens_usage(true, true, Some(Island::Music)));
+        assert!(!hover_opens_usage(true, true, Some(Island::Usage)));
+        assert_eq!(USAGE_HOVER_DELAY_MS, 300);
+    }
+
+    #[test]
+    fn the_detail_shows_the_windows_by_length_up_to_three() {
+        let windows = vec![window(10_080, 30), window(300, 96), window(43_200, 10)];
+        let shown = dial_windows(&windows);
+        let minutes: Vec<i64> = shown.iter().map(|w| w.minutes).collect();
+        assert_eq!(minutes, [300, 10_080, 43_200]);
+        let many: Vec<_> = (1..=5).map(|n| window(n * 60, 10)).collect();
+        assert_eq!(dial_windows(&many).len(), 3);
+        assert!(dial_windows(&[]).is_empty());
+        // With alerts a row is as tall as its two dials need; without them
+        // it grows with every window, as today.
+        let three = ProviderUsage {
+            state: State::Ready,
+            windows,
+            fetched_at: None,
+        };
+        assert_eq!(usage_row_height(&three, false), ISLAND_ROW_HEIGHT + 26.0);
+        assert_eq!(usage_row_height(&three, true), ISLAND_ROW_HEIGHT);
+    }
+
+    #[test]
+    #[ignore = "Requires Windows composition; reveals the bar, no provider requests"]
+    fn native_hovering_the_usage_opens_the_dials_only_with_alerts() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        // SAFETY: The dispatcher and the bar belong to this test thread.
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, false, true, MenuBarWidgets::default())?;
+        bar.hover(&gfx, true)?;
+        let mut look = bar.look.clone().context("initial look")?;
+        look.track = None;
+        look.usage_enabled = true;
+        look.active_providers = ActiveProviders::default();
+        look.active_providers.0[Provider::Claude as usize] = true;
+        look.widgets.island_style = IslandStyle::Notch;
+        let soon = |hours: i64| Some(chrono::Utc::now() + chrono::Duration::hours(hours));
+        look.usage.providers[Provider::Claude as usize] = ProviderUsage {
+            state: State::Ready,
+            windows: vec![
+                usage::Window {
+                    label: None,
+                    minutes: 10_080,
+                    used_percent: 40,
+                    resets_at: soon(72),
+                },
+                usage::Window {
+                    label: None,
+                    minutes: 300,
+                    used_percent: 97,
+                    resets_at: soon(2),
+                },
+            ],
+            fetched_at: Some(std::time::SystemTime::now()),
+        };
+        let center = |bar: &MenuBar| -> Result<(f32, f32)> {
+            let hit = bar
+                .island_hits
+                .iter()
+                .find(|hit| matches!(hit.action, IslandAction::Toggle(Island::Usage)))
+                .context("the usage trigger")?;
+            let (left, top, right, bottom) = hit.bounds;
+            Ok(((left + right) / 2.0, (top + bottom) / 2.0))
+        };
+
+        // Key off: resting on the usage arms nothing and opens nothing.
+        look.widgets.ai_alerts = false;
+        bar.apply_look(&gfx, look.clone())?;
+        let (x, y) = center(&bar)?;
+        bar.pointer_moved(&gfx, x, y)?;
+        assert!(!bar.usage_hover_armed);
+        bar.usage_hover_fired(&gfx)?;
+        assert!(bar.panel.is_none());
+
+        // Key on: one one-shot timer while the pointer is over the usage.
+        look.widgets.ai_alerts = true;
+        bar.apply_look(&gfx, look.clone())?;
+        let (x, y) = center(&bar)?;
+        bar.pointer_moved(&gfx, x, y)?;
+        assert!(bar.usage_hover_armed && bar.panel.is_none());
+        // Leaving before the delay disarms it and nothing opens.
+        bar.pointer_moved(&gfx, 2.0, 2.0)?;
+        assert!(!bar.usage_hover_armed);
+        bar.usage_hover_fired(&gfx)?;
+        assert!(bar.panel.is_none(), "a timer that fires late opens nothing");
+        // Resting through the delay (WM_TIMER) opens the detail, timer gone.
+        bar.pointer_moved(&gfx, x, y)?;
+        assert!(bar.usage_hover_armed);
+        bar.usage_hover_fired(&gfx)?;
+        assert_eq!(bar.panel, Some(Island::Usage));
+        assert!(!bar.usage_hover_armed);
+        assert!(bar.panel_span.width() > 0.0);
+        assert!(
+            bar.island_hits
+                .iter()
+                .any(|hit| matches!(hit.action, IslandAction::Refresh))
+        );
+        let current = bar.look.as_ref().context("look")?;
+        assert_eq!(current.panel_content_height(), 74.0 + ISLAND_ROW_HEIGHT);
+        // With something open, resting on the usage arms nothing.
+        bar.pointer_moved(&gfx, x, y)?;
+        assert!(!bar.usage_hover_armed);
+
+        // Closed while the pointer stays on the usage: it does not reopen
+        // until the pointer leaves and comes back.
+        bar.dismiss_island(&gfx)?;
+        bar.apply_look(&gfx, look.clone())?;
+        assert!(bar.panel.is_none());
+        let (x, y) = center(&bar)?;
+        bar.pointer_moved(&gfx, x, y)?;
+        assert!(!bar.usage_hover_armed, "blocked until it leaves");
+        bar.pointer_moved(&gfx, 2.0, 2.0)?;
+        bar.pointer_moved(&gfx, x, y)?;
+        assert!(bar.usage_hover_armed);
+        // Turning the key off disarms it.
+        look.widgets.ai_alerts = false;
+        bar.apply_look(&gfx, look.clone())?;
+        assert!(!bar.usage_hover_armed);
+        bar.usage_hover_fired(&gfx)?;
+        assert!(bar.panel.is_none());
+
+        // The dials draw in both styles, scales and themes, with one to
+        // three windows.
+        let quota: Vec<_> = [300, 10_080, 43_200]
+            .into_iter()
+            .map(|minutes| usage::Window {
+                label: None,
+                minutes,
+                used_percent: 85,
+                resets_at: soon(5),
+            })
+            .collect();
+        look.widgets.ai_alerts = true;
+        for style in [IslandStyle::Notch, IslandStyle::Bubble] {
+            look.widgets.island_style = style;
+            for scale in [1.0, 1.5, 2.0] {
+                look.scale = scale;
+                for (light, glass) in [(true, true), (false, false)] {
+                    look.light = light;
+                    look.glass = glass;
+                    look.panel = Some(Island::Usage);
+                    for windows in [quota[..1].to_vec(), quota[..2].to_vec(), quota.clone()] {
+                        look.usage.providers[Provider::Claude as usize] = ProviderUsage {
+                            state: State::Ready,
+                            windows,
+                            fetched_at: Some(std::time::SystemTime::now()),
+                        };
+                        bar.apply_look(&gfx, look.clone())?;
+                        assert_eq!(bar.panel, Some(Island::Usage));
+                        assert!(bar.panel_span.width() > 0.0);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
