@@ -232,7 +232,6 @@ pub struct MenuBarWidgets {
 /// The halo under text and icons without a background: (blur, Y offset,
 /// alpha of the black), in logical pixels.
 const HALO: [(f32, f32, u8); 2] = [(3.0, 1.0, 230), (12.0, 0.0, 115)];
-const CAPSULE_HALO: [(f32, f32, u8); 3] = [(1.5, 0.0, 230), (4.0, 1.0, 170), (12.0, 0.0, 140)];
 
 const BARE_NOTCH_EXTRA_HEIGHT: f32 = 2.0;
 const BARE_NOTCH_DIVIDER_HEIGHT: f32 = 14.0;
@@ -282,8 +281,7 @@ fn add_halo(
     look: &Look,
 ) -> Result<()> {
     let scale = look.scale;
-    let halo: &[_] = if look.zoned { &CAPSULE_HALO } else { &HALO };
-    for &(blur, lift, alpha) in halo {
+    for (blur, lift, alpha) in HALO {
         let shadow = c.CreateDropShadow()?;
         shadow.SetMask(mask)?;
         shadow.SetBlurRadius(blur * scale)?;
@@ -439,6 +437,10 @@ impl Span {
     fn contains(self, x: f32) -> bool {
         (self.left..self.right).contains(&x)
     }
+
+    fn screen_pixels(self, origin: i32) -> std::ops::Range<i32> {
+        origin + self.left.floor() as i32..origin + self.right.ceil() as i32
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -455,10 +457,10 @@ fn strip_zone(bounds: RECT, entrance: Span, point: POINT) -> PointerZone {
     {
         PointerZone::Outside
     } else {
-        let x = (point.x - bounds.left) as f32;
-        if entrance.contains(x) {
+        let entrance = entrance.screen_pixels(bounds.left);
+        if entrance.contains(&point.x) {
             PointerZone::Center
-        } else if x < entrance.left {
+        } else if point.x < entrance.start {
             PointerZone::Left
         } else {
             PointerZone::Right
@@ -518,12 +520,14 @@ fn presence(
     ghost: bool,
     covered: bool,
     has_island: bool,
+    zoned: bool,
 ) -> Presence {
     if !visible {
         Presence::Hidden
     } else if !auto_hide || revealed {
         Presence::Full
-    } else if ghost && !covered && has_island {
+    } else if ghost && has_island && (!covered || zoned) {
+        // The island remains available over maximized windows in zoned mode.
         Presence::IslandOnly
     } else {
         Presence::Hidden
@@ -539,8 +543,11 @@ fn needs_pointer_timer(
     auto_hide: bool,
     panel_open: bool,
     hiding: bool,
+    retry_clip: bool,
 ) -> bool {
-    on_screen && (panel_open || (auto_hide && (presence != Presence::IslandOnly || hiding)))
+    retry_clip
+        || (on_screen
+            && (panel_open || (auto_hide && (presence != Presence::IslandOnly || hiding))))
 }
 
 /// The window region that keeps only the island, in window pixels, so clicks
@@ -552,6 +559,20 @@ fn ghost_region(triggers: Span, island_height: f32) -> Option<RECT> {
         right: triggers.right.ceil() as i32,
         bottom: island_height.round() as i32,
     })
+}
+
+fn resting_island_region(
+    presence: Presence,
+    hiding: bool,
+    island_hiding: bool,
+    triggers: Span,
+    island_height: f32,
+) -> Option<WindowRegion> {
+    if !hiding && (presence == Presence::IslandOnly || island_hiding) {
+        ghost_region(triggers, island_height).map(WindowRegion::Island)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -580,17 +601,29 @@ impl RegionPart {
             right,
             bottom,
         } = self.rect;
+        // Leave room for the compositor's antialiased edge around each shape.
+        // A full shadow margin would claim transparent pixels from apps below.
+        const EDGE_PADDING: i32 = 2;
         let diameter = (2.0 * self.radius).round() as i32;
         // A notch meets the screen edge with square top corners. Its upper
         // rounding sits above the window, leaving only the lower corners.
-        let top = if self.square_top { top - diameter } else { top };
+        let top = if self.square_top {
+            top - diameter - EDGE_PADDING
+        } else {
+            top
+        };
         // SAFETY: The arguments are window-relative pixel coordinates.
         unsafe {
-            if diameter > 0 {
-                CreateRoundRectRgn(left, top, right, bottom, diameter, diameter)
-            } else {
-                CreateRectRgn(left, top, right, bottom)
-            }
+            let diameter = diameter + 2 * EDGE_PADDING;
+            // GDI drops the final row and column of a rounded region.
+            CreateRoundRectRgn(
+                left - EDGE_PADDING,
+                top - EDGE_PADDING,
+                right + EDGE_PADDING + 1,
+                bottom + EDGE_PADDING + 1,
+                diameter,
+                diameter,
+            )
         }
     }
 }
@@ -671,6 +704,20 @@ fn install_window_region(hwnd: HWND, handle: Option<HRGN>) -> bool {
         }
     }
     false
+}
+
+fn sync_window_region(
+    installed: &mut Option<WindowRegion>,
+    desired: Option<WindowRegion>,
+    install: impl FnOnce(Option<WindowRegion>) -> bool,
+) -> bool {
+    if *installed != desired {
+        if !install(desired) {
+            return false;
+        }
+        *installed = desired;
+    }
+    true
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -1745,8 +1792,9 @@ impl MenuBar {
             self.auto_hide,
             self.revealed,
             self.ghost,
-            self.covered && !self.zoned(),
+            self.covered,
             self.triggers_span.width() > 0.0,
+            self.zoned(),
         )
     }
 
@@ -1956,7 +2004,7 @@ impl MenuBar {
         self.animation_epoch = self.animation_epoch.wrapping_add(1);
         self.exit_animation = None;
         self.revealed = inside;
-        if inside && self.zoned() {
+        if inside && self.zoned() && !was_hiding {
             self.revealed_sides = RevealedSides::default();
         }
         self.hide_until = (!inside && animated)
@@ -2172,6 +2220,12 @@ impl MenuBar {
     /// A leave notification can already be queued when the hidden window is
     /// shown. Check the pointer rather than hiding a newly revealed bar on it.
     pub fn check_pointer(&mut self, gfx: &Gfx) -> Result<()> {
+        if self.zoned()
+            && self.desired_window_region(self.presence_now(), self.hide_until.is_some())
+                != self.window_region
+        {
+            self.place()?;
+        }
         if self.panel.is_some() {
             // SAFETY: Read-only Escape state; checked only while a popup is open.
             if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x1B) } < 0 {
@@ -2212,8 +2266,13 @@ impl MenuBar {
             && point.y < self.bounds.bottom;
         let within_island = point.y >= self.bounds.bottom
             && point.y < self.bounds.top + self.island_height as i32
-            && x >= self.triggers_span.left
-            && x < self.triggers_span.right;
+            && if self.zoned() {
+                self.triggers_span
+                    .screen_pixels(self.bounds.left)
+                    .contains(&point.x)
+            } else {
+                self.triggers_span.contains(x)
+            };
         // Include the gap between the island and its popup so crossing it
         // does not close the popup before the pointer reaches its controls.
         let within_panel = self.panel.is_some()
@@ -2223,10 +2282,6 @@ impl MenuBar {
             && point.y < PANEL_BOTTOM.load(Ordering::Relaxed);
         let inside = within_bar || within_island || within_panel;
         if self.zoned() {
-            if !self.revealed {
-                // Only another dwell over the island can interrupt the exit.
-                return Ok(());
-            }
             let zone = if within_bar {
                 strip_zone(self.bounds, self.zone_entrance(), point)
             } else if inside {
@@ -2234,6 +2289,15 @@ impl MenuBar {
             } else {
                 PointerZone::Outside
             };
+            if !self.revealed {
+                if self.hide_until.is_some()
+                    && zone == PointerZone::Center
+                    && !muelle_shell::tracker::caption_button_at(point, self.bounds)
+                {
+                    return self.hover(gfx, true);
+                }
+                return Ok(());
+            }
             let Some(sides) = revealed_at(Some(self.revealed_sides), zone) else {
                 return self.hover(gfx, false);
             };
@@ -2302,6 +2366,31 @@ impl MenuBar {
         (self.visible && self.reserves()).then_some(self.bounds)
     }
 
+    fn visible_sides(&self, presence: Presence, hiding: bool) -> RevealedSides {
+        if presence == Presence::Full || hiding {
+            self.revealed_sides
+        } else {
+            RevealedSides::default()
+        }
+    }
+
+    fn desired_window_region(&self, presence: Presence, hiding: bool) -> Option<WindowRegion> {
+        if self.zoned() {
+            Some(
+                self.capsule_layout
+                    .region(self.visible_sides(presence, hiding)),
+            )
+        } else {
+            resting_island_region(
+                presence,
+                hiding,
+                self.island_hide_until.is_some(),
+                self.triggers_span,
+                self.island_height,
+            )
+        }
+    }
+
     /// Positions the window and reserves (or frees) its strip of the screen.
     fn place(&mut self) -> Result<()> {
         self.sync_progress_watch();
@@ -2323,11 +2412,7 @@ impl MenuBar {
         let on_screen = show_bar || island_hiding;
         let full = presence == Presence::Full;
         let zoned = self.zoned();
-        let sides = if full || hiding {
-            self.revealed_sides
-        } else {
-            RevealedSides::default()
-        };
+        let sides = self.visible_sides(presence, hiding);
         if let Some([left, right]) = &self.capsule_layers {
             left.SetIsVisible(sides.left)?;
             right.SetIsVisible(sides.right)?;
@@ -2355,13 +2440,7 @@ impl MenuBar {
         } else if !self.auto_hide {
             self.reset_surface()?;
         }
-        let region = if zoned {
-            Some(self.capsule_layout.region(sides))
-        } else if !hiding && (presence == Presence::IslandOnly || island_hiding) {
-            ghost_region(self.triggers_span, self.island_height).map(WindowRegion::Island)
-        } else {
-            None
-        };
+        let region = self.desired_window_region(presence, hiding);
         // An auto-hiding or intelligent bar leaves the whole screen to the
         // windows.
         let strip = if self.reserves() { bar_height } else { 0 };
@@ -2376,16 +2455,11 @@ impl MenuBar {
         // a strip along the top edge took the clicks meant for the close
         // button of maximized windows and for browser tabs. The edge watcher
         // watches the pointer instead.
-        let clip_ready = if zoned && region != self.window_region {
-            let installed =
-                install_window_region(self.hwnd, region.map(WindowRegion::create_handle));
-            if installed {
-                self.window_region = region;
-            }
-            installed
-        } else {
-            true
+        let hwnd = self.hwnd;
+        let install = |region: Option<WindowRegion>| {
+            install_window_region(hwnd, region.map(WindowRegion::create_handle))
         };
+        let clip_ready = !zoned || sync_window_region(&mut self.window_region, region, install);
         let show = if on_screen && clip_ready {
             SWP_SHOWWINDOW
         } else {
@@ -2402,18 +2476,17 @@ impl MenuBar {
                 self.visual_height,
                 SWP_NOACTIVATE | show,
             )?;
-            if !zoned && region != self.window_region {
-                let handle = region.map(WindowRegion::create_handle);
-                if install_window_region(self.hwnd, handle) {
-                    self.window_region = region;
-                }
+            if !zoned {
+                sync_window_region(&mut self.window_region, region, install);
             }
+            // Retry a failed zoned clip even while the pointer is idle over the island.
             if needs_pointer_timer(
                 show_bar,
                 presence,
                 self.auto_hide,
                 self.panel.is_some(),
                 hiding,
+                on_screen && !clip_ready,
             ) {
                 // TrackMouseEvent may report a leave immediately after showing
                 // a window. Check real geometry while revealed, including if
@@ -2443,18 +2516,21 @@ impl MenuBar {
                 );
             }
         }
-        let island = (presence == Presence::IslandOnly).then(|| RECT {
-            left: bounds.left + self.triggers_span.left.floor() as i32,
-            right: bounds.left + self.triggers_span.right.ceil() as i32,
-            bottom: bounds.top + self.island_height as i32,
-            ..bounds
+        let island = (presence == Presence::IslandOnly).then(|| {
+            let entrance = self.triggers_span.screen_pixels(bounds.left);
+            RECT {
+                left: entrance.start,
+                right: entrance.end,
+                bottom: bounds.top + self.island_height as i32,
+                ..bounds
+            }
         });
         let top = (self.visible && hidden).then(|| {
             if zoned {
-                let entrance = self.zone_entrance();
+                let entrance = self.zone_entrance().screen_pixels(bounds.left);
                 RECT {
-                    left: bounds.left + entrance.left.floor() as i32,
-                    right: bounds.left + entrance.right.ceil() as i32,
+                    left: entrance.start,
+                    right: entrance.end,
                     ..bounds
                 }
             } else {
@@ -2478,6 +2554,7 @@ impl MenuBar {
                 };
                 let zone = strip_zone(entrance, self.zone_entrance(), point);
                 if revealed_at(None, zone).is_none() {
+                    edge_watch::retry_on_move(edge_watch::Target::MenuBar);
                     return Ok(());
                 }
             }
@@ -2989,6 +3066,17 @@ impl MenuBar {
     /// where it happens, or `None` when the bar does not show now.
     pub fn take_cue(&mut self) -> Option<(mascot::Act, Option<POINT>)> {
         let (act, x) = self.cue.take()?;
+        // Resolve network anchors at delivery, when the visible sides are known.
+        if self.zoned() && matches!(act, mascot::Act::Online | mascot::Act::Offline) {
+            let point = self.anchor(Action::Network).or_else(|| {
+                let island = self.triggers_span;
+                (self.presence_now() != Presence::Hidden && island.width() > 0.0).then_some(POINT {
+                    x: self.bounds.left + ((island.left + island.right) / 2.0) as i32,
+                    y: self.bounds.top + self.island_height as i32,
+                })
+            });
+            return Some((act, point));
+        }
         // The moment sits under the island, on screen also while only the
         // island shows.
         let island_shown = self.presence_now() != Presence::Hidden;
@@ -3001,15 +3089,10 @@ impl MenuBar {
         ))
     }
 
-    /// Whether the bar is on screen now.
-    fn shown(&self) -> bool {
-        self.visible && (!self.auto_hide || self.revealed)
-    }
-
     /// The point under a status icon, while the bar shows: its centre and
     /// the bar's bottom edge, in screen pixels.
     fn anchor(&self, item: Action) -> Option<POINT> {
-        if !self.shown() {
+        if !self.status_shown() {
             return None;
         }
         let (left, right, _) = self.zones.iter().find(|(_, _, action)| *action == item)?;
@@ -3154,7 +3237,7 @@ impl MenuBar {
             };
             visual.SetOffset(offset)?;
             visual.SetBrush(&item.brush)?;
-            if look.widgets.bare {
+            if look.widgets.bare && !look.zoned {
                 let size = Vector2::new(item.width, item.height);
                 add_halo(c, layers, &item.brush.cast()?, size, offset, look)?;
             }
@@ -3377,7 +3460,7 @@ impl MenuBar {
                     };
                     visual.SetOffset(offset)?;
                     visual.SetBrush(&brush.brush)?;
-                    if look.widgets.bare {
+                    if look.widgets.bare && !look.zoned {
                         let size = Vector2::new(brush.width, brush.height);
                         add_halo(c, &right_layers, &brush.brush.cast()?, size, offset, look)?;
                     }
@@ -5599,19 +5682,35 @@ mod island_tests {
             ((true, true, false, false, false, true), Hidden),
         ] {
             let (v, a, r, g, c, i) = args;
-            assert_eq!(presence(v, a, r, g, c, i), expected, "{args:?}");
+            assert_eq!(presence(v, a, r, g, c, i, false), expected, "{args:?}");
         }
+    }
+
+    #[test]
+    fn zoned_island_remains_visible_when_the_strip_is_covered() {
+        assert_eq!(
+            presence(true, true, false, true, true, true, true),
+            Presence::IslandOnly
+        );
     }
 
     #[test]
     fn needs_pointer_timer_is_off_while_only_the_island_rests() {
         use Presence::*;
-        assert!(!needs_pointer_timer(true, IslandOnly, true, false, false));
-        assert!(needs_pointer_timer(true, IslandOnly, true, true, false));
-        assert!(needs_pointer_timer(true, IslandOnly, true, false, true));
-        assert!(needs_pointer_timer(true, Full, true, false, false));
-        assert!(!needs_pointer_timer(true, Full, false, false, false));
-        assert!(!needs_pointer_timer(false, Hidden, true, false, false));
+        assert!(!needs_pointer_timer(
+            true, IslandOnly, true, false, false, false
+        ));
+        assert!(needs_pointer_timer(
+            true, IslandOnly, true, true, false, false
+        ));
+        assert!(needs_pointer_timer(
+            true, IslandOnly, true, false, true, false
+        ));
+        assert!(needs_pointer_timer(true, Full, true, false, false, false));
+        assert!(!needs_pointer_timer(true, Full, false, false, false, false));
+        assert!(!needs_pointer_timer(
+            false, Hidden, true, false, false, false
+        ));
     }
 
     #[test]
@@ -5632,6 +5731,63 @@ mod island_tests {
             );
         }
         assert_eq!(ghost_region(Span::default(), 28.0), None);
+    }
+
+    #[test]
+    fn revealed_unzoned_bar_has_no_region() {
+        let island = Span {
+            left: 740.4,
+            right: 1179.6,
+        };
+        assert_eq!(
+            resting_island_region(Presence::Full, false, false, island, 30.0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_window_region_is_retried_until_installed() {
+        let mut installed = Some(WindowRegion::Island(RECT::default()));
+        let previous = installed;
+        let desired = Some(CapsuleLayout::default().region(RevealedSides::default()));
+        let failed = !sync_window_region(&mut installed, desired, |_| false);
+        assert_eq!(installed, previous);
+        assert!(needs_pointer_timer(
+            true,
+            Presence::IslandOnly,
+            true,
+            false,
+            false,
+            failed
+        ));
+        assert!(sync_window_region(&mut installed, desired, |_| true));
+        assert_eq!(installed, desired);
+        assert!(sync_window_region(&mut installed, desired, |_| {
+            panic!("the installed region must be reused")
+        }));
+    }
+
+    #[test]
+    fn dwell_accepts_the_first_pixel_of_a_fractional_entrance() {
+        let bounds = RECT {
+            left: -1920,
+            top: -30,
+            right: 0,
+            bottom: -2,
+        };
+        let entrance = Span {
+            left: 800.4,
+            right: 1120.6,
+        };
+        let pixels = entrance.screen_pixels(bounds.left);
+        for (x, expected) in [
+            (pixels.start - 1, PointerZone::Left),
+            (pixels.start, PointerZone::Center),
+            (pixels.end - 1, PointerZone::Center),
+            (pixels.end, PointerZone::Right),
+        ] {
+            assert_eq!(strip_zone(bounds, entrance, POINT { x, y: -30 }), expected);
+        }
     }
 
     #[test]
@@ -5785,9 +5941,19 @@ mod island_tests {
             28.0,
             15.0,
         );
+        let panel = RegionPart::rounded(
+            Span {
+                left: 740.0,
+                right: 1100.0,
+            },
+            35.0,
+            180.0,
+            18.0,
+        );
         let region = CapsuleLayout {
             island,
             right,
+            panel,
             ..CapsuleLayout::default()
         }
         .region(RevealedSides {
@@ -5798,12 +5964,29 @@ mod island_tests {
         assert!(!region.is_invalid());
         // SAFETY: The region is owned by this test and deleted after querying it.
         let covered = unsafe {
-            let covered = [(800, 0), (800, 29), (1300, 14), (1550, 0), (1700, 14)]
-                .map(|(x, y)| PtInRegion(region, x, y).as_bool());
+            let covered = [
+                (800, 0),
+                (800, 29),
+                (1300, 14),
+                (1550, 0),
+                (1700, 14),
+                (1548, 14),
+                (1547, 14),
+                (1918, 14),
+                (1919, 14),
+                (900, 216),
+                (900, 217),
+            ]
+            .map(|(x, y)| PtInRegion(region, x, y).as_bool());
             let _ = DeleteObject(region.into());
             covered
         };
-        assert_eq!(covered, [true, false, false, false, true]);
+        assert_eq!(
+            covered,
+            [
+                true, false, false, false, true, true, false, true, false, true, false
+            ]
+        );
     }
 
     #[test]
