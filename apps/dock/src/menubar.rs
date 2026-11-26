@@ -5633,6 +5633,13 @@ fn usage_alert_extra(normal: f32, wording: f32, available: f32) -> f32 {
     (usage_alert_width(normal, normal + wording, available) - normal).max(0.0)
 }
 
+fn bare_alert_extra(label: f32, replaced: Option<f32>, gap: f32) -> f32 {
+    match replaced {
+        Some(width) => (label - width).max(0.0),
+        None => label + gap,
+    }
+}
+
 /// What changes the island's alert wording: the announcement on and which
 /// providers are in red.
 fn alert_signature(look: &Look) -> (Option<Provider>, [bool; Provider::COUNT]) {
@@ -5718,7 +5725,6 @@ fn plan_usage_alerts(
     let inset = if bare { 0.0 } else { px(13.0) };
     let half = (normal - 2.0 * inset) / providers.len() as f32;
     let ring = Gfx::usage_ring_size(scale, bare);
-    let icon = px(if bare { BARE_PROVIDER_LOGO_SIZE } else { 18.0 });
     let item_gap = px(BARE_PROVIDER_ITEM_GAP);
     // A label with the width its slot grows by.
     type Wording = Option<(LabelBrush, f32)>;
@@ -5743,7 +5749,6 @@ fn plan_usage_alerts(
         } else {
             0.0
         };
-        let packed = icon + item_gap + percent + item_gap + ring;
         let short = usage::back_phrase(window.resets_at, now, false)
             .map(|text| -> Result<_> {
                 let label = gfx.text_brush_tinted(
@@ -5757,7 +5762,7 @@ fn plan_usage_alerts(
                     },
                 )?;
                 let extra = if bare {
-                    (packed + item_gap + label.width - px(BARE_PROVIDER_WIDTH)).max(0.0)
+                    bare_alert_extra(label.width, None, item_gap)
                 } else {
                     label.width + item_gap
                 };
@@ -5774,8 +5779,7 @@ fn plan_usage_alerts(
                     ALERT_CRITICAL,
                 )?;
                 let extra = if bare {
-                    (icon + item_gap + label.width + item_gap + ring - px(BARE_PROVIDER_WIDTH))
-                        .max(0.0)
+                    bare_alert_extra(label.width, Some(percent), item_gap)
                 } else {
                     (px(21.0) + px(25.0) + label.width + px(8.0) + ring + px(16.0) - half).max(0.0)
                 };
@@ -9186,6 +9190,12 @@ mod island_tests {
         assert_eq!(alert_form(Some(260.0), None, 200.0), AlertForm::Quiet);
         assert_eq!(alert_form(Some(260.0), Some(90.0), 60.0), AlertForm::Quiet);
         assert_eq!(alert_form(None, None, 500.0), AlertForm::Quiet);
+    }
+
+    #[test]
+    fn bare_alert_adds_only_the_width_that_changes_inside_the_provider_group() {
+        assert_eq!(bare_alert_extra(248.0, Some(32.0), 6.0), 216.0);
+        assert_eq!(bare_alert_extra(70.0, None, 6.0), 76.0);
     }
 
     #[test]
