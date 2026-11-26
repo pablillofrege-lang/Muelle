@@ -753,6 +753,44 @@ fn sync_window_region(
     true
 }
 
+/// Bounds the retries of a zoned clip that `SetWindowRgn` keeps refusing.
+/// Each retry rides the pointer timer; past the limit the bar waits for the
+/// next change of state instead of polling forever.
+#[derive(Default)]
+struct ClipRetry {
+    failed: Option<(Option<WindowRegion>, u8)>,
+}
+
+impl ClipRetry {
+    const LIMIT: u8 = 5;
+
+    /// Records an attempt to install `desired` and says whether to retry.
+    fn record(&mut self, desired: Option<WindowRegion>, installed: bool) -> bool {
+        if installed {
+            self.failed = None;
+            return false;
+        }
+        let failures = match self.failed {
+            Some((region, failures)) if region == desired => failures.saturating_add(1),
+            _ => 1,
+        };
+        self.failed = Some((desired, failures));
+        failures < Self::LIMIT
+    }
+
+    /// The attempt just recorded was the last one.
+    fn just_gave_up(&self) -> bool {
+        self.failed
+            .is_some_and(|(_, failures)| failures == Self::LIMIT)
+    }
+
+    /// The pointer timer stops retrying `desired` once it has given up on it.
+    fn gave_up(&self, desired: Option<WindowRegion>) -> bool {
+        self.failed
+            .is_some_and(|(region, failures)| region == desired && failures >= Self::LIMIT)
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq)]
 struct VolumeTrack {
     center_x: f32,
@@ -949,6 +987,7 @@ pub struct MenuBar {
     ghost: bool,
     /// The window region set now, to call `SetWindowRgn` only on change.
     window_region: Option<WindowRegion>,
+    clip_retry: ClipRetry,
     capsule_layout: CapsuleLayout,
     capsule_layers: Option<[ContainerVisual; 2]>,
     revealed_sides: RevealedSides,
@@ -1669,6 +1708,7 @@ impl MenuBar {
             island_hide_until: None,
             ghost: false,
             window_region: None,
+            clip_retry: ClipRetry::default(),
             capsule_layout: CapsuleLayout::default(),
             capsule_layers: None,
             revealed_sides: RevealedSides::default(),
@@ -2282,11 +2322,12 @@ impl MenuBar {
     /// A leave notification can already be queued when the hidden window is
     /// shown. Check the pointer rather than hiding a newly revealed bar on it.
     pub fn check_pointer(&mut self, gfx: &Gfx) -> Result<()> {
-        if self.zoned()
-            && self.desired_window_region(self.presence_now(), self.hide_until.is_some())
-                != self.window_region
-        {
-            self.place()?;
+        if self.zoned() {
+            let desired =
+                self.desired_window_region(self.presence_now(), self.hide_until.is_some());
+            if desired != self.window_region && !self.clip_retry.gave_up(desired) {
+                self.place()?;
+            }
         }
         if self.panel.is_some() {
             // SAFETY: Read-only Escape state; checked only while a popup is open.
@@ -2527,6 +2568,12 @@ impl MenuBar {
             install_window_region(hwnd, region.map(WindowRegion::create_handle))
         };
         let clip_ready = !zoned || sync_window_region(&mut self.window_region, region, install);
+        let retry_clip = zoned && on_screen && self.clip_retry.record(region, clip_ready);
+        if zoned && on_screen && self.clip_retry.just_gave_up() {
+            muelle_shell::log::line(
+                "recorte de la barra superior rechazado; se reintenta en el próximo cambio",
+            );
+        }
         let show = if on_screen && clip_ready {
             SWP_SHOWWINDOW
         } else {
@@ -2553,7 +2600,7 @@ impl MenuBar {
                 self.auto_hide,
                 self.panel.is_some(),
                 hiding,
-                on_screen && !clip_ready,
+                retry_clip,
             ) {
                 // TrackMouseEvent may report a leave immediately after showing
                 // a window. Check real geometry while revealed, including if
@@ -5827,6 +5874,36 @@ mod island_tests {
             let (v, a, r, g, c, i) = args;
             assert_eq!(presence(v, a, r, g, c, i), expected, "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_refused_clip_is_retried_a_few_times_then_waits_for_a_change() {
+        let first = Some(WindowRegion::Capsules([None; 5]));
+        let second = Some(WindowRegion::Island(RECT {
+            left: 800,
+            top: 0,
+            right: 1120,
+            bottom: 30,
+        }));
+        let mut retry = ClipRetry::default();
+        assert!(!retry.record(first, true), "installed, nothing to retry");
+        for attempt in 1..ClipRetry::LIMIT {
+            assert!(retry.record(first, false), "attempt {attempt}");
+            assert!(!retry.gave_up(first));
+        }
+        assert!(
+            !retry.record(first, false),
+            "the last attempt stops the timer"
+        );
+        assert!(retry.just_gave_up());
+        assert!(retry.gave_up(first));
+        assert!(!retry.record(first, false));
+        assert!(!retry.just_gave_up(), "logged once");
+        // A new state asks for another clip, which gets its own attempts.
+        assert!(!retry.gave_up(second));
+        assert!(retry.record(second, false));
+        assert!(!retry.record(second, true));
+        assert!(!retry.gave_up(first) && !retry.gave_up(second));
     }
 
     #[test]
