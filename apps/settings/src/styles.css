@@ -695,6 +695,11 @@ input:focus-visible {
 .select-control option { background: var(--content); color: var(--text); }
 .select-chevron { position: absolute; inset-inline-end: 9px; top: 50%; width: 12px; height: 12px; transform: translateY(-50%); pointer-events: none; color: var(--text-dim); }
 
+.preference-field { display: flex; flex-direction: column; align-items: end; gap: 4px; max-width: 100%; }
+.preference-field input { width: 170px; max-width: 100%; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--segment); color: var(--text); font: inherit; }
+.preference-field input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.card-note a { color: inherit; }
+
 
 /* Spacing previews isolate the dock at a larger, consistent icon size. */
 .preview-density { display: grid; place-items: center; width: 100%; height: 72px; }

@@ -145,6 +145,38 @@ test("each section renders only its own controls, in every language and visibili
 
 const wallpaperButtons = (view) => [...elements(view.body())].filter((node) => node.type === "button" && "data-wallpaper-id" in node.props);
 
+test("desktop clock and manual weather preferences save together and auto hides location fields", async () => {
+  const view = fixture("appearance");
+  const markup = () => renderToStaticMarkup(view.body());
+  assert.match(markup(), /aria-label="Desktop clock"/);
+  const latitude = markup().match(/<input [^>]*aria-label="Latitude"[^>]*>/)?.[0] ?? "";
+  assert.match(latitude, /min="-90" max="90"/);
+  view.change("Desktop clock", true);
+  view.change("City", "Málaga");
+  view.change("Latitude", "36.72");
+  view.change("Longitude", "-4.42");
+  view.change("Show weather", false);
+  view.change("Use my location", true);
+  assert.doesNotMatch(markup(), /aria-label="(City|Latitude|Longitude)"/);
+  view.fire(60);
+  await settle();
+  assert.deepEqual(view.calls, [{
+    desktopClock: true,
+    weather: { city: "Málaga", latitude: 36.72, longitude: -4.42, enabled: false, auto: true },
+  }]);
+  view.change("Use my location", false);
+  assert.match(markup(), /value="Málaga"/);
+});
+
+test("Cristal A is a dock style independent of appearance", async () => {
+  const view = fixture("dock", { language: "es", appearance: "frosted" });
+  assert.match(renderToStaticMarkup(view.body()), /<option value="a" dir="auto">Cristal A<\/option>/);
+  view.change("Estilo del dock", "a");
+  view.fire(60);
+  await settle();
+  assert.deepEqual(view.calls, [{ dockStyle: "a" }]);
+});
+
 test("the gallery bundles only offline previews and appears only inside Appearance", () => {
   for (const language of Object.keys(texts)) {
     assert.equal(texts[language].wallpaperNames.length, wallpaperCount);

@@ -544,7 +544,16 @@ pub fn update_preferences(
                         "version" | "pinned" | "groups" | "recent" | "taskbarPins"
                     )
                 {
-                    fields.insert(key, value);
+                    if key == "weather"
+                        && let Some(current) = fields
+                            .get_mut(&key)
+                            .and_then(serde_json::Value::as_object_mut)
+                        && let serde_json::Value::Object(changes) = value
+                    {
+                        current.extend(changes);
+                    } else {
+                        fields.insert(key, value);
+                    }
                 }
             }
         }
@@ -1113,6 +1122,33 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Config>(&serde_json::to_string(&selected)?)?,
             selected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn updating_one_weather_field_preserves_the_saved_location() -> Result<(), ConfigError> {
+        let path = scratch("weather-patch");
+        let config = Config {
+            weather: Weather {
+                city: "Málaga".into(),
+                latitude: 36.72,
+                longitude: -4.42,
+                ..Weather::default()
+            },
+            ..Config::default()
+        };
+        save(&path, &config)?;
+        let updated = update_preferences(
+            &path,
+            serde_json::Map::from_iter([("weather".into(), serde_json::json!({"auto": true}))]),
+        )?;
+        assert_eq!(
+            updated.weather,
+            Weather {
+                auto: true,
+                ..config.weather
+            }
         );
         Ok(())
     }

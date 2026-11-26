@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 
 interface CardProps {
   /** Heading above the group, as macOS System Settings labels its groups. */
@@ -118,6 +118,62 @@ interface SelectProps<T extends string> {
   label: string;
   options: readonly { value: T; label: string }[];
   onChange: (value: T) => void;
+}
+
+interface PreferenceInputProps {
+  label: string;
+  value: string | number;
+  min?: number;
+  max?: number;
+  maxLength?: number;
+  invalidText?: string;
+  onChange: (value: string) => void;
+}
+
+/** Commits once the user leaves the field or presses Enter. */
+export function PreferenceInput({ label, value, min, max, maxLength, invalidText, onChange }: PreferenceInputProps) {
+  const errorId = useId();
+  const [draft, setDraft] = useState<string | null>(null);
+  const [invalid, setInvalid] = useState(false);
+  const number = typeof value === "number";
+  return (
+    <div className="preference-field">
+      <input
+        type={number ? "number" : "text"}
+        inputMode={number ? "decimal" : undefined}
+        step={number ? "any" : undefined}
+        required={number}
+        min={min}
+        max={max}
+        maxLength={maxLength}
+        aria-label={label}
+        aria-invalid={invalid || undefined}
+        aria-describedby={invalid ? errorId : undefined}
+        value={draft ?? value}
+        onChange={(event) => {
+          const input = event.currentTarget;
+          setDraft(input.value);
+          if (input.validity.valid) setInvalid(false);
+        }}
+        onBlur={(event) => {
+          if (draft === null) return;
+          const input = event.currentTarget;
+          if (!input.validity.valid) {
+            setInvalid(true);
+            return;
+          }
+          const next = input.value.trim();
+          if (next !== String(value)) onChange(next);
+          setDraft(null);
+          setInvalid(false);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.nativeEvent.isComposing) event.currentTarget.blur();
+        }}
+      />
+      {invalid && <span id={errorId} className="row-hint" role="status">{invalidText}</span>}
+    </div>
+  );
 }
 
 /** Native popup and keyboard navigation, styled like the other Settings controls. */
