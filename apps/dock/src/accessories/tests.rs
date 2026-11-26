@@ -1,5 +1,8 @@
 use super::*;
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use windows::{
     Win32::{
         Foundation::WAIT_OBJECT_0,
@@ -9,16 +12,26 @@ use windows::{
 };
 
 fn ready_monitor() -> Result<(Monitor, Owned<HANDLE>)> {
-    // Explicitly provided executable: never launch a full dock in unit tests.
-    let path = PathBuf::from(
-        env::var_os("MUELLE_ACCESSORY_TEST_EXE")
-            .context("Build muelle and set MUELLE_ACCESSORY_TEST_EXE to its absolute path")?,
-    );
-    ensure!(
-        path.is_absolute() && path.is_file(),
-        "test executable missing"
-    );
-    let monitor = Monitor::start(0, 0, path, true)?;
+    let powershell = PathBuf::from(env::var_os("SystemRoot").context("missing Windows directory")?)
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let ready = serde_json::to_string(&Frame::Ready(Snapshot {
+        state: State::Ready,
+        ..Snapshot::default()
+    }))?;
+    // A real child with deterministic stdout and no device providers. Once
+    // ready it stays alive until the monitor or its deadline terminates it.
+    let monitor = Monitor::start(0, 0, true, |_| {
+        let mut worker = Command::new(powershell);
+        worker
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::WriteLine($env:MUELLE_TEST_READY_FRAME); [Threading.Thread]::Sleep(-1)",
+            ])
+            .env("MUELLE_TEST_READY_FRAME", ready);
+        worker
+    })?;
     let started = Instant::now();
     while monitor.snapshot().state == State::Loading && started.elapsed() < Duration::from_secs(7) {
         thread::sleep(Duration::from_millis(10));
@@ -49,7 +62,7 @@ fn wait_for_reader_cleanup(shared: &Arc<Shared>) {
 }
 
 #[test]
-#[ignore = "Requires MUELLE_ACCESSORY_TEST_EXE pointing to a built native worker"]
+#[ignore = "Starts and terminates its own Windows child process"]
 fn monitor_repeated_shutdown_and_timeout_are_bounded() -> Result<()> {
     for _ in 0..3 {
         let (monitor, process) = ready_monitor()?;
