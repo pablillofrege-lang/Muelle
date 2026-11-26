@@ -138,6 +138,20 @@ pub(crate) fn text_in(language: Language) -> &'static Strings {
     }
 }
 
+pub(crate) struct WeatherText {
+    pub conditions: [&'static str; 6],
+    pub high: &'static str,
+    pub low: &'static str,
+}
+
+pub(crate) fn weather(language: Language) -> &'static WeatherText {
+    if language == Language::Es {
+        &es::WEATHER
+    } else {
+        &en::WEATHER
+    }
+}
+
 /// The language the text is in, never `Auto`. Part of the menu bar's
 /// rendered-content key.
 pub fn language() -> Language {

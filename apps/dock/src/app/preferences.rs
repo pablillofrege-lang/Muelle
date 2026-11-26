@@ -81,7 +81,7 @@ fn warn_about_weather(config: &Config) {
 }
 
 fn weather_warning(config: &Config) -> Option<&'static str> {
-    (config.weather.enabled && !config.weather.has_valid_coordinates())
+    (config.weather.enabled && !config.weather.auto && !config.weather.has_valid_coordinates())
         .then_some("tiempo: coordenadas fuera de rango en la configuración; no se consulta")
 }
 

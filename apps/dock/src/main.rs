@@ -90,7 +90,7 @@ fn main() -> Result<()> {
         ["--autostart", "off"] => Ok(autostart::set(None)?),
         [guard::FLAG, pid] => guard::run(pid.parse().context("pid no válido")?),
         ["--usage-worker"] => usage::worker_main(),
-        [weather::WORKER_FLAG, latitude, longitude] => weather::worker_main(latitude, longitude),
+        [weather::WORKER_FLAG] => weather::worker_main(),
         [accessories::FLAG] => accessories::worker_main(None),
         [accessories::FLAG, visibility] => accessories::worker_main(Some(visibility)),
         [accessories::USB_FLAG] => accessories::usb_worker_main(),
