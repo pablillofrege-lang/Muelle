@@ -23,6 +23,12 @@
 - Commits en español, concisos, sin `Co-Authored-By`; push tras cada commit.
 - CI: `cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings; cargo test --workspace --locked`. Ajustes: `cd apps/settings; pnpm test; pnpm build`.
 
+## Reparto
+
+- Tareas 1-2: Sonnet (Agent nativo), en serie, sin tocar `menubar.rs` salvo el campo de `MenuBarWidgets`.
+- Tareas 3-5: Codex `gpt-6.2-sol` high, un solo encargo en serie (comparten `menubar.rs`).
+- Tarea 6: Opus (rebase, revisión, instalación), Fable (comparación visual) y Haiku (RAM y CPU).
+
 ## Review Focus
 
 1. `resets_at` ausente o ya pasado (dato viejo): la frase larga queda «Claude casi agotado» sin hora y no hay frase corta; nada de «vuelve a las 00:00». → prueba en Tarea 2.
@@ -139,5 +145,6 @@
 - [ ] Rebasar sobre `origin/f1-ajustes-diseno` (o `main` si el PR #5 ya está fusionado) y repetir CI, Ajustes y nativas.
 - [ ] Revisión de Opus de la rama entera (`superpowers:requesting-code-review`).
 - [ ] Compilar Ajustes y el dock, instalar con `scripts/build-installer.ps1` + `/S` y encender `menuBarAiAlerts`.
+- [ ] Fable compara capturas reales (normal, ámbar, rojo durante y después del aviso, detalle) con `ObsidianVault/proyectos/muelle/preview/f2/avisos-ia.html`, alternativa C.
 - [ ] Haiku mide RAM en reposo (`scripts/measure.ps1`, < ~40 MB) y CPU en reposo (rondas de 45 s sin entrada, con la clave encendida y en rojo forzado tras el aviso: sin diferencia frente a la clave apagada).
 - [ ] Abrir el PR de F2 y anotar en la nota del vault.
