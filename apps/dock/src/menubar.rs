@@ -4651,12 +4651,8 @@ fn draw_compact_usage(
     let icon_size = px(if bare { 15.0 } else { 18.0 }) as u32;
     let with_ring = half >= px(if bare { 52.0 } else { 84.0 });
     let ring_size = px(16.0);
-    let gap = px(6.0);
-    let show_labels = if bare {
-        half >= px(76.0)
-    } else {
-        half > px(106.0)
-    };
+    let max_gap = px(6.0);
+    let show_labels = if bare { with_ring } else { half > px(106.0) };
     let mut labels = [const { None }; Provider::COUNT];
     if show_labels {
         for (slot, (_, usage, _)) in labels.iter_mut().zip(providers) {
@@ -4670,16 +4666,22 @@ fn draw_compact_usage(
             };
             let label = gfx.text_brush_sized(&usage.compact_text(), scale, font, true, ink)?;
             let reserve = if bare {
-                icon_size as f32 + 2.0 * gap + ring_size
+                icon_size as f32 + ring_size
             } else {
                 px(if has_reading { 74.0 } else { 50.0 })
             };
-            *slot = (label.width <= half - reserve).then_some(label);
+            let remaining = half - reserve - label.width;
+            *slot = (remaining >= 0.0).then(|| {
+                // Give the measured percentage the space it needs before adding gaps.
+                let gap = (remaining / 2.0).min(max_gap);
+                (label, gap)
+            });
         }
     }
-    let bare_group_width = |label: &Option<LabelBrush>| {
+    let bare_group_width = |label: &Option<(LabelBrush, f32)>| {
+        let gap = label.as_ref().map_or(max_gap, |(_, gap)| *gap);
         icon_size as f32
-            + label.as_ref().map_or(0.0, |label| gap + label.width)
+            + label.as_ref().map_or(0.0, |(label, _)| gap + label.width)
             + if with_ring { gap + ring_size } else { 0.0 }
     };
     // Keep the design's spacing when it fits and give wide percentages priority.
@@ -4691,11 +4693,6 @@ fn draw_compact_usage(
     let breaks = providers.len().saturating_sub(1) as f32;
     let provider_gap = ((geometry.width - groups_width) / breaks.max(1.0)).clamp(0.0, px(14.0));
     let mut bare_left = (geometry.width - groups_width - provider_gap * breaks) / 2.0;
-    let label_offset = if bare {
-        icon_size as f32 + gap
-    } else {
-        px(25.0)
-    };
     let mut anchors = Vec::with_capacity(providers.len());
     for (index, ((provider, usage, accent), label)) in providers.iter().zip(labels).enumerate() {
         let slot = inset + index as f32 * half;
@@ -4738,7 +4735,12 @@ fn draw_compact_usage(
                 icon_size as f32,
             )?;
         }
-        if let Some(label) = label {
+        if let Some((label, gap)) = label {
+            let label_offset = if bare {
+                icon_size as f32 + gap
+            } else {
+                px(25.0)
+            };
             add_visual(
                 c,
                 content,
