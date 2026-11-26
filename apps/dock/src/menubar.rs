@@ -5676,7 +5676,19 @@ enum AlertSlot {
     /// The announcement: the phrase where the percentage goes.
     Long(LabelBrush),
     /// "vuelve 21:40", after the ring.
-    Short(LabelBrush),
+    Short(ShortAlert),
+}
+
+struct ShortAlert {
+    prefix: LabelBrush,
+    time: LabelBrush,
+    gap: f32,
+}
+
+impl ShortAlert {
+    fn width(&self) -> f32 {
+        self.prefix.width + self.gap + self.time.width
+    }
 }
 
 /// The alert wording of every provider and the width it adds to the usage
@@ -5717,6 +5729,7 @@ fn plan_usage_alerts(
     let scale = look.scale;
     let px = |v: f32| (v * scale).round();
     let bare = look.zoned;
+    let ink = if look.light { Ink::Dark } else { Ink::Light };
     let now = chrono::Local::now();
     let normal = usage_trigger_width(scale, providers.len(), bare);
     let music = music_trigger_width(scale, look.track.is_some(), bare);
@@ -5727,7 +5740,7 @@ fn plan_usage_alerts(
     let ring = Gfx::usage_ring_size(scale, bare);
     let item_gap = px(BARE_PROVIDER_ITEM_GAP);
     // A label with the width its slot grows by.
-    type Wording = Option<(LabelBrush, f32)>;
+    type Wording = Option<(AlertSlot, f32)>;
     let mut words: Vec<(Provider, Wording, Wording)> = Vec::new();
     for (provider, usage, _) in providers {
         if usage.alert_level() != Level::Critical {
@@ -5749,41 +5762,43 @@ fn plan_usage_alerts(
         } else {
             0.0
         };
-        let short = usage::back_phrase(window.resets_at, now, false)
-            .map(|text| -> Result<_> {
-                let label = gfx.text_brush_tinted(
-                    &text,
-                    scale,
-                    11.5,
-                    false,
-                    Color {
-                        A: 217,
-                        ..ALERT_CRITICAL
-                    },
-                )?;
-                let extra = if bare {
-                    bare_alert_extra(label.width, None, item_gap)
-                } else {
-                    label.width + item_gap
+        let short = usage::short_back_phrase(window.resets_at, now)
+            .map(|(prefix, time)| -> Result<_> {
+                let channel = if look.light { 0 } else { 255 };
+                let labels = ShortAlert {
+                    prefix: gfx.text_brush_tinted(
+                        prefix,
+                        scale,
+                        12.0,
+                        false,
+                        rgba(channel, channel, channel, 173),
+                    )?,
+                    time: gfx.text_brush_sized(&time, scale, 12.0, true, ink)?,
+                    gap: px(3.0),
                 };
-                Ok((label, extra))
+                let extra = if bare {
+                    bare_alert_extra(labels.width(), None, item_gap)
+                } else {
+                    labels.width() + item_gap
+                };
+                Ok((AlertSlot::Short(labels), extra))
             })
             .transpose()?;
         let long = (look.announcing == Some(*provider))
             .then(|| -> Result<_> {
-                let label = gfx.text_brush_tinted(
+                let label = gfx.text_brush_sized(
                     &usage::alert_text(*provider, usage, now),
                     scale,
                     12.0,
                     true,
-                    ALERT_CRITICAL,
+                    ink,
                 )?;
                 let extra = if bare {
                     bare_alert_extra(label.width, Some(percent), item_gap)
                 } else {
                     (px(21.0) + px(25.0) + label.width + px(8.0) + ring + px(16.0) - half).max(0.0)
                 };
-                Ok((label, extra))
+                Ok((AlertSlot::Long(label), extra))
             })
             .transpose()?;
         words.push((*provider, long, short));
@@ -5809,10 +5824,8 @@ fn plan_usage_alerts(
     );
     for (provider, long, short) in words {
         let chosen = match form {
-            AlertForm::Long => long
-                .map(|(label, extra)| (AlertSlot::Long(label), extra))
-                .or_else(|| short.map(|(label, extra)| (AlertSlot::Short(label), extra))),
-            AlertForm::Short => short.map(|(label, extra)| (AlertSlot::Short(label), extra)),
+            AlertForm::Long => long.or(short),
+            AlertForm::Short => short,
             AlertForm::Quiet => None,
         };
         if let Some((slot, extra)) = chosen {
@@ -6176,12 +6189,12 @@ fn draw_compact_usage(
             AlertSlot::Quiet => {}
         }
     }
-    let bare_group_width = |label: &Option<(LabelBrush, f32)>, suffix: &Option<LabelBrush>| {
+    let bare_group_width = |label: &Option<(LabelBrush, f32)>, suffix: &Option<ShortAlert>| {
         let gap = label.as_ref().map_or(max_gap, |(_, gap)| *gap);
         icon_size as f32
             + label.as_ref().map_or(0.0, |(label, _)| gap + label.width)
             + if with_ring { gap + ring_size } else { 0.0 }
-            + suffix.as_ref().map_or(0.0, |text| max_gap + text.width)
+            + suffix.as_ref().map_or(0.0, |text| max_gap + text.width())
     };
     // Keep the design's spacing when it fits and give wide percentages priority.
     let groups_width: f32 = if bare {
@@ -6267,7 +6280,7 @@ fn draw_compact_usage(
                 alert_ink(shown_level(usage, alerts), *accent),
                 bare,
             )?;
-            let suffix_width = suffix.as_ref().map_or(0.0, |text| max_gap + text.width);
+            let suffix_width = suffix.as_ref().map_or(0.0, |text| max_gap + text.width());
             // The ring keeps its place; the long phrase widens the slot
             // before it, "vuelve ..." goes after it.
             let x = if bare {
@@ -6284,16 +6297,20 @@ fn draw_compact_usage(
                 ring.width,
                 ring.height,
             )?);
-            if let Some(text) = &suffix {
-                add_visual(
-                    c,
-                    content,
-                    &text.brush.cast()?,
-                    x + ring.width + max_gap,
-                    (bar_height - text.height) / 2.0,
-                    text.width,
-                    text.height,
-                )?;
+            if let Some(short) = &suffix {
+                let mut left = x + ring.width + max_gap;
+                for label in [&short.prefix, &short.time] {
+                    add_visual(
+                        c,
+                        content,
+                        &label.brush.cast()?,
+                        left,
+                        (bar_height - label.height) / 2.0,
+                        label.width,
+                        label.height,
+                    )?;
+                    left += label.width + short.gap;
+                }
             }
         }
         if let Some(visual) = beat {

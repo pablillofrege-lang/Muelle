@@ -54,7 +54,8 @@ pub struct Strings {
     pub usage_back_today_long: &'static str,
     pub usage_back_tomorrow_long: &'static str,
     pub usage_back_day_long: &'static str,
-    /// The short phrases beside the ring.
+    /// The short return phrase, drawn as a prefix and a date/time.
+    pub usage_back: &'static str,
     pub usage_back_today: &'static str,
     pub usage_back_tomorrow: &'static str,
     pub usage_back_day: &'static str,

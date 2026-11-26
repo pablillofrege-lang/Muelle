@@ -158,6 +158,34 @@ pub fn back_phrase_with(
     now: DateTime<Local>,
     long: bool,
 ) -> Option<String> {
+    if long {
+        return back_wording(text, resets_at, now, true);
+    }
+    let (prefix, time) = short_back_phrase_with(text, resets_at, now)?;
+    Some(format!("{prefix} {time}"))
+}
+
+pub fn short_back_phrase(
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+) -> Option<(&'static str, String)> {
+    short_back_phrase_with(strings::text(), resets_at, now)
+}
+
+fn short_back_phrase_with(
+    text: &Strings,
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+) -> Option<(&'static str, String)> {
+    Some((text.usage_back, back_wording(text, resets_at, now, false)?))
+}
+
+fn back_wording(
+    text: &Strings,
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+    long: bool,
+) -> Option<String> {
     let resets = resets_at?.with_timezone(&Local);
     if resets <= now {
         return None;
@@ -2170,6 +2198,22 @@ mod alert_tests {
             phrase(en, Some(at(28, 4, 0)), now, true).as_deref(),
             Some("back Sat at 04:00")
         );
+    }
+
+    #[test]
+    fn compact_return_labels_keep_the_localized_day_with_the_time() {
+        let now = at(25, 21, 0);
+        let resets = Some(at(28, 4, 0).with_timezone(&Utc));
+        for (language, prefix, time) in [
+            (Language::Es, "vuelve", "sáb. 04:00"),
+            (Language::En, "back", "Sat 04:00"),
+            (Language::Fr, "back", "Sat 04:00"),
+        ] {
+            assert_eq!(
+                short_back_phrase_with(strings::text_in(language), resets, now),
+                Some((prefix, time.to_owned()))
+            );
+        }
     }
 
     #[test]
