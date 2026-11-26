@@ -41,7 +41,7 @@ use std::{
 };
 
 use anyhow::Result;
-use muelle_config::{Config, DockDensity};
+use muelle_config::{Config, DockDensity, DockStyle};
 use muelle_core::{
     attention::Attention,
     frame::{DockEdge, Frame as DockFrame},
@@ -545,6 +545,7 @@ struct StageKey {
     /// backdrop brush made while Windows had transparency off stays black
     /// after it comes back, so its `glass` rebuilds the dock both ways.
     look: crate::appearance::Look,
+    dock_style: DockStyle,
     bin_full: bool,
     auto_hide: bool,
     smart_hide: bool,

@@ -205,6 +205,7 @@ pub fn run() -> Result<()> {
         let config = load_config();
         strings::set_language(config.language);
         crate::appearance::set(config.appearance);
+        crate::appearance::set_dock_style(config.dock_style);
         crate::appearance::set_menu_bar(config.menu_bar_appearance);
         let roster = roster_from(&config);
         let auto_hide = config.auto_hide;
