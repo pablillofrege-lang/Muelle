@@ -368,6 +368,15 @@ pub fn menu_bar_finish_hide(completed_epoch: Option<usize>) {
     });
 }
 
+/// The compositor ended an announcement of the usage island; `generation`
+/// tells a stale end from the current one.
+pub fn menu_bar_alert_done(generation: usize) {
+    with_app("aviso de límite de IA", |app| match &mut app.menubar {
+        Some(bar) => bar.alert_done(&app.gfx, generation),
+        None => Ok(()),
+    });
+}
+
 pub fn menu_bar_pointer_moved(x: f32, y: f32) {
     with_app("barra superior", |app| match &mut app.menubar {
         Some(bar) => bar.pointer_moved(&app.gfx, x, y),

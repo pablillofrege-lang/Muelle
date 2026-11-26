@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accessories;
+mod alerts;
 mod app;
 mod appearance;
 mod assets;

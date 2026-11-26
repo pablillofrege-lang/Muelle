@@ -6,7 +6,9 @@
 //! brightness) and the date and time (opens the notification center).
 //!
 //! Cost while idle: one timer that fires once a minute, on the minute, to
-//! redraw the clock. Everything else is event-driven.
+//! redraw the clock. Everything else is event-driven. The AI limit alerts
+//! add none: the heartbeat and the island's growth are finite composition
+//! animations, and the end of the 8 s announcement is the compositor's.
 //!
 //! With auto-hide on, the bar reserves no space and stays off screen. Resting
 //! the pointer briefly at the top edge reveals it.
@@ -27,6 +29,7 @@ use muelle_shell::{
     watch::RegistryWatch,
 };
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering},
@@ -38,10 +41,10 @@ use windows::{
     UI::{
         Color,
         Composition::{
-            CompositionBatchTypes, CompositionBrush, CompositionRoundedRectangleGeometry,
-            CompositionScopedBatch, CompositionSurfaceBrush, Compositor, ContainerVisual,
-            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, ScalarKeyFrameAnimation,
-            ShapeVisual, SpriteVisual, VisualCollection,
+            AnimationIterationBehavior, CompositionBatchTypes, CompositionBrush,
+            CompositionRoundedRectangleGeometry, CompositionScopedBatch, CompositionSurfaceBrush,
+            Compositor, ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget,
+            ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, VisualCollection,
         },
     },
     Win32::{
@@ -77,7 +80,9 @@ use windows::{
 use windows_numerics::{Vector2, Vector3};
 
 use crate::{
-    accessories, app,
+    accessories,
+    alerts::AlertTracker,
+    app,
     appearance::{self, Material},
     bluetooth, edge_watch,
     gfx::{BARE_ISLAND_RADIUS, Gfx, Ink, LabelBrush},
@@ -106,6 +111,8 @@ const VOLUME_CAPTURE_LOST: u32 = WM_APP + 31;
 const AUDIO_CHANGED: u32 = WM_APP + 32;
 const AUDIO_TICK: u32 = WM_APP + 33;
 const BLUETOOTH_CHANGED: u32 = WM_APP + 34;
+/// The compositor ended the announcement's 8 s; the number is its generation.
+const ALERT_DONE: u32 = WM_APP + 35;
 const VOLUME_TIMER: usize = 4;
 const PROGRESS_TIMER: usize = 5;
 /// The system monitor's samples (issue #64): every 2 s while it shows, and
@@ -367,6 +374,8 @@ struct Look {
     panel: Option<Island>,
     usage_refreshing: bool,
     track: Option<Track>,
+    /// The provider whose announcement widens the island now (`ai_alerts`).
+    announcing: Option<Provider>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1035,6 +1044,28 @@ pub struct MenuBar {
     /// it lives outside `widgets` and changing it redraws nothing.
     clock_target: Option<String>,
     usage: Option<UsageMonitor>,
+    /// Which providers are in red (`ai_alerts`), those waiting for their
+    /// announcement and the one on now, with when it began.
+    alerts: AlertTracker,
+    announce_queue: VecDeque<Provider>,
+    announcing: Option<Provider>,
+    announce_started: Option<Instant>,
+    /// Changes whenever an announcement ends or is cancelled, so the end of
+    /// an older one that arrives late is ignored.
+    alert_generation: usize,
+    /// Holds the announcement's 8 s animation: it outlives every redraw,
+    /// which replaces the island's own visuals.
+    alert_host: ContainerVisual,
+    alert_clock: Option<ExitAnimation>,
+    /// How long an announcement lasts (`ALERT_LONG`; shorter in tests).
+    alert_long: Duration,
+    /// Heartbeats under way and what they beat on in the last drawing.
+    pulses: Vec<(Provider, Instant)>,
+    pulse_targets: Vec<(Provider, SpriteVisual)>,
+    /// The island's body, which a growing announcement unveils, and the
+    /// span it grows from.
+    island_body: Option<ContainerVisual>,
+    growing_from: Option<Span>,
     /// Where each provider sits in the closed island, as screen x.
     usage_anchors: Vec<(Provider, i32)>,
     /// A moment for the crab, waiting for the dock (see `take_cue`).
@@ -1132,6 +1163,7 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         ACCESSORIES_CHANGED => app::menu_bar_accessories_changed(),
         MEDIA_CHANGED => app::menu_bar_media_changed(),
         BLUETOOTH_CHANGED => app::menu_bar_bluetooth_changed(),
+        ALERT_DONE => app::menu_bar_alert_done(w.0),
         AUDIO_CHANGED => {
             if !AUDIO_TICK_PENDING.swap(true, Ordering::Relaxed) {
                 unsafe {
@@ -1723,6 +1755,8 @@ impl MenuBar {
         let island_layer = gfx.compositor.CreateContainerVisual()?;
         surface.Children()?.InsertAtTop(&strip_layer)?;
         surface.Children()?.InsertAtTop(&island_layer)?;
+        let alert_host = gfx.compositor.CreateContainerVisual()?;
+        surface.Children()?.InsertAtBottom(&alert_host)?;
         let mut bar = Self {
             accessories: None,
             accessories_enabled: false,
@@ -1773,6 +1807,18 @@ impl MenuBar {
             widgets,
             clock_target: None,
             usage: usage_enabled.then(|| UsageMonitor::new(hwnd.0 as isize, USAGE_CHANGED)),
+            alerts: AlertTracker::default(),
+            announce_queue: VecDeque::new(),
+            announcing: None,
+            announce_started: None,
+            alert_generation: 0,
+            alert_host,
+            alert_clock: None,
+            alert_long: ALERT_LONG,
+            pulses: Vec::new(),
+            pulse_targets: Vec::new(),
+            island_body: None,
+            growing_from: None,
             usage_anchors: Vec::new(),
             cue: None,
             online: None,
@@ -3089,6 +3135,7 @@ impl MenuBar {
             panel: self.panel,
             usage_refreshing: self.usage.as_ref().is_some_and(UsageMonitor::is_refreshing),
             track,
+            announcing: None,
         };
         self.apply_look(gfx, look)
     }
@@ -3212,6 +3259,7 @@ impl MenuBar {
         if look.panel != Some(Island::Usage) {
             self.usage_scroll = 0.0;
         }
+        self.sync_alerts(gfx, &mut look);
         let moved = self
             .look
             .as_ref()
@@ -3226,6 +3274,14 @@ impl MenuBar {
             .look
             .as_ref()
             .and_then(|old| usage_moment(&old.usage, &look.usage, &look.active_providers));
+        // An alert that widens the island unveils the new width from the old.
+        let alert_changed = self
+            .look
+            .as_ref()
+            .is_some_and(|old| alert_signature(old) != alert_signature(&look));
+        self.growing_from =
+            (look.widgets.ai_alerts && alert_changed && self.triggers_span.width() > 0.0)
+                .then_some(self.triggers_span);
         self.build(gfx, &look)?;
         // A crowded bar can have no room even for a compact trigger. Do not
         // keep a ghost popup that reappears by itself when space returns.
@@ -3235,11 +3291,224 @@ impl MenuBar {
             self.build(gfx, &look)?;
         }
         self.look = Some(look);
+        self.animate_alerts(gfx);
         self.sync_progress_watch();
         if let Some((provider, act)) = moment
             && let Some(&(_, x)) = self.usage_anchors.iter().find(|(p, _)| *p == provider)
         {
             self.cue = Some((act, x));
+        }
+        Ok(())
+    }
+
+    /// Whether the island is, or is about to be, in front of the user: an
+    /// announcement that began out of sight would have run out unseen.
+    fn island_on_screen(&self) -> bool {
+        self.visible
+            && (!self.auto_hide
+                || self.revealed
+                || (self.ghost && !(self.covered && !self.zoned())))
+    }
+
+    /// Reads the usage for AI limit alerts and settles which announcement is
+    /// on (`look.announcing`). Nothing here arms a timer.
+    fn sync_alerts(&mut self, gfx: &Gfx, look: &mut Look) {
+        if !look.widgets.ai_alerts || !look.usage_enabled {
+            if !look.widgets.ai_alerts {
+                self.alerts = AlertTracker::default();
+            }
+            self.cancel_alerts();
+            look.announcing = None;
+            return;
+        }
+        let notch = look.widgets.island_style == IslandStyle::Notch;
+        let fresh = self.alerts.observe(&look.usage, look.active_providers);
+        if notch {
+            for provider in fresh {
+                if self.announcing != Some(provider) && !self.announce_queue.contains(&provider) {
+                    self.announce_queue.push_back(provider);
+                }
+            }
+        } else {
+            // The bubble has no room for a phrase: colors, heartbeat and the
+            // detail on hover are all it has.
+            self.announce_queue.clear();
+            self.end_announcement();
+            for provider in fresh {
+                self.start_pulse(provider);
+            }
+        }
+        let red = |provider: Provider| {
+            look.active_providers.has(provider)
+                && look.usage.get(provider).alert_level() == Level::Critical
+        };
+        if let Some(provider) = self.announcing
+            && (!red(provider)
+                || self
+                    .announce_started
+                    .is_some_and(|began| began.elapsed() > self.alert_long + ALERT_GRACE))
+        {
+            self.end_announcement();
+        }
+        self.announce_queue.retain(|provider| red(*provider));
+        if notch && self.announcing.is_none() && self.island_on_screen() {
+            while let Some(next) = self.announce_queue.pop_front() {
+                self.announcing = Some(next);
+                self.announce_started = Some(Instant::now());
+                match self.start_alert_clock(gfx) {
+                    Ok(()) => {
+                        self.start_pulse(next);
+                        break;
+                    }
+                    Err(error) => {
+                        muelle_shell::log::line(&format!("aviso de límite de IA: {error:#}"));
+                        self.announcing = None;
+                        self.announce_started = None;
+                    }
+                }
+            }
+        }
+        look.announcing = self.announcing;
+    }
+
+    /// The 8 s of the announcement: a finite animation on a visual that no
+    /// redraw replaces. When the compositor completes its batch, the bar's
+    /// window gets `ALERT_DONE` with this announcement's generation.
+    fn start_alert_clock(&mut self, gfx: &Gfx) -> Result<()> {
+        self.alert_clock = None;
+        let c = &gfx.compositor;
+        let batch = c.CreateScopedBatch(CompositionBatchTypes::Animation)?;
+        let hold = c.CreateScalarKeyFrameAnimation()?;
+        hold.SetDuration(TimeSpan {
+            Duration: (self.alert_long.as_nanos() / 100) as i64,
+        })?;
+        hold.InsertKeyFrame(0.0, 1.0)?;
+        hold.InsertKeyFrame(1.0, 0.0)?;
+        let started = self.alert_host.StartAnimation(h!("Opacity"), &hold);
+        let window = self.hwnd.0 as isize;
+        let generation = self.alert_generation;
+        let completed = batch.Completed(&TypedEventHandler::new(move |_, _| {
+            // SAFETY: Only scalar state is posted back to the UI thread; a
+            // late reply of an announcement already over is ignored there.
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(window as *mut _)),
+                    ALERT_DONE,
+                    WPARAM(generation),
+                    LPARAM(0),
+                );
+            }
+            Ok(())
+        }));
+        // Register before ending the scope, and end it even on failure so no
+        // unrelated animation joins this batch.
+        let ended = batch.End();
+        started?;
+        ended?;
+        self.alert_clock = Some(ExitAnimation {
+            batch,
+            completed: completed?,
+        });
+        Ok(())
+    }
+
+    /// The announcement is over (or was cut short): the island goes back to
+    /// its short form at the next redraw and a late `ALERT_DONE` is ignored.
+    fn end_announcement(&mut self) {
+        if self.announcing.is_none() && self.alert_clock.is_none() {
+            return;
+        }
+        self.announcing = None;
+        self.announce_started = None;
+        self.alert_generation = self.alert_generation.wrapping_add(1);
+        // Dropping the clock unsubscribes its handler before the animation
+        // stops, so stopping it posts nothing.
+        if self.alert_clock.take().is_some() {
+            let _ = self.alert_host.StopAnimation(h!("Opacity"));
+        }
+    }
+
+    /// Everything stops: no queue, no announcement, no heartbeat.
+    fn cancel_alerts(&mut self) {
+        self.announce_queue.clear();
+        self.end_announcement();
+        self.pulses.clear();
+        for (_, visual) in self.pulse_targets.drain(..) {
+            let _ = visual.StopAnimation(h!("Scale"));
+            let _ = visual.SetScale(Vector3::new(1.0, 1.0, 1.0));
+        }
+        self.growing_from = None;
+    }
+
+    /// The compositor finished an announcement's 8 s.
+    pub fn alert_done(&mut self, gfx: &Gfx, generation: usize) -> Result<()> {
+        if generation != self.alert_generation || self.announcing.is_none() {
+            return Ok(());
+        }
+        self.end_announcement();
+        // Only the announcement changed: redraw what is on screen, with the
+        // next one in the queue if there is one.
+        let Some(look) = self.look.clone() else {
+            return self.refresh(gfx);
+        };
+        self.apply_look(gfx, look)
+    }
+
+    fn start_pulse(&mut self, provider: Provider) {
+        self.pulses.retain(|(other, _)| *other != provider);
+        self.pulses.push((provider, Instant::now()));
+    }
+
+    /// After a drawing: unveils a widened island and plays (or resumes, if a
+    /// redraw replaced the visual partway) the heartbeats.
+    fn animate_alerts(&mut self, gfx: &Gfx) {
+        if let Some(from) = self.growing_from.take()
+            && let Err(error) = self.unveil_island(gfx, from)
+        {
+            muelle_shell::log::line(&format!("ensanche de la isla: {error:#}"));
+        }
+        self.pulses
+            .retain(|(_, began)| pulse_cycles_left(began.elapsed()) > 0);
+        for (provider, began) in &self.pulses {
+            let Some((_, visual)) = self.pulse_targets.iter().find(|(p, _)| p == provider) else {
+                continue;
+            };
+            if let Err(error) = pulse(gfx, visual, pulse_cycles_left(began.elapsed())) {
+                muelle_shell::log::line(&format!("latido del anillo: {error:#}"));
+            }
+        }
+    }
+
+    /// The island is drawn at its new width at once (and its window region
+    /// with it, so no region changes mid-animation); its body is unveiled
+    /// from the old width by animating a clip's insets, 250 ms.
+    fn unveil_island(&self, gfx: &Gfx, from: Span) -> Result<()> {
+        let (Some(body), true) = (&self.island_body, system::animations_enabled()) else {
+            return Ok(());
+        };
+        let to = self.triggers_span;
+        let (left, right) = (
+            (from.left - to.left).max(0.0),
+            (to.right - from.right).max(0.0),
+        );
+        if left + right < 1.0 {
+            return Ok(());
+        }
+        let c = &gfx.compositor;
+        let clip = c.CreateInsetClip()?;
+        clip.SetLeftInset(left)?;
+        clip.SetRightInset(right)?;
+        body.SetClip(&clip)?;
+        let ease =
+            c.CreateCubicBezierEasingFunction(Vector2::new(0.2, 0.8), Vector2::new(0.2, 1.0))?;
+        for (name, inset) in [(h!("LeftInset"), left), (h!("RightInset"), right)] {
+            let open = c.CreateScalarKeyFrameAnimation()?;
+            open.SetDuration(TimeSpan {
+                Duration: ALERT_GROW_MS * 10_000,
+            })?;
+            open.InsertKeyFrame(0.0, inset)?;
+            open.InsertKeyFrameWithEasingFunction(1.0, 0.0, &ease)?;
+            clip.StartAnimation(name, &open)?;
         }
         Ok(())
     }
@@ -3735,6 +4004,8 @@ impl MenuBar {
         self.volume_controls = None;
         self.progress_controls = None;
         self.usage_viewport = None;
+        self.pulse_targets.clear();
+        self.island_body = None;
         self.triggers_span = Span::default();
         self.panel_span = Span::default();
         self.draw_island(gfx, look, &island_layers, width, height, left_end, right)?;
@@ -3850,17 +4121,21 @@ impl MenuBar {
         } else {
             None
         };
+        let providers = island_providers(look);
+        let bounds = Span {
+            left: left_end + px(8.0),
+            right: right_start - px(8.0),
+        };
+        let mut alerts = plan_usage_alerts(gfx, look, &providers, bounds.width())?;
         let triggers = match style {
             IslandStyle::Notch => trigger_layout(
-                Span {
-                    left: left_end + px(8.0),
-                    right: right_start - px(8.0),
-                },
+                bounds,
                 width / 2.0,
                 look.scale,
                 look.track.is_some(),
                 look.active_providers.count(),
                 look.zoned,
+                alerts.total,
             ),
             IslandStyle::Bubble => bubble_trigger_layout(
                 Span {
@@ -3884,8 +4159,10 @@ impl MenuBar {
         let (compact, compact_height, divider_inset) = match style {
             IslandStyle::Notch => {
                 let height = look.island_height(bar_height);
+                let (surface, body) = island_surface(gfx, look, layers, geometry, height)?;
+                self.island_body = body;
                 (
-                    island_surface(gfx, look, layers, geometry, height)?,
+                    surface,
                     height,
                     if look.zoned {
                         (height - px(BARE_NOTCH_DIVIDER_HEIGHT)) / 2.0
@@ -3928,7 +4205,6 @@ impl MenuBar {
                 (compact_height - 2.0 * divider_inset).max(1.0),
             )?;
         }
-        let providers = island_providers(look);
         for (kind, span) in triggers {
             let Some(span) = span else {
                 continue;
@@ -3969,18 +4245,25 @@ impl MenuBar {
                     }
                 }
                 Island::Usage => {
-                    let anchors = match style {
-                        IslandStyle::Notch => {
-                            draw_compact_usage(gfx, &content, geometry, compact_height, &providers)?
-                        }
+                    let drawn = match style {
+                        IslandStyle::Notch => draw_compact_usage(
+                            gfx,
+                            &content,
+                            geometry,
+                            compact_height,
+                            &providers,
+                            std::mem::take(&mut alerts),
+                        )?,
                         IslandStyle::Bubble => {
                             draw_bubble_usage(gfx, &content, geometry, compact_height, &providers)?
                         }
                     };
-                    self.usage_anchors = anchors
+                    self.usage_anchors = drawn
+                        .anchors
                         .into_iter()
                         .map(|(provider, x)| (provider, look.screen.left + (span.left + x) as i32))
                         .collect();
+                    self.pulse_targets = drawn.pulse;
                 }
             }
             let (left, right) = match kind {
@@ -4855,6 +5138,28 @@ fn available_panel(open: Option<Island>, music: bool, usage: bool) -> Option<Isl
     })
 }
 
+/// The closed island's usage trigger at rest, before any alert widens it.
+fn usage_trigger_width(scale: f32, providers: usize, bare: bool) -> f32 {
+    let px = |v: f32| (v * scale).round();
+    match providers {
+        0 => 0.0,
+        count if bare => px(BARE_PROVIDER_WIDTH * count as f32),
+        1 => px(ISLAND_SINGLE_WIDTH),
+        count => px(134.0 * count as f32),
+    }
+}
+
+/// The closed island's music trigger.
+fn music_trigger_width(scale: f32, music: bool, bare: bool) -> f32 {
+    if music {
+        (if bare { BARE_PLAYER_WIDTH } else { 214.0 } * scale).round()
+    } else {
+        0.0
+    }
+}
+
+/// `usage_extra` is the width an alert adds to the usage trigger (see
+/// `plan_usage_alerts`); the island grows around its center.
 fn trigger_layout(
     bounds: Span,
     center: f32,
@@ -4862,20 +5167,16 @@ fn trigger_layout(
     music: bool,
     providers: usize,
     bare: bool,
+    usage_extra: f32,
 ) -> [(Island, Option<Span>); 2] {
     let px = |v: f32| (v * scale).round();
     let mut result = [(Island::Music, None), (Island::Usage, None)];
     let gap = if music && providers > 0 { px(8.0) } else { 0.0 };
-    let music_width = if music {
-        px(if bare { BARE_PLAYER_WIDTH } else { 214.0 })
-    } else {
+    let music_width = music_trigger_width(scale, music, bare);
+    let usage_width = if providers == 0 {
         0.0
-    };
-    let usage_width = match providers {
-        0 => 0.0,
-        count if bare => px(BARE_PROVIDER_WIDTH * count as f32),
-        1 => px(ISLAND_SINGLE_WIDTH),
-        count => px(134.0 * count as f32),
+    } else {
+        usage_trigger_width(scale, providers, bare) + usage_extra
     };
     let total = music_width + usage_width;
     let available = (bounds.width() - gap).min(total);
@@ -5060,6 +5361,246 @@ fn usage_label(
     }
 }
 
+/// How long the announcement keeps the island widened.
+const ALERT_LONG: Duration = Duration::from_secs(8);
+/// Past this a missing end of the announcement (a hidden window never ticks
+/// its animations) is taken as ended by the next redraw.
+const ALERT_GRACE: Duration = Duration::from_secs(2);
+/// The island's growth and the heartbeat of the ring.
+const ALERT_GROW_MS: i64 = 250;
+const PULSE_CYCLE: Duration = Duration::from_millis(1400);
+const PULSE_CYCLES: i32 = 3;
+/// (time in the cycle, scale): two beats, then rest.
+const PULSE_FRAMES: [(f32, f32); 6] = [
+    (0.0, 1.0),
+    (0.12, 1.24),
+    (0.24, 1.0),
+    (0.34, 1.14),
+    (0.44, 1.0),
+    (1.0, 1.0),
+];
+
+/// Heartbeat cycles still to play `elapsed` after it began.
+fn pulse_cycles_left(elapsed: Duration) -> i32 {
+    let done = (elapsed.as_millis() / PULSE_CYCLE.as_millis()) as i32;
+    (PULSE_CYCLES - done).max(0)
+}
+
+/// How the usage trigger tells that a provider is in red.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlertForm {
+    /// The announcement: the phrase takes the place of the percentage.
+    Long,
+    /// "vuelve 21:40" beside the ring, for as long as the limit stays red.
+    Short,
+    /// Nothing special: there is no room, or nothing to say.
+    Quiet,
+}
+
+/// The form that fits: the full usage-trigger width needed with the long
+/// phrase, with the short one, and what the bar leaves free for it.
+fn alert_form(long: Option<f32>, short: Option<f32>, available: f32) -> AlertForm {
+    match (long, short) {
+        (Some(long), _) if long <= available => AlertForm::Long,
+        (_, Some(short)) if short <= available => AlertForm::Short,
+        _ => AlertForm::Quiet,
+    }
+}
+
+/// The width the usage trigger takes with an alert: what its text needs,
+/// never less than at rest and never more than the bar leaves free.
+fn usage_alert_width(normal: f32, phrase: f32, available: f32) -> f32 {
+    normal.max(phrase).min(available)
+}
+
+/// What changes the island's alert wording: the announcement on and which
+/// providers are in red.
+fn alert_signature(look: &Look) -> (Option<Provider>, [bool; Provider::COUNT]) {
+    let red = Provider::ALL.map(|provider| {
+        look.active_providers.has(provider)
+            && look.usage.get(provider).alert_level() == Level::Critical
+    });
+    (look.announcing, red)
+}
+
+/// Makes the visual beat `cycles` times: its scale goes 1, 1.24, 1, 1.14, 1
+/// around its center and stays still after the last cycle.
+fn pulse(gfx: &Gfx, visual: &SpriteVisual, cycles: i32) -> Result<()> {
+    let size = visual.Size()?;
+    visual.SetCenterPoint(Vector3::new(size.X / 2.0, size.Y / 2.0, 0.0))?;
+    let beat = gfx.compositor.CreateVector3KeyFrameAnimation()?;
+    beat.SetDuration(TimeSpan {
+        Duration: (PULSE_CYCLE.as_nanos() / 100) as i64,
+    })?;
+    for (time, scale) in PULSE_FRAMES {
+        beat.InsertKeyFrame(time, Vector3::new(scale, scale, 1.0))?;
+    }
+    beat.SetIterationBehavior(AnimationIterationBehavior::Count)?;
+    beat.SetIterationCount(cycles)?;
+    visual.StartAnimation(h!("Scale"), &beat)?;
+    Ok(())
+}
+
+/// What the usage trigger says for one provider in red.
+#[derive(Default)]
+enum AlertSlot {
+    #[default]
+    Quiet,
+    /// The announcement: the phrase where the percentage goes.
+    Long(LabelBrush),
+    /// "vuelve 21:40", after the ring.
+    Short(LabelBrush),
+}
+
+/// The alert wording of every provider and the width it adds to the usage
+/// trigger, planned before the island is laid out (see `plan_usage_alerts`).
+#[derive(Default)]
+struct UsageAlerts {
+    slots: [AlertSlot; Provider::COUNT],
+    /// Extra width each provider's slot takes.
+    extras: [f32; Provider::COUNT],
+    /// Their sum: what the usage trigger grows by.
+    total: f32,
+}
+
+/// What drawing the usage trigger leaves behind.
+struct UsageDrawn {
+    /// The center of each provider's figure, from the segment's left edge.
+    anchors: Vec<(Provider, f32)>,
+    /// What beats when a provider's alert starts: its ring, or its label.
+    pulse: Vec<(Provider, SpriteVisual)>,
+}
+
+/// Decides how each provider in red speaks and how much room that takes.
+/// Only in the Notch style with `ai_alerts`; otherwise everything is quiet.
+/// `bar_free` is the room between the app name and the status items.
+fn plan_usage_alerts(
+    gfx: &Gfx,
+    look: &Look,
+    providers: &[IslandProvider<'_>],
+    bar_free: f32,
+) -> Result<UsageAlerts> {
+    let mut plan = UsageAlerts::default();
+    if !look.widgets.ai_alerts
+        || look.widgets.island_style != IslandStyle::Notch
+        || providers.is_empty()
+    {
+        return Ok(plan);
+    }
+    let scale = look.scale;
+    let px = |v: f32| (v * scale).round();
+    let bare = look.zoned;
+    let now = chrono::Local::now();
+    let normal = usage_trigger_width(scale, providers.len(), bare);
+    let music = music_trigger_width(scale, look.track.is_some(), bare);
+    let gap = if music > 0.0 { px(8.0) } else { 0.0 };
+    let available = bar_free - gap - music;
+    let inset = if bare { 0.0 } else { px(13.0) };
+    let half = (normal - 2.0 * inset) / providers.len() as f32;
+    let ring = Gfx::usage_ring_size(scale, bare);
+    let icon = px(if bare { BARE_PROVIDER_LOGO_SIZE } else { 18.0 });
+    let item_gap = px(BARE_PROVIDER_ITEM_GAP);
+    // A label with the width its slot grows by.
+    type Wording = Option<(LabelBrush, f32)>;
+    let mut words: Vec<(Provider, Wording, Wording)> = Vec::new();
+    for (provider, usage, _) in providers {
+        if usage.alert_level() != Level::Critical {
+            continue;
+        }
+        let Some(window) = usage.worst_window() else {
+            continue;
+        };
+        // Bare packs icon, text and ring; the percentage it replaces counts.
+        let percent = if bare {
+            gfx.text_brush_sized(
+                &shown_text(usage, true),
+                scale,
+                BARE_PROVIDER_LABEL_SIZE,
+                true,
+                Ink::Light,
+            )?
+            .width
+        } else {
+            0.0
+        };
+        let packed = icon + item_gap + percent + item_gap + ring;
+        let short = usage::back_phrase(window.resets_at, now, false)
+            .map(|text| -> Result<_> {
+                let label = gfx.text_brush_tinted(
+                    &text,
+                    scale,
+                    11.5,
+                    false,
+                    Color {
+                        A: 217,
+                        ..ALERT_CRITICAL
+                    },
+                )?;
+                let extra = if bare {
+                    (packed + item_gap + label.width - px(BARE_PROVIDER_WIDTH)).max(0.0)
+                } else {
+                    label.width + item_gap
+                };
+                Ok((label, extra))
+            })
+            .transpose()?;
+        let long = (look.announcing == Some(*provider))
+            .then(|| -> Result<_> {
+                let label = gfx.text_brush_tinted(
+                    &usage::alert_text(*provider, usage, now),
+                    scale,
+                    12.0,
+                    true,
+                    ALERT_CRITICAL,
+                )?;
+                let extra = if bare {
+                    (icon + item_gap + label.width + item_gap + ring - px(BARE_PROVIDER_WIDTH))
+                        .max(0.0)
+                } else {
+                    (px(21.0) + px(25.0) + label.width + px(8.0) + ring + px(16.0) - half).max(0.0)
+                };
+                Ok((label, extra))
+            })
+            .transpose()?;
+        words.push((*provider, long, short));
+    }
+    let short_sum: f32 = words
+        .iter()
+        .filter_map(|(_, _, short)| short.as_ref().map(|(_, extra)| *extra))
+        .sum();
+    let long_sum: f32 = words
+        .iter()
+        .filter_map(|(_, long, short)| long.as_ref().or(short.as_ref()).map(|(_, extra)| *extra))
+        .sum();
+    let form = alert_form(
+        words
+            .iter()
+            .any(|(_, long, _)| long.is_some())
+            .then_some(normal + long_sum),
+        words
+            .iter()
+            .any(|(_, _, short)| short.is_some())
+            .then_some(normal + short_sum),
+        available,
+    );
+    for (provider, long, short) in words {
+        let chosen = match form {
+            AlertForm::Long => long
+                .map(|(label, extra)| (AlertSlot::Long(label), extra))
+                .or_else(|| short.map(|(label, extra)| (AlertSlot::Short(label), extra))),
+            AlertForm::Short => short.map(|(label, extra)| (AlertSlot::Short(label), extra)),
+            AlertForm::Quiet => None,
+        };
+        if let Some((slot, extra)) = chosen {
+            plan.slots[provider as usize] = slot;
+            plan.extras[provider as usize] = extra;
+            plan.total += extra;
+        }
+    }
+    plan.total = usage_alert_width(normal, normal + plan.total, available) - normal;
+    Ok(plan)
+}
+
 fn island_providers(look: &Look) -> Vec<IslandProvider<'_>> {
     Provider::ALL
         .into_iter()
@@ -5124,7 +5665,7 @@ fn island_surface(
     layers: &VisualCollection,
     geometry: IslandGeometry,
     island_height: f32,
-) -> Result<VisualCollection> {
+) -> Result<(VisualCollection, Option<ContainerVisual>)> {
     let c = &gfx.compositor;
     let px = |v| geometry.px(v);
     let island_left = geometry.left;
@@ -5134,9 +5675,23 @@ fn island_surface(
     let island = c.CreateContainerVisual()?;
     island.SetSize(size)?;
     island.SetOffset(Vector3::new(island_left.round(), 0.0, 0.0))?;
-    let content = island.Children()?;
+    let shell = island.Children()?;
     let silhouette = gfx.island_mask(island_width, island_height, scale, look.zoned)?;
-    content.InsertAtTop(&island_shadow(c, &silhouette.cast()?, size, geometry)?)?;
+    shell.InsertAtTop(&island_shadow(c, &silhouette.cast()?, size, geometry)?)?;
+    // With alerts the island's body (all but its shadow) is one visual, so a
+    // growing announcement can unveil it. Without them, nothing changes.
+    let body = if look.widgets.ai_alerts {
+        let body = c.CreateContainerVisual()?;
+        body.SetSize(size)?;
+        shell.InsertAtTop(&body)?;
+        Some(body)
+    } else {
+        None
+    };
+    let content = match &body {
+        Some(body) => body.Children()?,
+        None => shell.clone(),
+    };
 
     let tint = match (look.widgets.bare, look.light, look.glass) {
         (true, _, _) => BARE_ISLAND,
@@ -5197,7 +5752,7 @@ fn island_surface(
     )?;
 
     layers.InsertAtTop(&island)?;
-    Ok(content)
+    Ok((content, body))
 }
 
 fn bubble_surface(
@@ -5314,14 +5869,16 @@ fn draw_compact_usage(
     geometry: IslandGeometry,
     bar_height: f32,
     providers: &[IslandProvider<'_>],
-) -> Result<Vec<(Provider, f32)>> {
+    mut wording: UsageAlerts,
+) -> Result<UsageDrawn> {
     let c = &gfx.compositor;
     let px = |v| geometry.px(v);
     let ink = geometry.ink();
     let scale = geometry.scale;
     let bare = geometry.bare;
     let inset = if bare { 0.0 } else { px(13.0) };
-    let half = (geometry.width - 2.0 * inset) / providers.len().max(1) as f32;
+    // The alerts' extra width belongs to the providers in red alone.
+    let half = (geometry.width - wording.total - 2.0 * inset) / providers.len().max(1) as f32;
     if half < px(20.0) {
         let icon = gfx.glyph_brush(&[('\u{E9D9}', 1.0)], scale, ink)?;
         add_visual(
@@ -5334,10 +5891,13 @@ fn draw_compact_usage(
             icon.height,
         )?;
         let centre = geometry.width / 2.0;
-        return Ok(providers
-            .iter()
-            .map(|(provider, ..)| (*provider, centre))
-            .collect());
+        return Ok(UsageDrawn {
+            anchors: providers
+                .iter()
+                .map(|(provider, ..)| (*provider, centre))
+                .collect(),
+            pulse: Vec::new(),
+        });
     }
     let icon_size = px(if bare { BARE_PROVIDER_LOGO_SIZE } else { 18.0 }) as u32;
     let with_ring = half
@@ -5382,15 +5942,30 @@ fn draw_compact_usage(
             });
         }
     }
-    let bare_group_width = |label: &Option<(LabelBrush, f32)>| {
+    // The island's own announcement: the phrase replaces the percentage, and
+    // afterwards "vuelve 21:40" follows the ring.
+    let mut suffixes = [const { None }; Provider::COUNT];
+    for (index, (provider, ..)) in providers.iter().enumerate() {
+        match std::mem::take(&mut wording.slots[*provider as usize]) {
+            AlertSlot::Long(phrase) => labels[index] = Some((phrase, max_gap)),
+            AlertSlot::Short(phrase) => suffixes[index] = Some(phrase),
+            AlertSlot::Quiet => {}
+        }
+    }
+    let bare_group_width = |label: &Option<(LabelBrush, f32)>, suffix: &Option<LabelBrush>| {
         let gap = label.as_ref().map_or(max_gap, |(_, gap)| *gap);
         icon_size as f32
             + label.as_ref().map_or(0.0, |(label, _)| gap + label.width)
             + if with_ring { gap + ring_size } else { 0.0 }
+            + suffix.as_ref().map_or(0.0, |text| max_gap + text.width)
     };
     // Keep the design's spacing when it fits and give wide percentages priority.
     let groups_width: f32 = if bare {
-        labels[..providers.len()].iter().map(bare_group_width).sum()
+        labels[..providers.len()]
+            .iter()
+            .zip(&suffixes)
+            .map(|(label, suffix)| bare_group_width(label, suffix))
+            .sum()
     } else {
         0.0
     };
@@ -5399,9 +5974,13 @@ fn draw_compact_usage(
         ((geometry.width - groups_width) / breaks.max(1.0)).clamp(0.0, px(BARE_PROVIDER_GROUP_GAP));
     let mut bare_left = (geometry.width - groups_width - provider_gap * breaks) / 2.0;
     let mut anchors = Vec::with_capacity(providers.len());
-    for (index, ((provider, usage, accent), label)) in providers.iter().zip(labels).enumerate() {
-        let slot = inset + index as f32 * half;
-        let group_width = bare_group_width(&label);
+    let mut pulse = Vec::new();
+    let mut slot_left = inset;
+    for (((provider, usage, accent), label), suffix) in providers.iter().zip(labels).zip(suffixes) {
+        let extra = wording.extras[*provider as usize];
+        let slot = slot_left;
+        slot_left += half + extra;
+        let group_width = bare_group_width(&label, &suffix);
         let start = if bare {
             let left = bare_left;
             bare_left += group_width + provider_gap;
@@ -5416,9 +5995,10 @@ fn draw_compact_usage(
         let anchor = if bare {
             start + group_width / 2.0
         } else {
-            inset + (index as f32 + 0.5) * half
+            slot + (half + extra) / 2.0
         };
         anchors.push((*provider, anchor));
+        let mut beat = None;
         if let Some(image) = usage::logo(*provider) {
             let image_brush = gfx.icon_brush(image, icon_size)?;
             let brush: CompositionBrush =
@@ -5430,7 +6010,7 @@ fn draw_compact_usage(
                 } else {
                     image_brush.cast()?
                 };
-            add_visual(
+            beat = Some(add_visual(
                 c,
                 content,
                 &brush,
@@ -5438,7 +6018,7 @@ fn draw_compact_usage(
                 (bar_height - icon_size as f32) / 2.0,
                 icon_size as f32,
                 icon_size as f32,
-            )?;
+            )?);
         }
         if let Some((label, gap)) = label {
             let label_offset = if bare {
@@ -5463,12 +6043,15 @@ fn draw_compact_usage(
                 alert_ink(shown_level(usage, alerts), *accent),
                 bare,
             )?;
+            let suffix_width = suffix.as_ref().map_or(0.0, |text| max_gap + text.width);
+            // The ring keeps its place; the long phrase widens the slot
+            // before it, "vuelve ..." goes after it.
             let x = if bare {
-                start + group_width - ring.width
+                start + group_width - suffix_width - ring.width
             } else {
-                inset + (index + 1) as f32 * half - px(16.0) - ring.width
+                slot + half + if suffix.is_some() { 0.0 } else { extra } - px(16.0) - ring.width
             };
-            add_visual(
+            beat = Some(add_visual(
                 c,
                 content,
                 &ring.brush.cast()?,
@@ -5476,10 +6059,24 @@ fn draw_compact_usage(
                 (bar_height - ring.height) / 2.0,
                 ring.width,
                 ring.height,
-            )?;
+            )?);
+            if let Some(text) = &suffix {
+                add_visual(
+                    c,
+                    content,
+                    &text.brush.cast()?,
+                    x + ring.width + max_gap,
+                    (bar_height - text.height) / 2.0,
+                    text.width,
+                    text.height,
+                )?;
+            }
+        }
+        if let Some(visual) = beat {
+            pulse.push((*provider, visual));
         }
     }
-    Ok(anchors)
+    Ok(UsageDrawn { anchors, pulse })
 }
 
 fn draw_bubble_usage(
@@ -5488,7 +6085,7 @@ fn draw_bubble_usage(
     geometry: IslandGeometry,
     pill_height: f32,
     providers: &[IslandProvider<'_>],
-) -> Result<Vec<(Provider, f32)>> {
+) -> Result<UsageDrawn> {
     let c = &gfx.compositor;
     let px = |v| geometry.px(v);
     let ink = geometry.ink();
@@ -5507,14 +6104,18 @@ fn draw_bubble_usage(
             icon.height,
         )?;
         let centre = geometry.width / 2.0;
-        return Ok(providers
-            .iter()
-            .map(|(provider, ..)| (*provider, centre))
-            .collect());
+        return Ok(UsageDrawn {
+            anchors: providers
+                .iter()
+                .map(|(provider, ..)| (*provider, centre))
+                .collect(),
+            pulse: Vec::new(),
+        });
     }
     let icon_size = px(15.0) as u32;
     let gap = px(4.0);
     let mut anchors = Vec::with_capacity(providers.len());
+    let mut pulse = Vec::new();
     for (index, (provider, usage, _accent)) in providers.iter().enumerate() {
         let slot_left = inset + index as f32 * slot;
         anchors.push((*provider, slot_left + slot / 2.0));
@@ -5528,6 +6129,7 @@ fn draw_bubble_usage(
         };
         let group_width = icon_size as f32 + label.as_ref().map_or(0.0, |text| gap + text.width);
         let start = slot_left + ((slot - group_width) / 2.0).max(0.0);
+        let mut beat = None;
         if let Some(image) = usage::logo(*provider) {
             let image_brush = gfx.icon_brush(image, icon_size)?;
             let brush: CompositionBrush =
@@ -5539,7 +6141,7 @@ fn draw_bubble_usage(
                 } else {
                     image_brush.cast()?
                 };
-            add_visual(
+            beat = Some(add_visual(
                 c,
                 content,
                 &brush,
@@ -5547,10 +6149,11 @@ fn draw_bubble_usage(
                 (pill_height - icon_size as f32) / 2.0,
                 icon_size as f32,
                 icon_size as f32,
-            )?;
+            )?);
         }
         if let Some(label) = label {
-            add_visual(
+            // No ring here: the percentage is what beats.
+            beat = Some(add_visual(
                 c,
                 content,
                 &label.brush.cast()?,
@@ -5558,10 +6161,13 @@ fn draw_bubble_usage(
                 (pill_height - label.height) / 2.0,
                 label.width,
                 label.height,
-            )?;
+            )?);
+        }
+        if let Some(visual) = beat {
+            pulse.push((*provider, visual));
         }
     }
-    Ok(anchors)
+    Ok(UsageDrawn { anchors, pulse })
 }
 
 fn track_title(track: &Track) -> &str {
@@ -5744,6 +6350,7 @@ impl Drop for MenuBar {
         self.bluetooth = None;
         self.accessories = None;
         self.exit_animation = None;
+        self.alert_clock = None;
         self.media = None;
         ISLAND_HOOK_WINDOW.store(0, Ordering::Relaxed);
         edge_watch::set_menu_bar(None, None);
@@ -7863,6 +8470,262 @@ mod island_tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "Requires Windows composition; reveals the bar, no provider requests"]
+    fn native_ai_alerts_widen_the_island_then_settle_without_timers() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::{
+            System::WinRT::{
+                CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+                DispatcherQueueOptions,
+            },
+            UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW},
+        };
+        // SAFETY: The dispatcher and the bar belong to this test thread.
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, false, true, MenuBarWidgets::default())?;
+        bar.hover(&gfx, true)?;
+        let mut look = bar.look.clone().context("initial look")?;
+        look.track = None;
+        look.usage_enabled = true;
+        look.active_providers = ActiveProviders::default();
+        look.active_providers.0[Provider::Claude as usize] = true;
+        look.widgets.island_style = IslandStyle::Notch;
+        let reading = |percent: u8| ProviderUsage {
+            state: State::Ready,
+            windows: vec![usage::Window {
+                label: None,
+                minutes: 300,
+                used_percent: percent,
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(2)),
+            }],
+            fetched_at: Some(std::time::SystemTime::now()),
+        };
+        let set = |look: &mut Look, claude: u8, alerts: bool| {
+            look.usage.providers[Provider::Claude as usize] = reading(claude);
+            look.widgets.ai_alerts = alerts;
+        };
+        let width = |bar: &MenuBar| bar.triggers_span.width();
+
+        // Today's width: 40 %, and 97 % with the key off.
+        set(&mut look, 40, false);
+        bar.apply_look(&gfx, look.clone())?;
+        let normal = width(&bar);
+        assert!(normal > 0.0);
+        set(&mut look, 97, false);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(width(&bar), normal, "the key off changes nothing");
+        assert!(bar.announcing.is_none() && bar.alert_clock.is_none());
+        assert!(bar.pulses.is_empty() && bar.pulse_targets.len() <= 1);
+
+        // The key on: 97 % widens the island for the announcement.
+        bar.alert_long = Duration::from_millis(400);
+        set(&mut look, 40, true);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(width(&bar), normal, "40 % is no alert");
+        set(&mut look, 97, true);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(bar.announcing, Some(Provider::Claude));
+        assert!(bar.alert_clock.is_some() && bar.pulses.len() == 1);
+        assert!(
+            !bar.pulse_targets.is_empty(),
+            "the ring has something to beat"
+        );
+        let announcing = width(&bar);
+        assert!(announcing > normal, "{announcing} > {normal}");
+        let first = bar.alert_generation;
+        // The animations take their targets: the heartbeat centers on the
+        // ring and the growth unveils the body from a narrower span.
+        let (_, ring) = bar.pulse_targets[0].clone();
+        pulse(&gfx, &ring, PULSE_CYCLES)?;
+        let (size, center) = (ring.Size()?, ring.CenterPoint()?);
+        assert_eq!((center.X, center.Y), (size.X / 2.0, size.Y / 2.0));
+        let narrower = Span {
+            left: bar.triggers_span.left + 20.0,
+            right: bar.triggers_span.right - 20.0,
+        };
+        bar.unveil_island(&gfx, narrower)?;
+        assert!(bar.island_body.is_some());
+
+        // The end of the batch: the island settles on its short phrase.
+        bar.alert_done(&gfx, first)?;
+        assert!(bar.announcing.is_none() && bar.alert_clock.is_none());
+        let settled = width(&bar);
+        assert!(
+            normal < settled && settled < announcing,
+            "{normal} < {settled} < {announcing}"
+        );
+        // The same end arriving again changes nothing.
+        bar.alert_done(&gfx, first)?;
+        assert_eq!(width(&bar), settled);
+        // Red stays red: no new announcement without crossing again.
+        bar.apply_look(&gfx, look.clone())?;
+        assert!(bar.announcing.is_none() && bar.announce_queue.is_empty());
+
+        // The compositor itself completes the batch (the 400 ms of this test).
+        set(&mut look, 90, true);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(width(&bar), normal);
+        set(&mut look, 96, true);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(bar.announcing, Some(Provider::Claude));
+        let mut completions = 0;
+        let until = Instant::now() + Duration::from_millis(1500);
+        let mut msg = MSG::default();
+        while Instant::now() < until && bar.announcing.is_some() {
+            // SAFETY: The queue belongs to this thread; no input is injected.
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                if msg.hwnd == bar.hwnd && msg.message == ALERT_DONE {
+                    completions += 1;
+                    bar.alert_done(&gfx, msg.wParam.0)?;
+                } else {
+                    unsafe { DispatchMessageW(&msg) };
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if system::animations_enabled() {
+            assert_eq!(
+                completions, 1,
+                "the announcement ends through the compositor"
+            );
+            assert!(bar.announcing.is_none());
+        }
+
+        // Stale data without a reset time: the phrase has no hour and
+        // nothing stays on the island once it is over.
+        let undated = |percent: u8| ProviderUsage {
+            state: State::Ready,
+            windows: vec![usage::Window {
+                label: None,
+                minutes: 300,
+                used_percent: percent,
+                resets_at: None,
+            }],
+            fetched_at: Some(std::time::SystemTime::now()),
+        };
+        set(&mut look, 90, true);
+        bar.apply_look(&gfx, look.clone())?;
+        look.usage.providers[Provider::Claude as usize] = undated(130);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(bar.announcing, Some(Provider::Claude));
+        bar.alert_done(&gfx, bar.alert_generation)?;
+        assert_eq!(width(&bar), normal, "no hour, no short phrase");
+
+        // Review focus 5: turning the key off mid-announcement.
+        bar.alert_long = ALERT_LONG;
+        set(&mut look, 90, true);
+        bar.apply_look(&gfx, look.clone())?;
+        set(&mut look, 98, true);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(bar.announcing, Some(Provider::Claude));
+        let stale = bar.alert_generation;
+        set(&mut look, 98, false);
+        bar.apply_look(&gfx, look.clone())?;
+        assert!(bar.announcing.is_none() && bar.announce_queue.is_empty());
+        assert!(bar.alert_clock.is_none() && bar.pulses.is_empty());
+        assert_eq!(width(&bar), normal, "back to the width of today");
+        // The batch that completes late must not widen or redraw anything.
+        bar.alert_done(&gfx, stale)?;
+        assert_eq!(width(&bar), normal);
+        assert!(bar.announcing.is_none());
+        // And on again, the old end does not cut the new announcement.
+        set(&mut look, 98, true);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(bar.announcing, Some(Provider::Claude));
+        bar.alert_done(&gfx, stale)?;
+        assert_eq!(bar.announcing, Some(Provider::Claude));
+
+        // The bubble only colors and beats: no phrase, no queue.
+        bar.alert_done(&gfx, bar.alert_generation)?;
+        look.widgets.island_style = IslandStyle::Bubble;
+        set(&mut look, 40, true);
+        bar.apply_look(&gfx, look.clone())?;
+        let bubble = width(&bar);
+        set(&mut look, 99, true);
+        bar.apply_look(&gfx, look.clone())?;
+        assert!(bar.announcing.is_none() && bar.announce_queue.is_empty());
+        assert_eq!(width(&bar), bubble);
+        assert_eq!(bar.pulses.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires Windows composition; reveals the bar, no provider requests"]
+    fn native_two_providers_in_red_announce_one_after_the_other() -> Result<()> {
+        use anyhow::Context;
+        use windows::Win32::System::WinRT::{
+            CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        };
+        // SAFETY: The dispatcher and the bar belong to this test thread.
+        let _queue = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })?
+        };
+        let gfx = Gfx::new()?;
+        let mut bar = MenuBar::create(&gfx, false, false, true, MenuBarWidgets::default())?;
+        bar.hover(&gfx, true)?;
+        let mut look = bar.look.clone().context("initial look")?;
+        look.track = None;
+        look.usage_enabled = true;
+        look.widgets.ai_alerts = true;
+        look.widgets.island_style = IslandStyle::Notch;
+        look.active_providers = ActiveProviders::default();
+        look.active_providers.0[Provider::Claude as usize] = true;
+        look.active_providers.0[Provider::Codex as usize] = true;
+        let reading = |percent: u8, state: State| ProviderUsage {
+            state,
+            windows: vec![usage::Window {
+                label: None,
+                minutes: 300,
+                used_percent: percent,
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+            }],
+            fetched_at: Some(std::time::SystemTime::now()),
+        };
+        look.usage.providers[Provider::Claude as usize] = reading(50, State::Ready);
+        look.usage.providers[Provider::Codex as usize] = reading(60, State::Ready);
+        bar.apply_look(&gfx, look.clone())?;
+        let normal = bar.triggers_span.width();
+        // A reading that is not Ready neither announces nor lights anything.
+        look.usage.providers[Provider::Codex as usize] = reading(99, State::SignIn);
+        bar.apply_look(&gfx, look.clone())?;
+        assert!(bar.announcing.is_none());
+        assert_eq!(bar.triggers_span.width(), normal);
+        // Both cross at once: the island's order, one announcement at a time.
+        look.usage.providers[Provider::Claude as usize] = reading(96, State::Ready);
+        look.usage.providers[Provider::Codex as usize] = reading(100, State::Ready);
+        bar.apply_look(&gfx, look.clone())?;
+        assert_eq!(bar.announcing, Some(Provider::Claude));
+        assert_eq!(bar.announce_queue, [Provider::Codex]);
+        let generation = bar.alert_generation;
+        bar.alert_done(&gfx, generation)?;
+        assert_eq!(bar.announcing, Some(Provider::Codex));
+        assert!(bar.announce_queue.is_empty());
+        assert_ne!(bar.alert_generation, generation);
+        bar.alert_done(&gfx, generation)?;
+        assert_eq!(
+            bar.announcing,
+            Some(Provider::Codex),
+            "a stale end is ignored"
+        );
+        bar.alert_done(&gfx, bar.alert_generation)?;
+        assert!(bar.announcing.is_none());
+        assert!(bar.triggers_span.width() > normal, "the short phrases stay");
+        Ok(())
+    }
+
     fn window(minutes: i64, used_percent: u8) -> usage::Window {
         usage::Window {
             label: None,
@@ -7919,6 +8782,63 @@ mod island_tests {
     }
 
     #[test]
+    fn the_long_phrase_needs_room_or_the_short_one_takes_its_place() {
+        // Full usage-trigger widths in each form, and what the bar leaves free.
+        assert_eq!(alert_form(Some(260.0), Some(90.0), 300.0), AlertForm::Long);
+        assert_eq!(alert_form(Some(260.0), Some(90.0), 200.0), AlertForm::Short);
+        assert_eq!(alert_form(None, Some(90.0), 200.0), AlertForm::Short);
+        assert_eq!(alert_form(Some(260.0), None, 200.0), AlertForm::Quiet);
+        assert_eq!(alert_form(Some(260.0), Some(90.0), 60.0), AlertForm::Quiet);
+        assert_eq!(alert_form(None, None, 500.0), AlertForm::Quiet);
+    }
+
+    #[test]
+    fn the_widened_usage_never_passes_what_the_bar_leaves_free() {
+        assert_eq!(usage_alert_width(134.0, 260.0, 500.0), 260.0);
+        assert_eq!(usage_alert_width(134.0, 260.0, 200.0), 200.0);
+        assert_eq!(usage_alert_width(134.0, 90.0, 500.0), 134.0);
+    }
+
+    #[test]
+    fn an_alert_widens_only_the_usage_trigger_and_nothing_without_one() {
+        let bounds = Span {
+            left: 0.0,
+            right: 1920.0,
+        };
+        for bare in [false, true] {
+            let plain = trigger_layout(bounds, 960.0, 1.0, true, 2, bare, 0.0);
+            let wide = trigger_layout(bounds, 960.0, 1.0, true, 2, bare, 100.0);
+            let [(_, Some(music)), (_, Some(usage))] = plain else {
+                panic!("both triggers fit");
+            };
+            let [(_, Some(wide_music)), (_, Some(wide_usage))] = wide else {
+                panic!("both triggers fit");
+            };
+            assert_eq!(wide_music.width(), music.width());
+            assert_eq!(wide_usage.width(), usage.width() + 100.0);
+            // The island grows around the center: each side moves half.
+            assert_eq!(wide_music.left, music.left - 50.0);
+            assert_eq!(wide_usage.right, usage.right + 50.0);
+        }
+    }
+
+    #[test]
+    fn the_heartbeat_is_two_beats_then_rest_over_one_point_four_seconds() {
+        let scales: Vec<f32> = PULSE_FRAMES.iter().map(|(_, scale)| *scale).collect();
+        assert_eq!(scales, [1.0, 1.24, 1.0, 1.14, 1.0, 1.0]);
+        let times: Vec<f32> = PULSE_FRAMES.iter().map(|(time, _)| *time).collect();
+        assert_eq!(times, [0.0, 0.12, 0.24, 0.34, 0.44, 1.0]);
+        assert_eq!(PULSE_CYCLE, Duration::from_millis(1400));
+        assert_eq!(PULSE_CYCLES, 3);
+        // Cycles left after a rebuild partway through: never more than three.
+        assert_eq!(pulse_cycles_left(Duration::ZERO), 3);
+        assert_eq!(pulse_cycles_left(Duration::from_millis(1399)), 3);
+        assert_eq!(pulse_cycles_left(Duration::from_millis(1400)), 2);
+        assert_eq!(pulse_cycles_left(Duration::from_millis(4199)), 1);
+        assert_eq!(pulse_cycles_left(Duration::from_millis(4200)), 0);
+    }
+
+    #[test]
     fn clicking_usage_replaces_music_and_clicking_again_closes_it() {
         let open = toggle_panel(Some(Island::Music), Island::Usage);
         assert_eq!(open, Some(Island::Usage));
@@ -7938,6 +8858,7 @@ mod island_tests {
             true,
             5,
             false,
+            0.0,
         );
         let Some(usage) = triggers[1].1 else {
             panic!("Usage trigger should fit");
@@ -7953,7 +8874,7 @@ mod island_tests {
             right: 390.0,
         };
         let [(_, Some(music)), (_, Some(usage))] =
-            trigger_layout(bounds, 300.0, 1.5, true, 3, false)
+            trigger_layout(bounds, 300.0, 1.5, true, 3, false, 0.0)
         else {
             panic!("Both triggers should fit");
         };
@@ -7973,7 +8894,7 @@ mod island_tests {
                 [(true, 152.0, bare_width), (false, 214.0, original_width)]
             {
                 let [(_, Some(music)), (_, Some(usage))] =
-                    trigger_layout(bounds, 960.0, 1.0, true, providers, bare)
+                    trigger_layout(bounds, 960.0, 1.0, true, providers, bare, 0.0)
                 else {
                     panic!("Both triggers should fit");
                 };

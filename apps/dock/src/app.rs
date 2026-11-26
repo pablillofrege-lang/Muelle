@@ -89,11 +89,11 @@ use menus::run_outside;
 pub use events::{
     drag_enter, drag_leave, drag_over, drop_files, group_view_menu, group_view_moved,
     group_view_press, group_view_press_lost, group_view_release, group_view_tick,
-    menu_bar_accessories_changed, menu_bar_accessories_reset, menu_bar_audio_changed,
-    menu_bar_bluetooth_changed, menu_bar_check_pointer, menu_bar_clicked, menu_bar_dismiss_island,
-    menu_bar_finish_hide, menu_bar_media_changed, menu_bar_monitor_tick, menu_bar_pointer_moved,
-    menu_bar_progress_tick, menu_bar_registry_changed, menu_bar_scrolled, menu_bar_tick,
-    menu_bar_volume_flush, menu_bar_volume_press, menu_bar_volume_release,
+    menu_bar_accessories_changed, menu_bar_accessories_reset, menu_bar_alert_done,
+    menu_bar_audio_changed, menu_bar_bluetooth_changed, menu_bar_check_pointer, menu_bar_clicked,
+    menu_bar_dismiss_island, menu_bar_finish_hide, menu_bar_media_changed, menu_bar_monitor_tick,
+    menu_bar_pointer_moved, menu_bar_progress_tick, menu_bar_registry_changed, menu_bar_scrolled,
+    menu_bar_tick, menu_bar_volume_flush, menu_bar_volume_press, menu_bar_volume_release,
     multi_window_view_dismiss, multi_window_view_middle_click, multi_window_view_press,
     multi_window_view_release, multi_window_view_scroll, multi_window_view_tick,
 };

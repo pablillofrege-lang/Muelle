@@ -143,7 +143,6 @@ pub fn level(percent: u8) -> Level {
 /// When a limit returns, in the current language: "vuelve a las 21:40" (long)
 /// or "vuelve 21:40" (short); tomorrow and later days are named. `None` with no
 /// reset time or one already past, so stale data never says "vuelve a las 00:00".
-#[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
 pub fn back_phrase(
     resets_at: Option<DateTime<Utc>>,
     now: DateTime<Local>,
@@ -153,7 +152,6 @@ pub fn back_phrase(
 }
 
 /// `back_phrase` with an explicit catalog.
-#[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
 pub fn back_phrase_with(
     text: &Strings,
     resets_at: Option<DateTime<Utc>>,
@@ -192,13 +190,11 @@ pub fn back_phrase_with(
 
 /// The long alert: "Claude casi agotado, vuelve a las 21:40", or just
 /// "Claude casi agotado" when the reset time is unknown or past.
-#[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
 pub fn alert_text(provider: Provider, usage: &ProviderUsage, now: DateTime<Local>) -> String {
     alert_text_with(strings::text(), provider, usage, now)
 }
 
 /// `alert_text` with an explicit catalog.
-#[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
 pub fn alert_text_with(
     text: &Strings,
     provider: Provider,
@@ -234,7 +230,7 @@ impl Snapshot {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub enum Provider {
     Claude,

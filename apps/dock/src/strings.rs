@@ -49,24 +49,16 @@ pub struct Strings {
     pub usage_updated: &'static str,
     pub usage_used: &'static str,
     /// `{name}` is the provider.
-    #[allow(dead_code)]
     pub usage_almost_out: &'static str,
     /// The alert's long phrases: `{time}` is HH:MM, `{day}` a short weekday.
-    #[allow(dead_code)]
     pub usage_back_today_long: &'static str,
-    #[allow(dead_code)]
     pub usage_back_tomorrow_long: &'static str,
-    #[allow(dead_code)]
     pub usage_back_day_long: &'static str,
     /// The short phrases beside the ring.
-    #[allow(dead_code)]
     pub usage_back_today: &'static str,
-    #[allow(dead_code)]
     pub usage_back_tomorrow: &'static str,
-    #[allow(dead_code)]
     pub usage_back_day: &'static str,
     /// Monday first.
-    #[allow(dead_code)]
     pub weekdays_short: [&'static str; 7],
     pub media_title: &'static str,
     pub media_no_output: &'static str,
