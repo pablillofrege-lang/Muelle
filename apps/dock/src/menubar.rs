@@ -675,9 +675,11 @@ enum WindowRegion {
 }
 
 impl CapsuleLayout {
-    fn region(self, sides: RevealedSides) -> WindowRegion {
+    /// `island` is false once the island starts fading out (covered by a
+    /// maximized window): it must not take clicks meant for that window.
+    fn region(self, sides: RevealedSides, island: bool) -> WindowRegion {
         WindowRegion::Capsules([
-            self.island,
+            self.island.filter(|_| island),
             self.left.filter(|_| sides.left),
             self.right.filter(|_| sides.right),
             self.panel,
@@ -2440,10 +2442,10 @@ impl MenuBar {
 
     fn desired_window_region(&self, presence: Presence, hiding: bool) -> Option<WindowRegion> {
         if self.zoned() {
-            Some(
-                self.capsule_layout
-                    .region(self.visible_sides(presence, hiding)),
-            )
+            Some(self.capsule_layout.region(
+                self.visible_sides(presence, hiding),
+                self.island_hide_until.is_none(),
+            ))
         } else {
             resting_island_region(
                 presence,
@@ -5931,7 +5933,7 @@ mod island_tests {
     fn a_failed_window_region_is_retried_until_installed() {
         let mut installed = Some(WindowRegion::Island(RECT::default()));
         let previous = installed;
-        let desired = Some(CapsuleLayout::default().region(RevealedSides::default()));
+        let desired = Some(CapsuleLayout::default().region(RevealedSides::default(), true));
         let failed = !sync_window_region(&mut installed, desired, |_| false);
         assert_eq!(installed, previous);
         assert!(needs_pointer_timer(
@@ -6056,7 +6058,7 @@ mod island_tests {
                 [island, left, right, None, None],
             ),
         ] {
-            assert_eq!(layout.region(sides), WindowRegion::Capsules(expected));
+            assert_eq!(layout.region(sides, true), WindowRegion::Capsules(expected));
         }
         let open = CapsuleLayout {
             panel,
@@ -6064,7 +6066,7 @@ mod island_tests {
             ..layout
         };
         assert_eq!(
-            open.region(RevealedSides::default()),
+            open.region(RevealedSides::default(), true),
             WindowRegion::Capsules([island, None, None, panel, volume])
         );
         assert_eq!(
@@ -6077,8 +6079,13 @@ mod island_tests {
             })
         );
         assert_eq!(
-            CapsuleLayout::default().region(RevealedSides::default()),
+            CapsuleLayout::default().region(RevealedSides::default(), true),
             WindowRegion::Capsules([None; 5])
+        );
+        // A covered island fading out keeps no clickable region.
+        assert_eq!(
+            open.region(RevealedSides::default(), false),
+            WindowRegion::Capsules([None, None, None, panel, volume])
         );
     }
 
@@ -6123,10 +6130,13 @@ mod island_tests {
             panel,
             ..CapsuleLayout::default()
         }
-        .region(RevealedSides {
-            left: false,
-            right: true,
-        })
+        .region(
+            RevealedSides {
+                left: false,
+                right: true,
+            },
+            true,
+        )
         .create_handle();
         assert!(!region.is_invalid());
         // SAFETY: The region is owned by this test and deleted after querying it.
