@@ -89,7 +89,9 @@ use crate::{
 
 // Logical pixels.
 const HEIGHT: f32 = 28.0;
-const SIDE_MARGIN: f32 = 14.0;
+const LEFT_MARGIN: f32 = 14.0;
+const RIGHT_MARGIN: f32 = 14.0;
+const BARE_RIGHT_MARGIN: f32 = 10.0;
 const ITEM_GAP: f32 = 16.0;
 /// Extra clickable room around an item.
 const HIT_SLOP: f32 = 7.0;
@@ -218,14 +220,14 @@ pub struct MenuBarWidgets {
     /// Only the essentials (`Config::menu_bar_essentials`): no network
     /// speed and none of the Windows shell buttons (see `essential`).
     pub essentials: bool,
-    /// No background (`Config::menu_bar_bare`): no strip behind the bar,
+    /// No background (`Config::menu_bar_bare`): a clear strip over the desktop,
     /// white text and icons with a dark halo, and an opaque black island.
     pub bare: bool,
 }
 
 /// The halo under text and icons without a background: (blur, Y offset,
-/// alpha of the black), in logical pixels. A tight layer and a wide one.
-const HALO: [(f32, f32, u8); 2] = [(3.0, 1.0, 230), (12.0, 0.0, 115)];
+/// alpha of the black), in logical pixels.
+const HALO: [(f32, f32, u8); 3] = [(1.5, 0.0, 230), (4.0, 1.0, 170), (12.0, 0.0, 140)];
 
 /// The island without a background: opaque, near black.
 const BARE_ISLAND: Color = Color {
@@ -235,9 +237,20 @@ const BARE_ISLAND: Color = Color {
     B: 6,
 };
 
-/// The bar's background fills: none without a background, even without
-/// transparency, where the bar is otherwise solid.
+fn strip_veil(bare: bool, covered: bool) -> Option<Color> {
+    (bare && covered).then_some(Color {
+        A: 215,
+        ..BARE_ISLAND
+    })
+}
+
+/// Bare mode clears the strip on the desktop and dims a covering window.
 fn strip_fills(gfx: &Gfx, look: &Look) -> Result<Vec<CompositionBrush>> {
+    if let Some(veil) = strip_veil(look.widgets.bare, look.covered) {
+        return Ok(vec![
+            gfx.compositor.CreateColorBrushWithColor(veil)?.cast()?,
+        ]);
+    }
     if look.widgets.bare {
         return Ok(Vec::new());
     }
@@ -325,6 +338,8 @@ struct Look {
     light: bool,
     /// See `system::transparency_enabled`.
     glass: bool,
+    /// Whether bare mode needs a veil behind the revealed strip.
+    covered: bool,
     app_name: String,
     clock: String,
     /// The input language indicator, when more than one is installed.
@@ -655,7 +670,8 @@ pub struct MenuBar {
     monitor_reading: muelle_shell::monitor::Reading,
     /// Widest each monitor column has been at this scale: digits changing
     /// width must not shift the rest of the bar every two seconds.
-    monitor_widths: (f32, [f32; 2]),
+    // CPU/RAM stacked, network speeds stacked, CPU/RAM combined.
+    monitor_widths: (f32, [f32; 3]),
     hwnd: HWND,
     _target: DesktopWindowTarget,
     /// Stable parent: content refreshes must not restart reveal animations.
@@ -1374,7 +1390,7 @@ impl MenuBar {
             accessory_retry_at: Instant::now() + Duration::from_secs(60),
             monitor: None,
             monitor_reading: muelle_shell::monitor::Reading::default(),
-            monitor_widths: (0.0, [0.0; 2]),
+            monitor_widths: (0.0, [0.0; 3]),
             hwnd,
             _target: target,
             surface,
@@ -1583,6 +1599,7 @@ impl MenuBar {
             return Ok(());
         }
         self.covered = covered;
+        self.refresh_bare_cover(gfx)?;
         if self.ghost {
             // The ghost bar always auto-hides: covering it only takes the
             // island away, and a revealed bar stays until the pointer leaves.
@@ -1627,6 +1644,17 @@ impl MenuBar {
         }
         // Content is not refreshed while hidden.
         self.refresh(gfx)
+    }
+
+    fn refresh_bare_cover(&mut self, gfx: &Gfx) -> Result<()> {
+        if self.widgets.bare
+            && (self.presence_now() == Presence::Full || self.hide_until.is_some())
+            && let Some(look) = &self.look
+            && look.covered != self.covered
+        {
+            self.apply_look(gfx, look.clone())?;
+        }
+        Ok(())
     }
 
     pub fn set_usage_enabled(&mut self, gfx: &Gfx, enabled: bool) -> Result<()> {
@@ -1690,7 +1718,8 @@ impl MenuBar {
 
     pub fn set_widgets(&mut self, gfx: &Gfx, widgets: MenuBarWidgets) -> Result<()> {
         if self.widgets == widgets {
-            return Ok(());
+            // The visibility preferences may have updated coverage first.
+            return self.refresh_bare_cover(gfx);
         }
         self.widgets = widgets;
         self.refresh(gfx)
@@ -2471,6 +2500,7 @@ impl MenuBar {
             // like its popups, whatever the Windows theme.
             light: appearance.light && !self.widgets.bare,
             glass: appearance.glass,
+            covered: self.widgets.bare && self.covered,
             app_name: self.app_name.clone(),
             clock: system::clock_text(),
             input: system::input_language(),
@@ -2601,6 +2631,7 @@ impl MenuBar {
     }
 
     fn apply_look(&mut self, gfx: &Gfx, mut look: Look) -> Result<()> {
+        look.covered = look.widgets.bare && self.covered;
         look.active_providers = look.usage.visible_providers(look.active_providers);
         look.usage_enabled &= look.active_providers.any();
         self.panel = available_panel(look.panel, look.track.is_some(), look.usage_enabled);
@@ -2804,7 +2835,7 @@ impl MenuBar {
         };
 
         self.zones.clear();
-        let mut left_end = px(SIDE_MARGIN);
+        let mut left_end = px(LEFT_MARGIN);
         if !look.app_name.is_empty() {
             let name = gfx.text_brush_fitted(
                 &look.app_name,
@@ -2814,13 +2845,18 @@ impl MenuBar {
                 ink,
                 px(220.0).min(width * 0.22),
             )?;
-            place(&layers, &name, px(SIDE_MARGIN))?;
+            place(&layers, &name, px(LEFT_MARGIN))?;
             left_end += name.width;
         }
 
         // Right side, from the edge inward.
         let slop = px(HIT_SLOP);
-        let mut right = width - px(SIDE_MARGIN);
+        let right_margin = if look.widgets.bare {
+            BARE_RIGHT_MARGIN
+        } else {
+            RIGHT_MARGIN
+        };
+        let mut right = width - px(right_margin);
         let status = look.status;
         let symbol = |layers: &[(char, f32)]| gfx.glyph_brush(layers, scale, ink);
         let mut items: Vec<(LabelBrush, Action)> = Vec::new();
@@ -2835,7 +2871,7 @@ impl MenuBar {
             ));
         }
         items.push((
-            gfx.text_brush(&look.clock, scale, false, ink)?,
+            gfx.text_brush(&look.clock, scale, look.widgets.bare, ink)?,
             Action::Clock,
         ));
         items.push((gfx.control_center_brush(scale, ink)?, Action::QuickSettings));
@@ -2943,8 +2979,7 @@ impl MenuBar {
             right = left - px(ITEM_GAP);
         }
 
-        // The system monitor (issue #64), left of the status icons: two
-        // small stacked columns, CPU over memory, then upload over download.
+        // The system monitor (issue #64), left of the status icons.
         if let Some(lines) = &look.monitor {
             // "Only the essentials" keeps CPU over memory, without speeds.
             let columns: &[usize] = if look.widgets.essentials {
@@ -2952,23 +2987,47 @@ impl MenuBar {
             } else {
                 &[1, 0]
             };
-            let brushes = lines[..columns.len() * 2]
+            let cpu_ram = if look.widgets.bare {
+                Some(gfx.text_brush_sized(
+                    &format!("{} · {}", lines[0], lines[1]),
+                    scale,
+                    12.5,
+                    false,
+                    ink,
+                )?)
+            } else {
+                None
+            };
+            let first_column = usize::from(cpu_ram.is_some());
+            let brushes = lines[first_column * 2..columns.len() * 2]
                 .iter()
                 .map(|line| gfx.text_brush_sized(line, scale, MONITOR_FONT, false, ink))
                 .collect::<Result<Vec<_>>>()?;
             if self.monitor_widths.0 != scale {
-                self.monitor_widths = (scale, [0.0; 2]);
+                self.monitor_widths = (scale, [0.0; 3]);
             }
             for (column, pair) in brushes.chunks(2).enumerate() {
                 let widest = pair.iter().map(|brush| brush.width).fold(0.0, f32::max);
-                self.monitor_widths.1[column] = self.monitor_widths.1[column].max(widest);
+                let index = first_column + column;
+                self.monitor_widths.1[index] = self.monitor_widths.1[index].max(widest);
+            }
+            if let Some(brush) = &cpu_ram {
+                self.monitor_widths.1[2] = self.monitor_widths.1[2].max(brush.width);
             }
             let widths = self.monitor_widths.1;
             let zone_right = right;
             let mut left = right;
             for &column in columns {
+                if column == 0
+                    && let Some(brush) = &cpu_ram
+                {
+                    left -= widths[2];
+                    place(&layers, brush, left)?;
+                    continue;
+                }
                 left -= widths[column];
-                for (row, brush) in brushes[column * 2..column * 2 + 2].iter().enumerate() {
+                let start = (column - first_column) * 2;
+                for (row, brush) in brushes[start..start + 2].iter().enumerate() {
                     let top = if row == 0 {
                         height / 2.0 - brush.height + px(MONITOR_TUCK)
                     } else {
@@ -4978,11 +5037,15 @@ mod island_tests {
             for bare in [false, true] {
                 look.glass = glass;
                 look.widgets.bare = bare;
-                assert_eq!(
-                    strip_fills(&gfx, &look)?.is_empty(),
-                    bare,
-                    "glass={glass} bare={bare}"
-                );
+                for covered in [false, true] {
+                    look.covered = covered;
+                    assert_eq!(
+                        strip_fills(&gfx, &look)?.is_empty(),
+                        bare && !covered,
+                        "glass={glass} bare={bare} covered={covered}"
+                    );
+                }
+                look.covered = false;
                 bar.apply_look(&gfx, look.clone())?;
                 let root: ContainerVisual = bar.content_root()?.cast()?;
                 let mut halos = 0;
@@ -4994,7 +5057,10 @@ mod island_tests {
                     }
                 }
                 if bare {
-                    assert!(halos > 0 && halos % 2 == 0, "glass={glass}: {halos}");
+                    assert!(
+                        halos > 0 && halos % HALO.len() == 0,
+                        "glass={glass}: {halos}"
+                    );
                 } else {
                     assert_eq!(halos, 0, "glass={glass}");
                 }
@@ -5008,6 +5074,15 @@ mod island_tests {
         bar.set_widgets(&gfx, widgets)?;
         assert!(!bar.look.as_ref().context("look")?.light);
         Ok(())
+    }
+
+    #[test]
+    fn only_the_covered_bare_strip_gets_a_veil() {
+        for (bare, covered) in [(false, false), (false, true), (true, false)] {
+            assert!(strip_veil(bare, covered).is_none());
+        }
+        let color = strip_veil(true, true).expect("the covered bare strip needs a veil");
+        assert_eq!((color.R, color.G, color.B, color.A), (4, 7, 6, 215));
     }
 
     #[test]
