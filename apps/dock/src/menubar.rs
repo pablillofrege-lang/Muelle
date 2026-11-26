@@ -520,14 +520,12 @@ fn presence(
     ghost: bool,
     covered: bool,
     has_island: bool,
-    zoned: bool,
 ) -> Presence {
     if !visible {
         Presence::Hidden
     } else if !auto_hide || revealed {
         Presence::Full
-    } else if ghost && has_island && (!covered || zoned) {
-        // The island remains available over maximized windows in zoned mode.
+    } else if ghost && has_island && !covered {
         Presence::IslandOnly
     } else {
         Presence::Hidden
@@ -1794,7 +1792,6 @@ impl MenuBar {
             self.ghost,
             self.covered,
             self.triggers_span.width() > 0.0,
-            self.zoned(),
         )
     }
 
@@ -1864,7 +1861,7 @@ impl MenuBar {
         }
         self.covered = covered;
         if self.ghost {
-            // Coverage can hide the island in the original ghost mode.
+            // Coverage hides the resting island while the edge watcher stays active.
             return self.place();
         }
         if !self.smart || self.hide_setting {
@@ -5682,16 +5679,19 @@ mod island_tests {
             ((true, true, false, false, false, true), Hidden),
         ] {
             let (v, a, r, g, c, i) = args;
-            assert_eq!(presence(v, a, r, g, c, i, false), expected, "{args:?}");
+            assert_eq!(presence(v, a, r, g, c, i), expected, "{args:?}");
         }
     }
 
     #[test]
-    fn zoned_island_remains_visible_when_the_strip_is_covered() {
-        assert_eq!(
-            presence(true, true, false, true, true, true, true),
-            Presence::IslandOnly
-        );
+    fn zoned_island_hides_when_covered_and_reveals_from_the_center() {
+        let covered = |visible, revealed| presence(visible, true, revealed, true, true, true);
+        assert_eq!(covered(true, false), Presence::Hidden);
+        assert!(revealed_at(None, PointerZone::Left).is_none());
+        assert!(revealed_at(None, PointerZone::Right).is_none());
+        let revealed = revealed_at(None, PointerZone::Center).is_some();
+        assert_eq!(covered(true, revealed), Presence::Full);
+        assert_eq!(covered(false, revealed), Presence::Hidden);
     }
 
     #[test]
