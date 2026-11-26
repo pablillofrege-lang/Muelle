@@ -346,15 +346,33 @@ pub fn battery() -> Option<Battery> {
 
 /// Current date with weekday, day and month in the user's language.
 pub fn date_text() -> String {
+    format_date(windows::core::PCWSTR::null(), None, w!("ddd d MMM"))
+}
+
+/// Long date without the year, in Muelle's selected desktop clock language.
+pub fn long_date_text(date: &windows::Win32::Foundation::SYSTEMTIME, spanish: bool) -> String {
+    let (locale, pattern) = if spanish {
+        (w!("es-ES"), w!("dddd, d 'de' MMMM"))
+    } else {
+        (w!("en-US"), w!("dddd, MMMM d"))
+    };
+    format_date(locale, Some(date), pattern)
+}
+
+fn format_date(
+    locale: windows::core::PCWSTR,
+    when: Option<&windows::Win32::Foundation::SYSTEMTIME>,
+    pattern: windows::core::PCWSTR,
+) -> String {
     use windows::Win32::Globalization::GetDateFormatEx;
     let mut date = [0u16; 64];
     // SAFETY: The buffer lives for the call. The returned length includes the terminator.
     let len = unsafe {
         GetDateFormatEx(
-            None,
+            locale,
             Default::default(),
-            None,
-            w!("ddd d MMM"),
+            when.map(std::ptr::from_ref),
+            pattern,
             Some(&mut date),
             None,
         )

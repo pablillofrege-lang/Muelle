@@ -18,12 +18,15 @@ use windows::Win32::{
             SetTimer, WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
             WM_DWMCOLORIZATIONCOLORCHANGED, WM_INITMENUPOPUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
             WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP,
-            WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
+            WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+            WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
         },
     },
 };
 
-use crate::{edge_watch, folder_menu, multi_window_view::MultiWindowAction, weather};
+use crate::{
+    desktop_clock, edge_watch, folder_menu, multi_window_view::MultiWindowAction, weather,
+};
 
 use super::{
     APPBAR_CALLBACK, ASSETS_DELAY_MS, ASSETS_READY, ASSETS_TIMER, App, BIN_CHANGED, BIN_DELAY_MS,
@@ -507,6 +510,7 @@ pub(super) unsafe extern "system" fn wndproc(
         BIN_STATE => with_app("papelera", |app| app.set_bin_full(w.0 != 0)),
         weather::READY => with_app("pronóstico del tiempo", |app| {
             app.weather.borrow_mut().poll();
+            app.refresh_desktop_clock(false);
             if let Some(bar) = &mut app.menubar {
                 bar.weather_changed(&app.gfx)?;
             }
@@ -607,10 +611,36 @@ pub(super) unsafe extern "system" fn wndproc(
         WM_TIMER if w.0 == MASCOT_TIMER => with_app("mascota", App::mascot_tick),
         WM_TIMER if w.0 == WELCOME_TIMER => with_app("bienvenida", App::welcome),
         WM_TIMER if w.0 == BREAK_TIMER => with_app("descanso", App::break_tick),
+        WM_TIMER if w.0 == desktop_clock::TIMER => with_app("minuto del escritorio", |app| {
+            app.refresh_desktop_clock(true);
+            Ok(())
+        }),
+        desktop_clock::DPI_CHANGED => with_app("escala del reloj del escritorio", |app| {
+            app.refresh_desktop_clock(false);
+            Ok(())
+        }),
+        WM_TIMECHANGE if hwnd == main_window() => {
+            with_app("cambio de hora del escritorio", |app| {
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.time_changed();
+                    app.refresh_desktop_clock(false);
+                }
+                Ok(())
+            })
+        }
         // Unlocked: maybe the first time today (see `App::welcome`).
-        WM_WTSSESSION_CHANGE if w.0 == WTS_SESSION_UNLOCK as usize => {
-            with_app("desbloqueo", |app| {
-                app.arm_welcome();
+        WM_WTSSESSION_CHANGE
+            if [WTS_SESSION_LOCK as usize, WTS_SESSION_UNLOCK as usize].contains(&w.0) =>
+        {
+            with_app("estado de sesión", |app| {
+                let unlocked = w.0 == WTS_SESSION_UNLOCK as usize;
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.set_unlocked(unlocked);
+                    app.refresh_desktop_clock(false);
+                }
+                if unlocked {
+                    app.arm_welcome();
+                }
                 Ok(())
             });
         }
@@ -665,6 +695,10 @@ pub(super) unsafe extern "system" fn wndproc(
                 // Asleep was a pause; awake may be the first time today.
                 app.moments.rested();
                 app.arm_welcome();
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.time_changed();
+                    app.refresh_desktop_clock(false);
+                }
                 Ok(())
             });
             // SAFETY: `hwnd` is this live window on its owning UI thread.
@@ -687,6 +721,10 @@ pub(super) unsafe extern "system" fn wndproc(
             crate::overlays::reclaim();
             with_app("Explorer reiniciado", |app| {
                 app.taskbar_attempts = 0;
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.reset_explorer();
+                    app.refresh_desktop_clock(false);
+                }
                 Ok(())
             });
             // SAFETY: `hwnd` is this live window on its owning UI thread.

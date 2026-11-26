@@ -241,6 +241,7 @@ pub fn run() -> Result<()> {
             remove_label: None,
             config,
             weather: std::rc::Rc::new(std::cell::RefCell::new(crate::weather::Cache::new(visual))),
+            desktop_clock: None,
             slide: Spring::at(if auto_hide { 1.0 } else { 0.0 }, slide_omega),
             press: None,
             drag: None,
@@ -314,6 +315,7 @@ pub fn run() -> Result<()> {
         // After the dock: creating the bar and reserving its strip take
         // 60-130 ms, which the dock no longer waits for.
         app.apply_menu_bar_setting();
+        app.apply_desktop_clock_setting();
         // Otherwise the bar shows no app name until the user switches windows.
         if let Err(error) = app.update_menu_bar_app() {
             eprintln!("muelle: barra superior: {error:#}");

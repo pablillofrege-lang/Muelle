@@ -17,6 +17,7 @@ mod app;
 mod appearance;
 mod assets;
 mod bluetooth;
+mod desktop_clock;
 mod drop;
 mod edge_watch;
 mod flight;

@@ -73,6 +73,7 @@ use windows::{
 
 use crate::{
     assets::Visuals,
+    desktop_clock,
     edge_watch::EdgeWatch,
     flight::{Flight, Snapshot},
     gfx::{Gfx, LabelBrush},
@@ -702,6 +703,7 @@ pub(crate) struct App {
     remove_label: Option<LabelBrush>,
     config: Config,
     weather: Rc<RefCell<weather::Cache>>,
+    desktop_clock: Option<desktop_clock::Clock>,
     /// 0 = shown, 1 = hidden (auto-hide).
     slide: Spring,
     press: Option<Press>,

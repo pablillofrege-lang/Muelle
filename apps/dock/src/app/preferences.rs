@@ -234,6 +234,7 @@ impl App {
         }
         self.sync_thumbnails();
         self.apply_menu_bar_setting();
+        self.apply_desktop_clock_setting();
         self.update_menu_bar_app()?;
         self.calm_windows();
         self.refresh()?;
@@ -407,6 +408,16 @@ impl App {
             }
         }
         self.apply_edge_settings();
+    }
+
+    pub(super) fn apply_desktop_clock_setting(&mut self) {
+        if self.config.desktop_clock {
+            self.desktop_clock
+                .get_or_insert_with(|| crate::desktop_clock::Clock::new(self.visual));
+            self.refresh_desktop_clock(false);
+        } else {
+            self.desktop_clock = None;
+        }
     }
 
     /// Shows the name of the app in front, as the macOS menu bar does.
