@@ -5081,8 +5081,10 @@ mod island_tests {
         for (bare, covered) in [(false, false), (false, true), (true, false)] {
             assert!(strip_veil(bare, covered).is_none());
         }
-        let color = strip_veil(true, true).expect("the covered bare strip needs a veil");
-        assert_eq!((color.R, color.G, color.B, color.A), (4, 7, 6, 215));
+        assert_eq!(
+            strip_veil(true, true).map(|color| (color.R, color.G, color.B, color.A)),
+            Some((4, 7, 6, 215)),
+        );
     }
 
     #[test]
