@@ -136,8 +136,6 @@ const BUBBLE_USAGE_PADDING: f32 = 16.0;
 const PANEL_GAP: f32 = 5.0;
 const PANEL_RADIUS: f32 = 18.0;
 const PANEL_SHADOW_MARGIN: f32 = 20.0;
-const ISLAND_SHADOW_BLUR: f32 = 12.0;
-const ISLAND_SHADOW_DROP: f32 = 5.0;
 const WM_POWERBROADCAST: u32 = 0x0218;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// AppBar notifications need a message id; the bar ignores them.
@@ -158,7 +156,6 @@ static TICK_PENDING: AtomicBool = AtomicBool::new(false);
 static AUDIO_TICK_PENDING: AtomicBool = AtomicBool::new(false);
 static TRIGGERS_LEFT: AtomicI32 = AtomicI32::new(0);
 static TRIGGERS_RIGHT: AtomicI32 = AtomicI32::new(0);
-static ISLAND_REGION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANEL_LEFT: AtomicI32 = AtomicI32::new(0);
 static PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
 static BAR_TOP: AtomicI32 = AtomicI32::new(0);
@@ -446,18 +443,13 @@ fn needs_pointer_timer(
     on_screen && (panel_open || (auto_hide && (presence != Presence::IslandOnly || hiding)))
 }
 
-/// Keep the lateral shadow of the notch inside the compact window region.
-/// The shadow offset is vertical, so only its blur contributes here. The
-/// compact bubble has no drop shadow, and HALO belongs to the hidden strip.
-fn ghost_region(triggers: Span, bar_height: f32, style: IslandStyle, scale: f32) -> Option<RECT> {
-    let margin = match style {
-        IslandStyle::Notch => (ISLAND_SHADOW_BLUR * scale).round() as i32,
-        IslandStyle::Bubble => 0,
-    };
+/// The window region that keeps only the island, in window pixels, so clicks
+/// along the rest of the top edge reach the windows below.
+fn ghost_region(triggers: Span, bar_height: f32) -> Option<RECT> {
     (triggers.width() > 0.0).then(|| RECT {
-        left: (triggers.left.floor() as i32 - margin).max(0),
+        left: triggers.left.floor() as i32,
         top: 0,
-        right: triggers.right.ceil() as i32 + margin,
+        right: triggers.right.ceil() as i32,
         bottom: bar_height.round() as i32,
     })
 }
@@ -669,7 +661,6 @@ pub struct MenuBar {
     ghost: bool,
     /// The window region set now, to call `SetWindowRgn` only on change.
     window_region: Option<RECT>,
-    island_region: Option<RECT>,
     /// How many times `place` reserved the strip (tests watch mode changes).
     #[cfg(test)]
     strip_reservations: usize,
@@ -824,12 +815,6 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_NCHITTEST => {
             let x = (l.0 & 0xFFFF) as i16 as i32;
             let y = (l.0 >> 16) as i16 as i32;
-            if ISLAND_REGION_ACTIVE.load(Ordering::Relaxed)
-                && (x < TRIGGERS_LEFT.load(Ordering::Relaxed)
-                    || x >= TRIGGERS_RIGHT.load(Ordering::Relaxed))
-            {
-                return LRESULT(-1);
-            }
             if y >= BAR_BOTTOM.load(Ordering::Relaxed)
                 && (y >= PANEL_BOTTOM.load(Ordering::Relaxed)
                     || x < PANEL_LEFT.load(Ordering::Relaxed)
@@ -1384,7 +1369,6 @@ impl MenuBar {
             island_hide_until: None,
             ghost: false,
             window_region: None,
-            island_region: None,
             #[cfg(test)]
             strip_reservations: 0,
             appbar: AppBar::register(hwnd, APPBAR_CALLBACK),
@@ -2060,7 +2044,7 @@ impl MenuBar {
             self.reset_surface()?;
         }
         let region = (!hiding && (presence == Presence::IslandOnly || island_hiding))
-            .then_some(self.island_region)
+            .then(|| ghost_region(self.triggers_span, bar_height as f32))
             .flatten();
         // An auto-hiding or intelligent bar leaves the whole screen to the
         // windows.
@@ -2096,7 +2080,6 @@ impl MenuBar {
                 let handle = region.map(|r| CreateRectRgn(r.left, r.top, r.right, r.bottom));
                 if install_window_region(self.hwnd, handle) {
                     self.window_region = region;
-                    ISLAND_REGION_ACTIVE.store(region.is_some(), Ordering::Relaxed);
                 }
             }
             if needs_pointer_timer(
@@ -3000,8 +2983,6 @@ impl MenuBar {
         self.triggers_span = Span::default();
         self.panel_span = Span::default();
         self.draw_island(gfx, look, &island_layers, width, height, left_end, right)?;
-        self.island_region =
-            ghost_region(self.triggers_span, height, look.widgets.island_style, scale);
         if let Some(drag) = self.volume_drag {
             let new_span = self.island_hits.iter().find_map(|hit| match hit.action {
                 IslandAction::Volume(span) => Some(span),
@@ -4250,8 +4231,8 @@ fn island_shadow(
 ) -> Result<SpriteVisual> {
     let shadow = c.CreateDropShadow()?;
     shadow.SetMask(mask)?;
-    shadow.SetBlurRadius(geometry.px(ISLAND_SHADOW_BLUR))?;
-    shadow.SetOffset(Vector3::new(0.0, geometry.px(ISLAND_SHADOW_DROP), 0.0))?;
+    shadow.SetBlurRadius(geometry.px(12.0))?;
+    shadow.SetOffset(Vector3::new(0.0, geometry.px(5.0), 0.0))?;
     shadow.SetColor(rgba(0, 0, 0, 92))?;
     let host = c.CreateSpriteVisual()?;
     host.SetSize(size)?;
@@ -4803,7 +4784,6 @@ impl Drop for MenuBar {
         self.exit_animation = None;
         self.media = None;
         ISLAND_HOOK_WINDOW.store(0, Ordering::Relaxed);
-        ISLAND_REGION_ACTIVE.store(false, Ordering::Relaxed);
         edge_watch::set_menu_bar(None, None);
         if let Some(hook) = self.outside_click_hook.take() {
             // SAFETY: Do not leave a callback pointing at a destroyed window.
@@ -5065,13 +5045,13 @@ mod island_tests {
     }
 
     #[test]
-    fn ghost_region_fits_the_body_and_only_the_notch_shadow() {
+    fn ghost_region_covers_only_the_island() {
         let island = Span {
             left: 740.4,
             right: 1179.6,
         };
         assert_eq!(
-            ghost_region(island, 28.0, IslandStyle::Bubble, 1.0),
+            ghost_region(island, 28.0),
             Some(RECT {
                 left: 740,
                 top: 0,
@@ -5079,28 +5059,7 @@ mod island_tests {
                 bottom: 28
             })
         );
-        assert_eq!(
-            ghost_region(island, 28.0, IslandStyle::Notch, 1.0),
-            Some(RECT {
-                left: 728,
-                top: 0,
-                right: 1192,
-                bottom: 28
-            })
-        );
-        assert_eq!(
-            ghost_region(island, 42.0, IslandStyle::Notch, 1.5),
-            Some(RECT {
-                left: 722,
-                top: 0,
-                right: 1198,
-                bottom: 42
-            })
-        );
-        assert_eq!(
-            ghost_region(Span::default(), 28.0, IslandStyle::Notch, 1.0),
-            None
-        );
+        assert_eq!(ghost_region(Span::default(), 28.0), None);
     }
 
     #[test]
@@ -5144,6 +5103,7 @@ mod island_tests {
             bottom: 1080,
         };
         bar.apply_look(&gfx, look.clone())?;
+        let height = |bar: &MenuBar| (bar.bounds.bottom - bar.bounds.top) as f32;
 
         bar.set_ghost(true)?;
         assert!(bar.auto_hide);
@@ -5154,7 +5114,7 @@ mod island_tests {
         assert_eq!(bar.surface.Opacity()?, 1.0);
         let (kind, r) = region_of(&bar);
         assert_ne!(kind, RGN_ERROR);
-        assert_eq!(Some(r), bar.island_region);
+        assert_eq!(Some(r), ghost_region(bar.triggers_span, height(&bar)));
         // CreateRectRgn returns a null handle on failure. It must not be
         // forwarded to SetWindowRgn, where it would remove this clip.
         assert!(!install_window_region(bar.hwnd, Some(HRGN::default())));
@@ -5175,7 +5135,7 @@ mod island_tests {
         assert_eq!(bar.presence_now(), Presence::IslandOnly);
         let (kind, r) = region_of(&bar);
         assert_ne!(kind, RGN_ERROR);
-        assert_eq!(Some(r), bar.island_region);
+        assert_eq!(Some(r), ghost_region(bar.triggers_span, height(&bar)));
 
         bar.set_covered(&gfx, true)?;
         assert_eq!(bar.presence_now(), Presence::Hidden);
@@ -5196,7 +5156,7 @@ mod island_tests {
         bar.apply_look(&gfx, scaled)?;
         let (kind, r) = region_of(&bar);
         assert_ne!(kind, RGN_ERROR);
-        assert_eq!(Some(r), bar.island_region);
+        assert_eq!(Some(r), ghost_region(bar.triggers_span, height(&bar)));
 
         bar.set_auto_hide(false)?;
         bar.set_smart_hide(false)?;
