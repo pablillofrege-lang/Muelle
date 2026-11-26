@@ -558,6 +558,13 @@ fn presence(
     }
 }
 
+/// Whether the minute tick runs. It refreshes the clock, the island's usage
+/// and reset times, and retries the accessories. Outside the zoned layout it
+/// never stops; a zoned bar pauses it only while nothing at all is on screen.
+fn minute_tick_runs(zoned: bool, presence: Presence) -> bool {
+    !zoned || presence != Presence::Hidden
+}
+
 /// Whether the pointer must be polled: while a popup is open, and while an
 /// auto-hiding bar shows more than the island at rest. Only the island
 /// resting arms nothing, so the ghost bar costs no CPU while idle.
@@ -951,6 +958,8 @@ pub struct MenuBar {
     app_name: String,
     look: Option<Look>,
     weather: weather::Cache,
+    /// The minute tick (clock, usage, accessory retries) is armed. Only a
+    /// zoned bar hidden altogether pauses it.
     clock_running: bool,
     /// Clickable spans, in window pixels.
     zones: Vec<(f32, f32, Action)>,
@@ -1668,7 +1677,7 @@ impl MenuBar {
             app_name: String::new(),
             look: None,
             weather: weather::Cache::default(),
-            clock_running: false,
+            clock_running: true,
             zones: Vec::new(),
             visible: true,
             auto_hide,
@@ -1727,6 +1736,8 @@ impl MenuBar {
         AUDIO_TICK_PENDING.store(false, Ordering::Relaxed);
         bar.update_status();
         bar.refresh(gfx)?;
+        // Armed here, not in `place`, which can return before it gets there.
+        bar.schedule_next_minute();
         Ok(bar)
     }
 
@@ -2465,7 +2476,7 @@ impl MenuBar {
         let on_screen = show_bar || island_hiding;
         let full = presence == Presence::Full;
         let zoned = self.zoned();
-        self.sync_clock(!zoned || full);
+        self.sync_clock(minute_tick_runs(zoned, presence));
         let sides = self.visible_sides(presence, hiding);
         if let Some([left, right]) = &self.capsule_layers {
             left.SetIsVisible(sides.left)?;
@@ -2774,7 +2785,12 @@ impl MenuBar {
         }
         self.clock_running = running;
         if running {
-            self.schedule_next_minute();
+            // Catch up at once on what changed while it was paused, then
+            // realign to the minute.
+            // SAFETY: A timer on our own live window.
+            unsafe {
+                SetTimer(Some(self.hwnd), CLOCK_TIMER, 1, None);
+            }
         } else {
             // SAFETY: The timer belongs to our live window.
             unsafe {
@@ -5596,6 +5612,10 @@ mod island_tests {
         };
         let gfx = Gfx::new()?;
         let mut bar = MenuBar::create(&gfx, false, true, true, MenuBarWidgets::default())?;
+        assert!(
+            bar.clock_running,
+            "armed by the constructor, not by `place`"
+        );
         bar.audio = None; // This fixture can never change the user's audio.
         bar.media = Some(media::Watch::test_snapshot(Track::test_fixture()));
         bar.refresh(&gfx)?;
@@ -5805,6 +5825,25 @@ mod island_tests {
             let (v, a, r, g, c, i) = args;
             assert_eq!(presence(v, a, r, g, c, i), expected, "{args:?}");
         }
+    }
+
+    #[test]
+    fn minute_tick_pauses_only_for_a_zoned_bar_hidden_altogether() {
+        use Presence::*;
+        // Outside the zoned layout it runs whatever the bar shows, as it
+        // always did, so nothing in `place` has to start it.
+        for presence in [Hidden, IslandOnly, Full] {
+            assert!(minute_tick_runs(false, presence), "{presence:?}");
+        }
+        // The resting island keeps refreshing usage and reset times.
+        assert!(minute_tick_runs(true, IslandOnly));
+        assert!(minute_tick_runs(true, Full));
+        assert!(!minute_tick_runs(true, Hidden));
+        // A covered zoned island is hidden, so it pauses there.
+        let covered = presence(true, true, false, true, true, true);
+        assert!(!minute_tick_runs(true, covered));
+        let resting = presence(true, true, false, true, false, true);
+        assert!(minute_tick_runs(true, resting));
     }
 
     #[test]
