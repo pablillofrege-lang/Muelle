@@ -278,8 +278,14 @@ impl Gfx {
         height: f32,
         scale: f32,
         bare: bool,
+        attached: bool,
     ) -> Result<CompositionSurfaceBrush> {
         let (shoulder, corner) = island_radii(width, height, scale, bare);
+        let corner = if attached {
+            corner.min(BARE_ISLAND_RADIUS * scale)
+        } else {
+            corner
+        };
         self.draw(width.ceil() as u32, height.ceil() as u32, |dc| {
             // SAFETY: The geometries, sink and brush stay alive through the drawing calls.
             unsafe {
@@ -1487,7 +1493,7 @@ const fn rgb(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
-fn island_radii(width: f32, height: f32, scale: f32, bare: bool) -> (f32, f32) {
+pub(crate) fn island_radii(width: f32, height: f32, scale: f32, bare: bool) -> (f32, f32) {
     let (shoulder, corner) = if bare {
         (0.0, BARE_ISLAND_RADIUS)
     } else {

@@ -29,6 +29,7 @@ use muelle_shell::{
     watch::RegistryWatch,
 };
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     sync::{
         Arc,
@@ -85,7 +86,7 @@ use crate::{
     app,
     appearance::{self, Material},
     bluetooth, edge_watch,
-    gfx::{BARE_ISLAND_RADIUS, Gfx, Ink, LabelBrush},
+    gfx::{BARE_ISLAND_RADIUS, Gfx, Ink, LabelBrush, island_radii},
     mascot,
     media::{self, Control as MediaControl, Track},
     scene::Theme,
@@ -147,6 +148,7 @@ const HIDE_FALLBACK_MS: u32 = HIDE_MS + 250;
 const HIDE_ANIMATION_DONE: u32 = WM_APP + 29;
 const ISLAND_SINGLE_WIDTH: f32 = 145.0;
 const ISLAND_EXPANDED_WIDTH: f32 = 440.0;
+const USAGE_DETAIL_HEIGHT: f32 = 119.0;
 const ISLAND_ROW_HEIGHT: f32 = 118.0;
 const BUBBLE_VERTICAL_INSET: f32 = 2.5;
 const BUBBLE_MUSIC_WIDTH: f32 = 164.0;
@@ -431,25 +433,43 @@ impl Look {
     fn panel_content_height(&self) -> f32 {
         match self.panel {
             Some(Island::Music) => 180.0,
+            Some(Island::Usage) if self.widgets.ai_alerts => USAGE_DETAIL_HEIGHT,
             Some(Island::Usage) => {
                 74.0 + Provider::ALL
                     .into_iter()
                     .filter(|provider| self.active_providers.has(*provider))
-                    .map(|provider| {
-                        usage_row_height(self.usage.get(provider), self.widgets.ai_alerts)
-                    })
+                    .map(|provider| usage_row_height(self.usage.get(provider)))
                     .sum::<f32>()
             }
             None => 0.0,
         }
     }
 
+    fn usage_detail_open(&self) -> bool {
+        self.widgets.ai_alerts && self.panel == Some(Island::Usage)
+    }
+
+    fn panel_top(&self, bar_height: f32) -> f32 {
+        if self.usage_detail_open() {
+            match self.widgets.island_style {
+                IslandStyle::Notch => self.island_height(bar_height),
+                IslandStyle::Bubble => bar_height - (BUBBLE_VERTICAL_INSET * self.scale).round(),
+            }
+        } else {
+            bar_height + (PANEL_GAP * self.scale).round()
+        }
+    }
+
     fn panel_height(&self) -> f32 {
         let natural = self.panel_content_height();
         if self.panel == Some(Island::Usage) {
+            let top = if self.usage_detail_open() {
+                self.panel_top((HEIGHT * self.scale).round()) / self.scale
+            } else {
+                HEIGHT + PANEL_GAP
+            };
             let available = (self.screen.bottom - self.screen.top) as f32 / self.scale
-                - HEIGHT
-                - PANEL_GAP
+                - top
                 - PANEL_SHADOW_MARGIN;
             natural.min(available.max(0.0))
         } else {
@@ -644,6 +664,24 @@ impl RegionPart {
         })
     }
 
+    fn contains(self, x: f32, y: f32) -> bool {
+        let left = self.rect.left as f32;
+        let right = self.rect.right as f32;
+        let top = self.rect.top as f32;
+        let bottom = self.rect.bottom as f32;
+        if !(left..right).contains(&x) || !(top..bottom).contains(&y) {
+            return false;
+        }
+        let radius = self.radius;
+        let dx = (left + radius - x).max(x - (right - radius)).max(0.0);
+        let dy = if self.square_top {
+            (y - (bottom - radius)).max(0.0)
+        } else {
+            (top + radius - y).max(y - (bottom - radius)).max(0.0)
+        };
+        dx * dx + dy * dy <= radius * radius
+    }
+
     fn create_handle(self) -> HRGN {
         let RECT {
             left,
@@ -691,6 +729,7 @@ struct CapsuleLayout {
 enum WindowRegion {
     Island(RECT),
     Capsules([Option<RegionPart>; 5]),
+    StripAndPanel(RECT, RegionPart),
 }
 
 impl CapsuleLayout {
@@ -712,29 +751,30 @@ impl WindowRegion {
         // SAFETY: CombineRgn permits reusing the destination as a source.
         // All handles belong to us until install_window_region transfers one.
         unsafe {
-            match self {
-                Self::Island(r) => CreateRectRgn(r.left, r.top, r.right, r.bottom),
-                Self::Capsules(parts) => {
-                    let region = CreateRectRgn(0, 0, 0, 0);
-                    if region.is_invalid() {
-                        return region;
-                    }
-                    for part in parts.into_iter().flatten() {
-                        let handle = part.create_handle();
-                        if !handle.is_invalid() {
-                            let combined =
-                                CombineRgn(Some(region), Some(region), Some(handle), RGN_OR);
-                            let _ = DeleteObject(handle.into());
-                            if combined != RGN_ERROR {
-                                continue;
-                            }
-                        }
-                        let _ = DeleteObject(region.into());
-                        return HRGN::default();
-                    }
-                    region
-                }
+            let (region, parts) = match self {
+                Self::Island(r) => return CreateRectRgn(r.left, r.top, r.right, r.bottom),
+                Self::Capsules(parts) => (CreateRectRgn(0, 0, 0, 0), parts),
+                Self::StripAndPanel(r, panel) => (
+                    CreateRectRgn(r.left, r.top, r.right, r.bottom),
+                    [Some(panel), None, None, None, None],
+                ),
+            };
+            if region.is_invalid() {
+                return region;
             }
+            for part in parts.into_iter().flatten() {
+                let handle = part.create_handle();
+                if !handle.is_invalid() {
+                    let combined = CombineRgn(Some(region), Some(region), Some(handle), RGN_OR);
+                    let _ = DeleteObject(handle.into());
+                    if combined != RGN_ERROR {
+                        continue;
+                    }
+                }
+                let _ = DeleteObject(region.into());
+                return HRGN::default();
+            }
+            region
         }
     }
 }
@@ -1458,7 +1498,6 @@ fn draw_usage_row(
     accent: Color,
     scale: f32,
     light: bool,
-    ai_alerts: bool,
     island_width: f32,
     y: f32,
 ) -> Result<()> {
@@ -1514,9 +1553,6 @@ fn draw_usage_row(
         ink,
         1.0,
     )?;
-    if ai_alerts && !usage.windows.is_empty() {
-        return draw_usage_dials(gfx, layers, usage, accent, scale, ink, left, width, y);
-    }
     if let Some(main) = usage.main_window() {
         add_panel_text(
             gfx,
@@ -1659,16 +1695,10 @@ fn draw_usage_row(
             }
         }
     } else {
-        let message = match usage.state {
-            State::Loading => text.usage_loading,
-            State::SignIn if provider == Provider::Claude => text.usage_claude_sign_in,
-            State::SignIn => text.usage_sign_in,
-            State::Ready | State::Unavailable => text.usage_unavailable,
-        };
         add_panel_text(
             gfx,
             layers,
-            message,
+            usage_state_text(provider, usage.state),
             left + px(53.0),
             y + px(43.0),
             scale,
@@ -1681,121 +1711,195 @@ fn draw_usage_row(
     Ok(())
 }
 
-/// The detail of a provider with `ai_alerts`: one dial per window (the 5 h
-/// and the weekly one, side by side), each with its percentage in the color
-/// of its level and the hour it comes back.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "A row of dials takes its data, colors and measured rectangle"
-)]
-fn draw_usage_dials(
+fn usage_state_text(provider: Provider, state: State) -> &'static str {
+    let text = strings::text();
+    match state {
+        State::Loading => text.usage_loading,
+        State::SignIn if provider == Provider::Claude => text.usage_claude_sign_in,
+        State::SignIn => text.usage_sign_in,
+        State::Ready | State::Unavailable => text.usage_unavailable,
+    }
+}
+
+fn draw_usage_detail(
     gfx: &Gfx,
     layers: &VisualCollection,
-    usage: &ProviderUsage,
-    accent: Color,
-    scale: f32,
-    ink: Ink,
-    left: f32,
-    width: f32,
-    y: f32,
+    geometry: IslandGeometry,
+    providers: &[IslandProvider<'_>],
 ) -> Result<()> {
     let c = &gfx.compositor;
-    let px = |logical: f32| (logical * scale).round();
-    let text = strings::text();
+    let px = |v| geometry.px(v);
+    let width = geometry.width / providers.len() as f32;
     let now = chrono::Local::now();
-    let dials = dial_windows(&usage.windows);
-    let column = (width - px(28.0)) / dials.len().max(1) as f32;
-    for (index, window) in dials.into_iter().enumerate() {
-        // Only a reading that is current colors its dial.
+    for (index, provider) in providers.iter().enumerate() {
+        let left = (index as f32 * width).round();
+        if index > 0 {
+            add_visual(
+                c,
+                layers,
+                &c.CreateColorBrushWithColor(geometry.border())?.cast()?,
+                left,
+                px(8.0),
+                px(1.0).max(1.0),
+                px(98.0),
+            )?;
+        }
+        let column = c.CreateContainerVisual()?;
+        column.SetSize(Vector2::new(width, px(USAGE_DETAIL_HEIGHT)))?;
+        column.SetClip(&c.CreateInsetClip()?)?;
+        column.SetOffset(Vector3::new(left, 0.0, 0.0))?;
+        draw_usage_column(gfx, &column.Children()?, geometry, width, provider, now)?;
+        layers.InsertAtTop(&column)?;
+    }
+    Ok(())
+}
+
+fn draw_usage_column(
+    gfx: &Gfx,
+    layers: &VisualCollection,
+    geometry: IslandGeometry,
+    width: f32,
+    (provider, usage, accent): &IslandProvider<'_>,
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<()> {
+    let c = &gfx.compositor;
+    let px = |v| geometry.px(v);
+    let scale = geometry.scale;
+    let ink = geometry.ink();
+    let narrow = width < px(145.0);
+    let left = px(if narrow { 6.0 } else { 14.0 });
+    let right = width - left;
+    let icon = px(13.0);
+    if let Some(image) = usage::logo(*provider) {
+        let image = gfx.icon_brush(image, icon as u32)?;
+        let brush: CompositionBrush =
+            if geometry.light && !matches!(provider, Provider::Claude | Provider::Gemini) {
+                let mask = c.CreateMaskBrush()?;
+                mask.SetMask(&image)?;
+                mask.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
+                mask.cast()?
+            } else {
+                image.cast()?
+            };
+        add_visual(c, layers, &brush, left, px(10.0), icon, icon)?;
+    }
+    let label = |text: &str, x, y, size, bold, opacity| -> Result<()> {
+        let brush = gfx.text_brush_fitted(text, scale, size, bold, ink, right - x)?;
+        add_visual(
+            c,
+            layers,
+            &brush.brush.cast()?,
+            x,
+            y,
+            brush.width,
+            brush.height,
+        )?
+        .SetOpacity(opacity)?;
+        Ok(())
+    };
+    label(
+        provider.name(),
+        left + icon + px(6.0),
+        px(8.0),
+        12.5,
+        true,
+        1.0,
+    )?;
+    if usage.windows.is_empty() {
+        label(
+            usage_state_text(*provider, usage.state),
+            left,
+            px(32.0),
+            11.5,
+            false,
+            0.72,
+        )?;
+    }
+    for (index, window) in dial_windows(&usage.windows).into_iter().enumerate() {
+        let y = px(if narrow {
+            25.0 + index as f32 * 45.0
+        } else {
+            33.0 + index as f32 * 40.0
+        });
         let level = if usage.state == State::Ready {
             usage::level(window.used_percent)
         } else {
             Level::Normal
         };
-        let x = left + px(14.0) + index as f32 * column;
         let dial = gfx.usage_ring_sized(
             Some(window.used_percent),
             scale,
-            alert_ink(level, accent),
+            alert_ink(level, *accent),
             28.0,
-            3.0,
+            3.5,
         )?;
         add_visual(
             c,
             layers,
             &dial.brush.cast()?,
-            x,
-            y + px(56.0),
+            left,
+            y,
             dial.width,
             dial.height,
         )?;
-        let text_left = x + dial.width + px(9.0);
-        let percent = format!("{}%", window.used_percent);
-        let figure = usage_label(gfx, &percent, scale, 14.0, ink, level)?;
+        let text_left = left + dial.width + px(if narrow { 4.0 } else { 9.0 });
+        let figure = usage_label(
+            gfx,
+            &format!("{} %", window.used_percent),
+            scale,
+            15.0,
+            ink,
+            level,
+        )?;
         add_visual(
             c,
             layers,
             &figure.brush.cast()?,
             text_left,
-            y + px(55.0),
+            y - px(if narrow { 4.0 } else { 0.0 }),
             figure.width,
             figure.height,
         )?;
-        add_panel_text(
-            gfx,
-            layers,
-            &window.title(),
-            text_left + figure.width + px(6.0),
-            y + px(58.0),
-            scale,
-            11.5,
-            false,
-            ink,
-            0.72,
-        )?;
-        // When it returns, or the raw reset time if there is no phrase for it.
-        let comes_back = usage::back_phrase(window.resets_at, now, true).or_else(|| {
-            window
-                .reset_text()
-                .map(|reset| format!("{} {reset}", text.usage_resets))
-        });
-        if let Some(line) = comes_back {
-            let room = (column - dial.width - px(9.0) - px(10.0)).max(px(24.0));
-            let label = gfx.text_brush_fitted(&line, scale, 11.0, false, ink, room)?;
-            add_visual(
-                c,
-                layers,
-                &label.brush.cast()?,
+        let title = if window.minutes == 7 * 24 * 60 {
+            Cow::Borrowed(strings::text().usage_weekly)
+        } else {
+            Cow::Owned(window.title())
+        };
+        let (title_left, title_top, back_left, back_top) = if narrow {
+            (text_left, y + px(14.0), left, y + px(25.0))
+        } else {
+            (
+                text_left + figure.width + px(4.0),
+                y + px(3.0),
                 text_left,
-                y + px(77.0),
-                label.width,
-                label.height,
-            )?
-            .SetOpacity(0.78)?;
-        }
-    }
-    if usage.state == State::Unavailable || usage.age_minutes().is_some_and(|minutes| minutes > 5) {
-        add_panel_text(
-            gfx,
-            layers,
-            text.usage_stale,
-            left + px(14.0),
-            y + px(98.0),
-            scale,
-            11.0,
+                y + px(16.0),
+            )
+        };
+        label(
+            &title,
+            title_left,
+            title_top,
+            if narrow { 10.0 } else { 11.5 },
             false,
-            ink,
-            0.7,
+            0.68,
         )?;
+        if let Some(back) = usage::back_phrase(window.resets_at, now, false) {
+            let brush = gfx.text_brush_sized(&back, scale, 11.0, false, ink)?;
+            if narrow
+                && brush.width > right - back_left
+                && let Some((prefix, time)) = back.rsplit_once(' ')
+            {
+                label(prefix, back_left, back_top, 10.0, false, 0.68)?;
+                label(time, back_left, back_top + px(10.0), 10.0, false, 0.68)?;
+            } else {
+                label(&back, back_left, back_top, 11.0, false, 0.68)?;
+            }
+        }
     }
     Ok(())
 }
 
-fn usage_row_height(usage: &ProviderUsage, ai_alerts: bool) -> f32 {
-    if ai_alerts {
-        // Dials sit side by side: a row never needs more than its two lines.
-        return ISLAND_ROW_HEIGHT;
-    }
+fn usage_row_height(usage: &ProviderUsage) -> f32 {
     ISLAND_ROW_HEIGHT + usage.windows.len().saturating_sub(2) as f32 * 26.0
 }
 
@@ -2569,11 +2673,17 @@ impl MenuBar {
             };
         // Include the gap between the island and its popup so crossing it
         // does not close the popup before the pointer reaches its controls.
-        let within_panel = self.panel.is_some()
-            && x >= self.panel_span.left
-            && x < self.panel_span.right
-            && point.y >= self.bounds.bottom
-            && point.y < PANEL_BOTTOM.load(Ordering::Relaxed);
+        let within_panel = if self.look.as_ref().is_some_and(Look::usage_detail_open) {
+            self.capsule_layout
+                .panel
+                .is_some_and(|part| part.contains(x, (point.y - self.bounds.top) as f32))
+        } else {
+            self.panel.is_some()
+                && x >= self.panel_span.left
+                && x < self.panel_span.right
+                && point.y >= self.bounds.bottom
+                && point.y < PANEL_BOTTOM.load(Ordering::Relaxed)
+        };
         let inside = within_bar || within_island || within_panel;
         if self.zoned() {
             let zone = if within_bar {
@@ -2755,6 +2865,16 @@ impl MenuBar {
                 self.visible_sides(presence, hiding),
                 self.island_hide_until.is_none(),
             ))
+        } else if presence == Presence::Full
+            && let Some(panel) = self.capsule_layout.panel
+        {
+            let strip = RECT {
+                left: 0,
+                top: 0,
+                right: self.bounds.right - self.bounds.left,
+                bottom: self.bounds.bottom - self.bounds.top,
+            };
+            Some(WindowRegion::StripAndPanel(strip, panel))
         } else {
             resting_island_region(
                 presence,
@@ -3818,7 +3938,7 @@ impl MenuBar {
         let screen = look.screen;
         let (width, height) = ((screen.right - screen.left) as f32, px(HEIGHT));
         let island_height = look.island_height(height);
-        let panel_bottom = height + px(PANEL_GAP) + px(look.panel_height());
+        let panel_bottom = look.panel_top(height) + px(look.panel_height());
         let visual_height = if look.panel.is_some() {
             panel_bottom + px(PANEL_SHADOW_MARGIN)
         } else {
@@ -4351,10 +4471,17 @@ impl MenuBar {
             right: last.right,
         };
         let geometry = IslandGeometry::new(self.triggers_span, 0.0, look);
+        let attached = look.usage_detail_open() && usage.is_some();
+        let detail_height = if attached {
+            px(look.panel_height())
+        } else {
+            0.0
+        };
         let (compact, compact_height, divider_inset) = match style {
             IslandStyle::Notch => {
                 let height = look.island_height(bar_height);
-                let (surface, body) = island_surface(gfx, look, layers, geometry, height)?;
+                let (surface, body) =
+                    island_surface(gfx, look, layers, geometry, height, detail_height)?;
                 self.island_body = body;
                 (
                     surface,
@@ -4368,11 +4495,46 @@ impl MenuBar {
             }
             IslandStyle::Bubble => {
                 let (surface, pill_height) =
-                    bubble_surface(gfx, look, layers, geometry, bar_height)?;
+                    bubble_surface(gfx, look, layers, geometry, bar_height, detail_height)?;
                 (surface, pill_height, px(5.0))
             }
         };
-        if look.zoned {
+        if detail_height > 0.0 {
+            self.panel_span = self.triggers_span;
+            let top = if style == IslandStyle::Bubble {
+                px(BUBBLE_VERTICAL_INSET)
+            } else {
+                0.0
+            };
+            let height = compact_height + detail_height;
+            let shoulder = if style == IslandStyle::Notch {
+                island_radii(geometry.width, height, look.scale, look.zoned).0
+            } else {
+                0.0
+            };
+            let face = Span {
+                left: self.panel_span.left + shoulder,
+                right: self.panel_span.right - shoulder,
+            };
+            self.capsule_layout.panel =
+                RegionPart::rounded(face, top, height, BARE_ISLAND_RADIUS * look.scale).map(
+                    |part| RegionPart {
+                        square_top: style == IslandStyle::Notch,
+                        ..part
+                    },
+                );
+            let detail = gfx.compositor.CreateContainerVisual()?;
+            detail.SetOffset(Vector3::new(shoulder, compact_height, 0.0))?;
+            detail.SetSize(Vector2::new(face.width(), detail_height))?;
+            detail.SetClip(&gfx.compositor.CreateInsetClip()?)?;
+            draw_usage_detail(
+                gfx,
+                &detail.Children()?,
+                IslandGeometry::new(face, top + compact_height, look),
+                &providers,
+            )?;
+            compact.InsertAtTop(&detail)?;
+        } else if look.zoned {
             let (top, radius) = match style {
                 IslandStyle::Notch => (0.0, BARE_ISLAND_RADIUS * look.scale),
                 IslandStyle::Bubble => (px(BUBBLE_VERTICAL_INSET), compact_height / 2.0),
@@ -4474,7 +4636,7 @@ impl MenuBar {
                 bounds: (left, 0.0, right, bar_height.max(compact_height)),
                 action: IslandAction::Toggle(kind),
             });
-            if look.panel != Some(kind) {
+            if look.panel != Some(kind) || attached {
                 continue;
             }
             let desired = px(match kind {
@@ -4618,7 +4780,7 @@ impl MenuBar {
         let mut row_top = 6.0;
         for (provider, usage, accent) in providers {
             let y = px(row_top);
-            row_top += usage_row_height(usage, look.widgets.ai_alerts);
+            row_top += usage_row_height(usage);
             let inset = px(23.0);
             add_visual(
                 c,
@@ -4637,7 +4799,6 @@ impl MenuBar {
                 *accent,
                 scale,
                 look.light,
-                look.widgets.ai_alerts,
                 island_width,
                 y,
             )?;
@@ -5333,11 +5494,11 @@ fn hover_opens_usage(ai_alerts: bool, over_usage: bool, open: Option<Island>) ->
     ai_alerts && over_usage && open.is_none()
 }
 
-/// The windows the detail draws as dials: the shortest first, three at most.
+/// The two shortest windows, with the 5 h limit before the weekly limit.
 fn dial_windows(windows: &[Window]) -> Vec<&Window> {
     let mut dials: Vec<&Window> = windows.iter().collect();
     dials.sort_by_key(|window| window.minutes);
-    dials.truncate(3);
+    dials.truncate(2);
     dials
 }
 
@@ -5902,18 +6063,21 @@ fn island_surface(
     layers: &VisualCollection,
     geometry: IslandGeometry,
     island_height: f32,
+    detail_height: f32,
 ) -> Result<(VisualCollection, Option<ContainerVisual>)> {
     let c = &gfx.compositor;
     let px = |v| geometry.px(v);
     let island_left = geometry.left;
     let island_width = geometry.width;
     let scale = geometry.scale;
+    let attached = detail_height > 0.0;
+    let island_height = island_height + detail_height;
     let size = Vector2::new(island_width, island_height);
     let island = c.CreateContainerVisual()?;
     island.SetSize(size)?;
     island.SetOffset(Vector3::new(island_left.round(), 0.0, 0.0))?;
     let shell = island.Children()?;
-    let silhouette = gfx.island_mask(island_width, island_height, scale, look.zoned)?;
+    let silhouette = gfx.island_mask(island_width, island_height, scale, look.zoned, attached)?;
     shell.InsertAtTop(&island_shadow(c, &silhouette.cast()?, size, geometry)?)?;
     // With alerts the island's body (all but its shadow) is one visual, so a
     // growing announcement can unveil it. Without them, nothing changes.
@@ -5962,7 +6126,12 @@ fn island_surface(
             Y: island_height + lift,
         })?;
         outline.SetOffset(Vector2 { X: 0.0, Y: -lift })?;
-        outline.SetCornerRadius(Vector2 { X: lift, Y: lift })?;
+        let radius = if attached {
+            BARE_ISLAND_RADIUS * scale
+        } else {
+            lift
+        };
+        outline.SetCornerRadius(Vector2::new(radius, radius))?;
         glass.SetClip(&c.CreateGeometricClipWithGeometry(&outline)?)?;
         add_visual(
             c,
@@ -5998,25 +6167,32 @@ fn bubble_surface(
     layers: &VisualCollection,
     geometry: IslandGeometry,
     bar_height: f32,
+    detail_height: f32,
 ) -> Result<(VisualCollection, f32)> {
     let c = &gfx.compositor;
     let inset_y = geometry.px(BUBBLE_VERTICAL_INSET);
     let pill_height = (bar_height - 2.0 * inset_y).max(1.0);
-    let radius = pill_height / 2.0;
-    let size = Vector2::new(geometry.width, pill_height);
+    let radius = if detail_height > 0.0 {
+        BARE_ISLAND_RADIUS * look.scale
+    } else {
+        pill_height / 2.0
+    };
+    let height = pill_height + detail_height;
+    let size = Vector2::new(geometry.width, height);
     let bubble = c.CreateContainerVisual()?;
     bubble.SetSize(size)?;
     bubble.SetOffset(Vector3::new(geometry.left.round(), inset_y, 0.0))?;
     let content = bubble.Children()?;
 
-    let tint = match (look.zoned, look.light, look.glass) {
+    let bare = look.zoned || (detail_height > 0.0 && look.widgets.bare);
+    let tint = match (bare, look.light, look.glass) {
         (true, _, _) => BARE_ISLAND,
         (false, true, true) => rgba(247, 249, 252, 243),
         (false, false, true) => rgba(7, 9, 13, 242),
         (false, true, false) => rgba(247, 249, 252, 255),
         (false, false, false) => rgba(10, 12, 17, 255),
     };
-    if look.glass && !look.zoned {
+    if look.glass && !bare {
         let glass = c.CreateContainerVisual()?;
         glass.SetSize(size)?;
         let outline = c.CreateRoundedRectangleGeometry()?;
@@ -6033,7 +6209,7 @@ fn bubble_surface(
             0.0,
             0.0,
             geometry.width,
-            pill_height,
+            height,
         )?;
         content.InsertAtTop(&glass)?;
     }
@@ -6043,7 +6219,7 @@ fn bubble_surface(
         0.0,
         0.0,
         geometry.width,
-        pill_height,
+        height,
         radius,
         tint,
         None,
@@ -8978,23 +9154,37 @@ mod island_tests {
     }
 
     #[test]
-    fn the_detail_shows_the_windows_by_length_up_to_three() {
+    fn the_detail_shows_the_two_shortest_windows_in_order() {
         let windows = vec![window(10_080, 30), window(300, 96), window(43_200, 10)];
         let shown = dial_windows(&windows);
         let minutes: Vec<i64> = shown.iter().map(|w| w.minutes).collect();
-        assert_eq!(minutes, [300, 10_080, 43_200]);
-        let many: Vec<_> = (1..=5).map(|n| window(n * 60, 10)).collect();
-        assert_eq!(dial_windows(&many).len(), 3);
+        assert_eq!(minutes, [300, 10_080]);
         assert!(dial_windows(&[]).is_empty());
-        // With alerts a row is as tall as its two dials need; without them
-        // it grows with every window, as today.
         let three = ProviderUsage {
             state: State::Ready,
             windows,
             fetched_at: None,
         };
-        assert_eq!(usage_row_height(&three, false), ISLAND_ROW_HEIGHT + 26.0);
-        assert_eq!(usage_row_height(&three, true), ISLAND_ROW_HEIGHT);
+        assert_eq!(usage_row_height(&three), ISLAND_ROW_HEIGHT + 26.0);
+    }
+
+    #[test]
+    fn the_attached_detail_keeps_the_seam_open_and_excludes_its_rounded_corners() {
+        let part = RegionPart {
+            rect: RECT {
+                left: 100,
+                top: 0,
+                right: 420,
+                bottom: 149,
+            },
+            radius: 15.0,
+            square_top: true,
+        };
+        assert!(part.contains(100.0, 30.0));
+        assert!(part.contains(260.0, 148.0));
+        assert!(!part.contains(100.0, 148.0));
+        assert!(!part.contains(420.0, 100.0));
+        assert!(!part.contains(260.0, 149.0));
     }
 
     #[test]
@@ -9077,14 +9267,25 @@ mod island_tests {
         bar.usage_hover_fired(&gfx)?;
         assert_eq!(bar.panel, Some(Island::Usage));
         assert!(!bar.usage_hover_armed);
-        assert!(bar.panel_span.width() > 0.0);
+        assert_eq!(bar.panel_span, bar.triggers_span);
         assert!(
-            bar.island_hits
+            !bar.island_hits
                 .iter()
                 .any(|hit| matches!(hit.action, IslandAction::Refresh))
         );
+        assert!(bar.usage_viewport.is_none());
         let current = bar.look.as_ref().context("look")?;
-        assert_eq!(current.panel_content_height(), 74.0 + ISLAND_ROW_HEIGHT);
+        assert_eq!(current.panel_content_height(), USAGE_DETAIL_HEIGHT);
+        let part = bar.capsule_layout.panel.context("attached detail region")?;
+        assert!(matches!(
+            bar.window_region,
+            Some(WindowRegion::StripAndPanel(..))
+        ));
+        let detail_y = current.panel_top((bar.bounds.bottom - bar.bounds.top) as f32) + 1.0;
+        assert!(part.contains(x, detail_y));
+        assert!(!part.contains(bar.panel_span.right + 1.0, detail_y));
+        bar.pointer_moved(&gfx, x, detail_y)?;
+        assert_eq!(bar.panel, Some(Island::Usage));
         // With something open, resting on the usage arms nothing.
         bar.pointer_moved(&gfx, x, y)?;
         assert!(!bar.usage_hover_armed);

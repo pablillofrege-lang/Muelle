@@ -45,6 +45,7 @@ pub(super) const TEXT: Strings = Strings {
     usage_back_day_long: "vuelve el {day} a las {time}",
     usage_back: "vuelve",
     usage_back_today: "{time}",
+    usage_weekly: "Semanal",
     usage_back_tomorrow: "mañana {time}",
     usage_back_day: "{day} {time}",
     weekdays_short: ["lun.", "mar.", "mié.", "jue.", "vie.", "sáb.", "dom."],

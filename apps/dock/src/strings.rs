@@ -59,6 +59,7 @@ pub struct Strings {
     pub usage_back_today: &'static str,
     pub usage_back_tomorrow: &'static str,
     pub usage_back_day: &'static str,
+    pub usage_weekly: &'static str,
     /// Monday first.
     pub weekdays_short: [&'static str; 7],
     pub media_title: &'static str,
