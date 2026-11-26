@@ -31,6 +31,7 @@ mod visibility;
 use std::{
     cell::RefCell,
     collections::HashMap,
+    rc::Rc,
     sync::{
         OnceLock,
         atomic::{AtomicIsize, AtomicU8, Ordering},
@@ -82,6 +83,7 @@ use crate::{
     multi_window_view::MultiWindowView,
     scene::Scene,
     thumbnails::Thumbnails,
+    weather,
 };
 
 use menus::run_outside;
@@ -699,6 +701,7 @@ pub(crate) struct App {
     placeholder: Option<CompositionSurfaceBrush>,
     remove_label: Option<LabelBrush>,
     config: Config,
+    weather: Rc<RefCell<weather::Cache>>,
     /// 0 = shown, 1 = hidden (auto-hide).
     slide: Spring,
     press: Option<Press>,

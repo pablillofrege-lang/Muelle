@@ -1,4 +1,4 @@
-//! One-shot forecasts for the zoned menu bar.
+//! One-shot forecasts shared by the desktop clock and the zoned menu bar.
 
 use std::{
     env,
@@ -15,11 +15,13 @@ use muelle_config::Weather;
 use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use windows::Win32::{
-    Foundation::{HANDLE, WAIT_OBJECT_0},
+    Foundation::{HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM},
     System::Threading::WaitForSingleObject,
+    UI::WindowsAndMessaging::{PostMessageW, WM_APP},
 };
 
 pub const WORKER_FLAG: &str = "--weather-worker";
+pub const READY: u32 = WM_APP + 13;
 const VALID_FOR: Duration = Duration::from_secs(30 * 60);
 /// After a failed query, the next reveal may ask again this soon.
 const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
@@ -112,7 +114,7 @@ fn parse_forecast(body: &[u8]) -> Option<Reading> {
     })
 }
 
-/// How long to wait after an attempt before the next one, on reveal only.
+/// How long to wait after an attempt before the next visible request.
 fn due(last_attempt: Option<Instant>, failed: bool, now: Instant) -> bool {
     let wait = if failed { RETRY_AFTER } else { VALID_FOR };
     last_attempt.is_none_or(|last| now.saturating_duration_since(last) >= wait)
@@ -120,6 +122,7 @@ fn due(last_attempt: Option<Instant>, failed: bool, now: Instant) -> bool {
 
 #[derive(Default)]
 pub struct Cache {
+    notify: isize,
     settings: Weather,
     last_attempt: Option<Instant>,
     /// The last attempt brought nothing: the next reveal retries sooner.
@@ -127,28 +130,45 @@ pub struct Cache {
     /// The last good reading and when it arrived.
     reading: Option<(Reading, Instant)>,
     pending: Option<Receiver<Option<Reading>>>,
+    discard_pending: bool,
 }
 
 impl Cache {
+    pub fn new(notify: HWND) -> Self {
+        Self {
+            notify: notify.0 as isize,
+            ..Self::default()
+        }
+    }
+
     pub fn configure(&mut self, settings: &Weather) -> bool {
         if &self.settings == settings {
             return false;
         }
-        // New coordinates, or the weather turned on: ask on the next reveal.
-        *self = Self {
-            settings: settings.clone(),
-            ..Self::default()
-        };
+        self.settings = settings.clone();
+        self.last_attempt = None;
+        self.failed = false;
+        self.reading = None;
+        // Allow the child to exit before launching another one. Its result
+        // belongs to the old settings even if they are later selected again.
+        self.discard_pending = self.pending.is_some();
         true
     }
 
     pub fn reveal(&mut self) {
+        let notify = self.notify;
         self.reveal_at(Instant::now(), |latitude, longitude| {
             let (send, receive) = mpsc::channel();
             thread::Builder::new()
                 .name("muelle-weather".into())
                 .spawn(move || {
-                    let _ = send.send(fetch_in_child(latitude, longitude));
+                    let result = fetch_in_child(latitude, longitude);
+                    if send.send(result).is_ok() {
+                        // SAFETY: No borrowed payload crosses the thread boundary.
+                        let _ = unsafe {
+                            PostMessageW(Some(HWND(notify as _)), READY, WPARAM(0), LPARAM(0))
+                        };
+                    }
                 })
                 .ok()
                 .map(|_| receive)
@@ -171,10 +191,10 @@ impl Cache {
         // The previous reading stays on screen until the new one arrives.
         self.last_attempt = Some(now);
         self.pending = start(settings.latitude, settings.longitude);
+        self.failed = self.pending.is_none();
     }
 
-    /// Checked by the existing pointer timer, which runs during reveal.
-    /// True when what the capsule shows changed.
+    /// Consumes the worker result on the dock's UI thread.
     pub fn poll(&mut self) -> bool {
         self.poll_at(Instant::now())
     }
@@ -189,6 +209,9 @@ impl Cache {
             Err(TryRecvError::Disconnected) => None,
         };
         self.pending = None;
+        if std::mem::take(&mut self.discard_pending) {
+            return false;
+        }
         self.failed = fetched.is_none();
         match fetched {
             Some(reading) => {
@@ -528,8 +551,28 @@ mod tests {
             enabled: true,
             ..off
         }));
+        assert!(!queries.reveal(&mut cache, moved));
+        assert!(queries.answer(Some(SUNNY)));
+        assert!(!cache.poll_at(moved));
         assert!(queries.reveal(&mut cache, moved));
         assert_eq!(queries.started, 3);
+    }
+
+    #[test]
+    fn changing_settings_does_not_overlap_workers_or_publish_stale_weather() {
+        let t0 = Instant::now();
+        let mut cache = cache();
+        let mut queries = Queries::default();
+        assert!(queries.reveal(&mut cache, t0));
+        assert!(cache.configure(&Weather {
+            longitude: -3.0,
+            ..Weather::default()
+        }));
+        assert!(!queries.reveal(&mut cache, t0));
+        assert!(queries.answer(Some(SUNNY)));
+        assert!(!cache.poll_at(t0));
+        assert_eq!(cache.reading_at(t0), None);
+        assert!(queries.reveal(&mut cache, t0));
     }
 
     #[test]

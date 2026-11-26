@@ -338,6 +338,7 @@ impl App {
 
     /// Creates or removes the menu bar to match the settings.
     pub(super) fn apply_menu_bar_setting(&mut self) {
+        let weather_changed = self.weather.borrow_mut().configure(&self.config.weather);
         let widgets = MenuBarWidgets {
             island_style: self.config.menu_bar_island_style,
             notifications: self.config.menu_bar_notifications,
@@ -359,6 +360,9 @@ impl App {
             )
             .inspect_err(|error| eprintln!("muelle: barra superior: {error:#}"))
             .ok();
+            if let Some(bar) = &mut self.menubar {
+                bar.attach_weather(self.weather.clone());
+            }
         }
         if let Some(bar) = &mut self.menubar {
             bar.set_clock_target(self.config.menu_bar_clock_target.as_deref());
@@ -392,7 +396,12 @@ impl App {
                 .and_then(|()| {
                     bar.set_accessories_enabled(&self.gfx, self.config.accessory_battery)
                 })
-                .and_then(|()| bar.set_weather(&self.gfx, &self.config.weather));
+                .and_then(|()| {
+                    if weather_changed {
+                        bar.weather_changed(&self.gfx)?;
+                    }
+                    Ok(())
+                });
             if let Err(error) = applied {
                 eprintln!("muelle: barra superior: {error:#}");
             }

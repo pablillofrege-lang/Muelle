@@ -94,6 +94,7 @@ impl Fixture {
             placeholder: None,
             remove_label: None,
             config,
+            weather: Default::default(),
             slide: Spring::at(0.0, 24.0),
             press: None,
             drag: None,

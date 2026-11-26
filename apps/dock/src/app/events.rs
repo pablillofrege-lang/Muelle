@@ -23,7 +23,7 @@ use windows::Win32::{
     },
 };
 
-use crate::{edge_watch, folder_menu, multi_window_view::MultiWindowAction};
+use crate::{edge_watch, folder_menu, multi_window_view::MultiWindowAction, weather};
 
 use super::{
     APPBAR_CALLBACK, ASSETS_DELAY_MS, ASSETS_READY, ASSETS_TIMER, App, BIN_CHANGED, BIN_DELAY_MS,
@@ -505,6 +505,13 @@ pub(super) unsafe extern "system" fn wndproc(
         DROP_RUN => with_app_then("soltar archivos", |app| Ok(app.pending_drop.take())),
         WM_RBUTTONUP => with_app_then("menú", App::on_right_click),
         BIN_STATE => with_app("papelera", |app| app.set_bin_full(w.0 != 0)),
+        weather::READY => with_app("pronóstico del tiempo", |app| {
+            app.weather.borrow_mut().poll();
+            if let Some(bar) = &mut app.menubar {
+                bar.weather_changed(&app.gfx)?;
+            }
+            Ok(())
+        }),
         TASKBAR_PREFS_CHANGED => {
             with_app("preferencias de badges", App::taskbar_preferences_changed)
         }

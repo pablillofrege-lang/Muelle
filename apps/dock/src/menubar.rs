@@ -30,7 +30,9 @@ use muelle_shell::{
 };
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::VecDeque,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering},
@@ -1057,7 +1059,7 @@ pub struct MenuBar {
     appbar: Option<AppBar>,
     app_name: String,
     look: Option<Look>,
-    weather: weather::Cache,
+    weather: Option<Rc<RefCell<weather::Cache>>>,
     /// The minute tick (clock, usage, accessory retries) is armed. Only a
     /// zoned bar hidden altogether pauses it.
     clock_running: bool,
@@ -1991,7 +1993,7 @@ impl MenuBar {
             appbar: AppBar::register(hwnd, APPBAR_CALLBACK),
             app_name: String::new(),
             look: None,
-            weather: weather::Cache::default(),
+            weather: None,
             clock_running: true,
             zones: Vec::new(),
             visible: true,
@@ -2359,10 +2361,15 @@ impl MenuBar {
         }
     }
 
-    pub fn set_weather(&mut self, gfx: &Gfx, settings: &muelle_config::Weather) -> Result<()> {
-        if self.weather.configure(settings) && self.zoned() && self.revealed {
-            // Changed while revealed: this counts as the reveal that asks.
-            self.weather.reveal();
+    pub fn attach_weather(&mut self, cache: Rc<RefCell<weather::Cache>>) {
+        self.weather = Some(cache);
+    }
+
+    pub fn weather_changed(&mut self, gfx: &Gfx) -> Result<()> {
+        if self.zoned() && self.visible && self.revealed && self.revealed_sides.left {
+            if let Some(cache) = &self.weather {
+                cache.borrow_mut().reveal();
+            }
             self.refresh(gfx)?;
         }
         Ok(())
@@ -2388,9 +2395,8 @@ impl MenuBar {
             self.revealed_sides = RevealedSides::ON_ENTRY;
         }
         let zoned_reveal = inside && self.zoned() && self.visible;
-        if zoned_reveal {
-            self.weather.reveal();
-            self.weather.poll();
+        if zoned_reveal && let Some(cache) = &self.weather {
+            cache.borrow_mut().reveal();
         }
         self.hide_until = (!inside && animated)
             .then(|| Instant::now() + Duration::from_millis(u64::from(HIDE_FALLBACK_MS)));
@@ -2629,9 +2635,6 @@ impl MenuBar {
         // SAFETY: Read-only cursor query in the same DPI context as `bounds`.
         unsafe { GetCursorPos(&mut point)? };
         self.pointer_left_at(gfx, point)?;
-        if self.zoned() && self.visible && self.revealed && self.weather.poll() {
-            self.refresh(gfx)?;
-        }
         Ok(())
     }
 
@@ -3435,7 +3438,11 @@ impl MenuBar {
                 self.app_name.clone()
             },
             clock: clock_labels(zoned, date, time),
-            weather: self.weather.reading().filter(|_| zoned),
+            weather: self
+                .weather
+                .as_ref()
+                .filter(|_| zoned)
+                .and_then(|cache| cache.borrow().reading()),
             input: system::input_language(),
             battery: system::battery(),
             status: self.status,
