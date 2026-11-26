@@ -1517,9 +1517,7 @@ fn draw_usage_row(
     if ai_alerts && !usage.windows.is_empty() {
         return draw_usage_dials(gfx, layers, usage, accent, scale, ink, left, width, y);
     }
-    if let Some(main) = shown_window(usage, ai_alerts) {
-        let level = shown_level(usage, ai_alerts);
-        let accent = alert_ink(level, accent);
+    if let Some(main) = usage.main_window() {
         add_panel_text(
             gfx,
             layers,
@@ -1532,32 +1530,18 @@ fn draw_usage_row(
             ink,
             0.72,
         )?;
-        let percent = format!("{}%", main.used_percent);
-        if level == Level::Normal {
-            add_panel_text_right(
-                gfx,
-                layers,
-                &percent,
-                right - px(14.0),
-                y + px(6.0),
-                scale,
-                20.0,
-                true,
-                ink,
-                1.0,
-            )?;
-        } else {
-            let label = gfx.text_brush_tinted(&percent, scale, 20.0, true, accent)?;
-            add_visual(
-                c,
-                layers,
-                &label.brush.cast()?,
-                right - px(14.0) - label.width,
-                y + px(6.0),
-                label.width,
-                label.height,
-            )?;
-        }
+        add_panel_text_right(
+            gfx,
+            layers,
+            &format!("{}%", main.used_percent),
+            right - px(14.0),
+            y + px(6.0),
+            scale,
+            20.0,
+            true,
+            ink,
+            1.0,
+        )?;
         add_panel_text_right(
             gfx,
             layers,
@@ -1588,13 +1572,7 @@ fn draw_usage_row(
             },
             None,
         )?;
-        // Codex can report over 100 %: with alerts the bar stops at full.
-        let filled = if ai_alerts {
-            main.used_percent.min(100)
-        } else {
-            main.used_percent
-        };
-        let fill = track_width * f32::from(filled) / 100.0;
+        let fill = track_width * f32::from(main.used_percent) / 100.0;
         if fill > 0.0 {
             add_rounded_box(
                 c,
@@ -1638,11 +1616,7 @@ fn draw_usage_row(
                 0.7,
             )?;
         }
-        let others = usage
-            .windows
-            .iter()
-            .filter(|window| !std::ptr::eq(*window, main));
-        for (index, secondary) in others.enumerate() {
+        for (index, secondary) in usage.windows.iter().skip(1).enumerate() {
             add_visual(
                 c,
                 layers,
@@ -4484,7 +4458,12 @@ impl MenuBar {
                         .into_iter()
                         .map(|(provider, x)| (provider, look.screen.left + (span.left + x) as i32))
                         .collect();
-                    self.pulse_targets = drawn.pulse;
+                    // Only alerts beat; with the key off nothing is kept to stop later.
+                    self.pulse_targets = if look.widgets.ai_alerts {
+                        drawn.pulse
+                    } else {
+                        Vec::new()
+                    };
                 }
             }
             let (left, right) = match kind {
@@ -5648,6 +5627,12 @@ fn usage_alert_width(normal: f32, phrase: f32, available: f32) -> f32 {
     normal.max(phrase).min(available)
 }
 
+/// The width the alert wording adds to the usage segment. Never negative:
+/// a crowded bar keeps today's layout instead of shrinking the usage.
+fn usage_alert_extra(normal: f32, wording: f32, available: f32) -> f32 {
+    (usage_alert_width(normal, normal + wording, available) - normal).max(0.0)
+}
+
 /// What changes the island's alert wording: the announcement on and which
 /// providers are in red.
 fn alert_signature(look: &Look) -> (Option<Provider>, [bool; Provider::COUNT]) {
@@ -5832,7 +5817,7 @@ fn plan_usage_alerts(
             plan.total += extra;
         }
     }
-    plan.total = usage_alert_width(normal, normal + plan.total, available) - normal;
+    plan.total = usage_alert_extra(normal, plan.total, available);
     Ok(plan)
 }
 
@@ -9208,6 +9193,10 @@ mod island_tests {
         assert_eq!(usage_alert_width(134.0, 260.0, 500.0), 260.0);
         assert_eq!(usage_alert_width(134.0, 260.0, 200.0), 200.0);
         assert_eq!(usage_alert_width(134.0, 90.0, 500.0), 134.0);
+        assert_eq!(usage_alert_extra(134.0, 126.0, 500.0), 126.0);
+        assert_eq!(usage_alert_extra(134.0, 126.0, 200.0), 66.0);
+        assert_eq!(usage_alert_extra(134.0, 0.0, 100.0), 0.0);
+        assert_eq!(usage_alert_extra(134.0, 126.0, 100.0), 0.0);
     }
 
     #[test]

@@ -38,7 +38,7 @@ impl AlertTracker {
     }
 
     /// Whether the provider is in red as of its last `Ready` reading.
-    #[cfg_attr(not(test), allow(dead_code))] // la isla colorea desde la lectura; lo usan las pruebas
+    #[cfg(test)]
     pub fn critical(&self, provider: Provider) -> bool {
         self.critical[provider as usize]
     }
