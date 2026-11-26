@@ -48,7 +48,7 @@ use windows::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM},
         Graphics::{
             Dwm::{DWMWA_USE_HOSTBACKDROPBRUSH, DwmSetWindowAttribute},
-            Gdi::{CreateRectRgn, DeleteObject, HRGN, SetWindowRgn},
+            Gdi::{CombineRgn, CreateRectRgn, DeleteObject, HRGN, RGN_ERROR, RGN_OR, SetWindowRgn},
         },
         System::{
             LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime,
@@ -479,6 +479,58 @@ fn ghost_region(triggers: Span, island_height: f32) -> Option<RECT> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowRegion {
+    island: RECT,
+    strip: Option<RECT>,
+}
+
+/// Clips the part of the full-width window below the strip to the island.
+fn strip_and_island_region(
+    width: i32,
+    bar_height: i32,
+    triggers: Span,
+    island_height: f32,
+    panel_open: bool,
+) -> Option<WindowRegion> {
+    if panel_open || island_height.round() as i32 <= bar_height {
+        return None;
+    }
+    Some(WindowRegion {
+        island: ghost_region(triggers, island_height)?,
+        strip: Some(RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: bar_height,
+        }),
+    })
+}
+
+impl WindowRegion {
+    fn create_handle(self) -> HRGN {
+        let rect_region = |r: RECT| unsafe { CreateRectRgn(r.left, r.top, r.right, r.bottom) };
+        let island = rect_region(self.island);
+        let Some(strip) = self.strip.filter(|_| !island.is_invalid()) else {
+            return island;
+        };
+        let strip = rect_region(strip);
+        // SAFETY: CombineRgn permits reusing the island as the destination.
+        // We own both handles until install_window_region transfers the result.
+        unsafe {
+            if !strip.is_invalid() {
+                let combined = CombineRgn(Some(island), Some(island), Some(strip), RGN_OR);
+                let _ = DeleteObject(strip.into());
+                if combined != RGN_ERROR {
+                    return island;
+                }
+            }
+            let _ = DeleteObject(island.into());
+        }
+        HRGN::default()
+    }
+}
+
 /// Installs a new region and consumes its handle. `None` removes the clip.
 fn install_window_region(hwnd: HWND, handle: Option<HRGN>) -> bool {
     // A null result from CreateRectRgn must not remove the existing clip.
@@ -686,7 +738,7 @@ pub struct MenuBar {
     /// island stays on screen.
     ghost: bool,
     /// The window region set now, to call `SetWindowRgn` only on change.
-    window_region: Option<RECT>,
+    window_region: Option<WindowRegion>,
     island_height: f32,
     /// How many times `place` reserved the strip (tests watch mode changes).
     #[cfg(test)]
@@ -2096,9 +2148,20 @@ impl MenuBar {
         } else if !self.auto_hide {
             self.reset_surface()?;
         }
-        let region = (!hiding && (presence == Presence::IslandOnly || island_hiding))
-            .then(|| ghost_region(self.triggers_span, self.island_height))
-            .flatten();
+        let region = if !hiding && (presence == Presence::IslandOnly || island_hiding) {
+            ghost_region(self.triggers_span, self.island_height).map(|island| WindowRegion {
+                island,
+                strip: None,
+            })
+        } else {
+            strip_and_island_region(
+                bounds.right - bounds.left,
+                bar_height,
+                self.triggers_span,
+                self.island_height,
+                self.panel.is_some(),
+            )
+        };
         // An auto-hiding or intelligent bar leaves the whole screen to the
         // windows.
         let strip = if self.reserves() { bar_height } else { 0 };
@@ -2130,7 +2193,7 @@ impl MenuBar {
                 SWP_NOACTIVATE | show,
             )?;
             if region != self.window_region {
-                let handle = region.map(|r| CreateRectRgn(r.left, r.top, r.right, r.bottom));
+                let handle = region.map(WindowRegion::create_handle);
                 if install_window_region(self.hwnd, handle) {
                     self.window_region = region;
                 }
