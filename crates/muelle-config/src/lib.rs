@@ -35,7 +35,7 @@ pub enum ConfigError {
 
 /// User settings. Missing fields use their default values, so adding fields
 /// does not break existing configuration files.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -110,6 +110,8 @@ pub struct Config {
     /// (e.g. the Clock app or a calendar). `None` keeps the notification
     /// center and calendar, as on the Windows taskbar.
     pub menu_bar_clock_target: Option<String>,
+    /// Weather shown in the left capsule of the zoned ghost bar.
+    pub weather: Weather,
     /// CPU, memory and network speed in the menu bar (issue #64). Off by
     /// default: off, nothing is sampled; on, every 2 s only while the bar
     /// is on screen.
@@ -165,6 +167,33 @@ pub struct Config {
     // indicator follows Windows' own "Show badges on taskbar apps"; icons
     // always bounce for attention; window previews always have a close
     // button.
+}
+
+/// Forecast coordinates and display preference for the zoned bar.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Weather {
+    pub enabled: bool,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+impl Default for Weather {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            latitude: 37.7796,
+            longitude: -3.7849,
+        }
+    }
+}
+
+impl Weather {
+    /// Latitude and longitude a forecast can be asked for.
+    #[must_use]
+    pub fn has_valid_coordinates(&self) -> bool {
+        (-90.0..=90.0).contains(&self.latitude) && (-180.0..=180.0).contains(&self.longitude)
+    }
 }
 
 /// Pinned apps the user gathered in one dock icon by dropping one on
@@ -402,6 +431,7 @@ impl Default for Config {
             menu_bar_bare: false,
             menu_bar_essentials: false,
             menu_bar_clock_target: None,
+            weather: Weather::default(),
             accessory_battery: false,
             show_indicators: true,
             show_recents: true,
@@ -1011,6 +1041,45 @@ mod tests {
             chosen
         );
         Ok(())
+    }
+
+    #[test]
+    fn zoned_weather_defaults_to_jaen_and_accepts_custom_coordinates()
+    -> Result<(), serde_json::Error> {
+        let legacy: Config = serde_json::from_str("{}")?;
+        assert!(legacy.weather.enabled);
+        assert_eq!(
+            (legacy.weather.latitude, legacy.weather.longitude),
+            (37.7796, -3.7849)
+        );
+
+        let updated: Config = serde_json::from_str(
+            r#"{"weather":{"enabled":false,"latitude":40.4168,"longitude":-3.7038}}"#,
+        )?;
+        assert!(!updated.weather.enabled);
+        assert_eq!(
+            (updated.weather.latitude, updated.weather.longitude),
+            (40.4168, -3.7038)
+        );
+        let round_trip: Config = serde_json::from_str(&serde_json::to_string(&updated)?)?;
+        assert_eq!(round_trip.weather, updated.weather);
+        assert!(legacy.weather.has_valid_coordinates());
+        assert!(updated.weather.has_valid_coordinates());
+        Ok(())
+    }
+
+    #[test]
+    fn weather_coordinates_out_of_range_are_flagged() {
+        let at = |latitude, longitude| Weather {
+            enabled: true,
+            latitude,
+            longitude,
+        };
+        assert!(at(90.0, -180.0).has_valid_coordinates());
+        assert!(at(-90.0, 180.0).has_valid_coordinates());
+        assert!(!at(90.1, 0.0).has_valid_coordinates());
+        assert!(!at(0.0, -180.5).has_valid_coordinates());
+        assert!(!at(f64::NAN, 0.0).has_valid_coordinates());
     }
 
     #[test]

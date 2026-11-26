@@ -1,6 +1,10 @@
 //! Persisted dock preferences, pinned apps and menu-bar coordination.
 
-use std::{env, path::Path};
+use std::{
+    env,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result};
 use muelle_config::{Config, DockGroup};
@@ -37,7 +41,10 @@ pub(super) fn explorer_id() -> String {
 pub(super) fn load_config() -> Config {
     let path = muelle_config::default_path();
     match muelle_config::load(&path) {
-        Ok(Some(config)) => config,
+        Ok(Some(config)) => {
+            warn_about_weather(&config);
+            config
+        }
         Ok(None) => {
             let pins = taskbar_pins();
             let config = Config {
@@ -60,6 +67,22 @@ pub(super) fn load_config() -> Config {
             Config::default()
         }
     }
+}
+
+/// A hand-edited file can hold coordinates no forecast exists for. The
+/// weather then stays empty; say why once, without the values themselves.
+fn warn_about_weather(config: &Config) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if let Some(warning) = weather_warning(config)
+        && !WARNED.swap(true, Ordering::Relaxed)
+    {
+        muelle_shell::log::line(warning);
+    }
+}
+
+fn weather_warning(config: &Config) -> Option<&'static str> {
+    (config.weather.enabled && !config.weather.has_valid_coordinates())
+        .then_some("tiempo: coordenadas fuera de rango en la configuración; no se consulta")
 }
 
 /// Apply only Explorer's built-in pin, preserving the order of all other apps.
@@ -165,6 +188,7 @@ impl App {
         let Ok(Some(saved)) = muelle_config::load(&muelle_config::default_path()) else {
             return Ok(());
         };
+        warn_about_weather(&saved);
         // Pinned and recent apps belong to the dock; the settings app only
         // changes the rest.
         let config = Config {
@@ -366,7 +390,8 @@ impl App {
                 })
                 .and_then(|()| {
                     bar.set_accessories_enabled(&self.gfx, self.config.accessory_battery)
-                });
+                })
+                .and_then(|()| bar.set_weather(&self.gfx, self.config.weather));
             if let Err(error) = applied {
                 eprintln!("muelle: barra superior: {error:#}");
             }
@@ -410,6 +435,22 @@ mod dock_preferences_tests {
         spring::Spring,
     };
     use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn weather_coordinates_out_of_range_leave_a_warning() {
+        let with = |enabled, latitude| Config {
+            weather: muelle_config::Weather {
+                enabled,
+                latitude,
+                ..muelle_config::Weather::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(weather_warning(&Config::default()), None);
+        assert!(weather_warning(&with(true, 120.0)).is_some());
+        // Turned off, nothing is asked, so there is nothing to explain.
+        assert_eq!(weather_warning(&with(false, 120.0)), None);
+    }
 
     #[test]
     fn dock_menu_toggles_the_selected_mode_without_creating_combined_policies() -> Result<()> {

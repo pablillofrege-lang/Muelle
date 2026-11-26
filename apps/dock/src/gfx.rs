@@ -91,6 +91,9 @@ const WHITE: D2D1_COLOR_F = D2D1_COLOR_F {
     a: 1.0,
 };
 
+const BARE_USAGE_RING_DIAMETER: f32 = 16.0;
+pub(crate) const BARE_ISLAND_RADIUS: f32 = 15.0;
+
 /// Shared font glyphs belong to drawing code, which is also used by the
 /// standalone diagnostics without a menu bar or application lifecycle.
 pub(crate) mod network_glyph {
@@ -268,18 +271,16 @@ impl Gfx {
         })
     }
 
-    /// Opaque island silhouette with curved shoulders at the screen edge.
+    /// Opaque island silhouette, with straight sides in bare mode.
     pub fn island_mask(
         &self,
         width: f32,
         height: f32,
         scale: f32,
+        bare: bool,
     ) -> Result<CompositionSurfaceBrush> {
+        let (shoulder, corner) = island_radii(width, height, scale, bare);
         self.draw(width.ceil() as u32, height.ceil() as u32, |dc| {
-            let shoulder = (12.0 * scale).min(width / 5.0).min(height / 2.0);
-            let corner = (22.0 * scale)
-                .min(width / 2.0 - shoulder)
-                .min(height - shoulder);
             // SAFETY: The geometries, sink and brush stay alive through the drawing calls.
             unsafe {
                 let white = dc.CreateSolidColorBrush(&WHITE, None)?;
@@ -360,16 +361,23 @@ impl Gfx {
         })
     }
 
+    pub(crate) fn usage_ring_size(scale: f32, bare: bool) -> f32 {
+        let diameter = if bare { BARE_USAGE_RING_DIAMETER } else { 18.0 };
+        (diameter * scale).round()
+    }
+
     pub fn usage_ring(
         &self,
         used_percent: Option<u8>,
         scale: f32,
         accent: Color,
+        bare: bool,
     ) -> Result<LabelBrush> {
-        let side = (18.0 * scale).round();
+        let stroke = if bare { 3.0 } else { 2.4 };
+        let side = Self::usage_ring_size(scale, bare);
         let center = side / 2.0;
         let radius = center - 2.0 * scale;
-        let stroke = (2.4 * scale).max(1.0);
+        let stroke = (stroke * scale).max(1.0);
         let brush = self.draw(side as u32, side as u32, |dc| {
             // SAFETY: Brushes remain alive for the drawing calls.
             unsafe {
@@ -1051,11 +1059,25 @@ impl Gfx {
     /// in a square. Layers are drawn in order with their opacity, so a dim full
     /// Wi-Fi fan can sit behind the bars actually received.
     pub fn glyph_brush(&self, layers: &[(char, f32)], scale: f32, ink: Ink) -> Result<LabelBrush> {
+        self.glyph_brush_with_font(layers, scale, ink, icon_font())
+    }
+
+    pub fn symbol_brush(&self, symbol: char, scale: f32, ink: Ink) -> Result<LabelBrush> {
+        self.glyph_brush_with_font(&[(symbol, 1.0)], scale, ink, w!("Segoe UI Symbol"))
+    }
+
+    fn glyph_brush_with_font(
+        &self,
+        layers: &[(char, f32)],
+        scale: f32,
+        ink: Ink,
+        font: windows::core::PCWSTR,
+    ) -> Result<LabelBrush> {
         let side = (18.0 * scale).round();
         // SAFETY: The format lives for the drawing below.
         let format = unsafe {
             let format = self.dwrite.CreateTextFormat(
-                icon_font(),
+                font,
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -1427,6 +1449,19 @@ const fn rgb(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
+fn island_radii(width: f32, height: f32, scale: f32, bare: bool) -> (f32, f32) {
+    let (shoulder, corner) = if bare {
+        (0.0, BARE_ISLAND_RADIUS)
+    } else {
+        (12.0, 22.0)
+    };
+    let shoulder = (shoulder * scale).min(width / 5.0).min(height / 2.0);
+    let corner = (corner * scale)
+        .min(width / 2.0 - shoulder)
+        .min(height - shoulder);
+    (shoulder, corner)
+}
+
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
@@ -1438,6 +1473,13 @@ mod recovery_tests {
             DispatcherQueueOptions,
         },
     };
+
+    #[test]
+    fn bare_island_mask_has_no_shoulders_and_uses_smaller_corners() {
+        assert_eq!(island_radii(320.0, 30.0, 1.0, true), (0.0, 15.0));
+        assert_eq!(island_radii(480.0, 45.0, 1.5, true), (0.0, 22.5));
+        assert_eq!(island_radii(490.0, 28.0, 1.0, false), (12.0, 16.0));
+    }
 
     #[test]
     fn labels_follow_the_first_letter_instead_of_the_ui_locale() {
