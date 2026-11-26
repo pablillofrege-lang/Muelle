@@ -26,9 +26,9 @@ pub(crate) enum ClockLine {
 impl ClockLine {
     pub const fn height(self) -> f32 {
         match self {
-            Self::Date => 28.0,
+            Self::Date => 34.5,
             Self::Time => 184.0 * 1.02,
-            Self::Weather => 25.0,
+            Self::Weather => 30.0,
         }
     }
 
@@ -176,6 +176,7 @@ impl Gfx {
                 let target = dc.GetTarget()?;
                 let mut transform = Matrix3x2::identity();
                 dc.GetTransform(&mut transform);
+                let antialias = dc.GetTextAntialiasMode();
                 let text = dc.CreateCommandList()?;
                 let white = dc.CreateSolidColorBrush(&WHITE, None)?;
                 dc.SetTarget(&text);
@@ -187,6 +188,7 @@ impl Gfx {
                 }
                 dc.SetTarget(&target);
                 dc.SetTransform(&transform);
+                dc.SetTextAntialiasMode(antialias);
                 text.Close()?;
 
                 for &(dy, blur, alpha) in line.shadows() {

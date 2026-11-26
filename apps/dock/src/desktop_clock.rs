@@ -213,12 +213,17 @@ fn viewport(monitor: Monitor) -> Viewport {
     let width = ((820.0 * scale).round() as i32).min(screen_width);
     let left = left + (screen_width - width) / 2;
     let top = top + (WINDOW_TOP * scale).round() as i32;
+    let height = WIDGET_TOP - WINDOW_TOP
+        + ClockLine::Date.height()
+        + ClockLine::Time.height()
+        + ClockLine::Weather.height()
+        + ClockLine::Weather.margin();
     Viewport {
         rect: RECT {
             left,
             top,
             right: left + width,
-            bottom: top + (338.0 * scale).ceil() as i32,
+            bottom: top + (height * scale).ceil() as i32,
         },
         scale,
     }
