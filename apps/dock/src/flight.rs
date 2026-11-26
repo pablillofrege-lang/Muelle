@@ -1129,6 +1129,7 @@ mod tests {
 #[cfg(test)]
 mod native_tests {
     use super::*;
+    use anyhow::Context;
     use windows::Win32::{
         System::WinRT::{
             CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
@@ -1198,17 +1199,22 @@ mod native_tests {
         )
         .ok_or_else(|| anyhow::anyhow!("could not create the native animation"))?;
         let overlay = flight.overlay;
-        let stand = flight.stand;
-        let unrelated = if flight.foreground != 123 { 123 } else { 124 };
+        let stand = flight
+            .stand
+            .context("minimization has no stand-in window")?;
+        let unrelated = [123, 124, 125]
+            .into_iter()
+            .find(|&hwnd| hwnd != flight.foreground && hwnd != flight.hwnd)
+            .context("no unrelated foreground window")?;
         assert!(
-            !flight.is_current(unrelated),
-            "switching apps invalidates the animation"
+            flight.is_current(unrelated),
+            "minimizing hands focus to another app while capture is pending"
         );
-        // Replace the graphics worker with one that never delivers a result.
-        let (_sender, stalled) = channel();
-        if let Phase::Standing { shot, .. } = &mut flight.phase {
-            *shot = stalled;
-        }
+        let (late_capture, stalled) = channel();
+        let Phase::Standing { shot, .. } = &mut flight.phase else {
+            panic!("minimization starts by waiting for capture");
+        };
+        *shot = stalled;
         flight.aim(
             &gfx,
             RECT {
@@ -1218,18 +1224,17 @@ mod native_tests {
                 bottom: 440,
             },
         );
-        flight.created_at = Instant::now() - CAPTURE_TIMEOUT;
         flight.restore_pending = true;
-        assert!(!flight.step(&gfx, Instant::now()));
+        assert!(flight.step(&gfx, flight.created_at));
+        assert!(!flight.step(&gfx, flight.created_at + CAPTURE_TIMEOUT));
         assert!(
             !flight.take_restore(true),
             "timing out must not reactivate a stale target"
         );
         drop(flight);
+        assert!(late_capture.send(None).is_err());
         assert!(!unsafe { IsWindow(Some(overlay)) }.as_bool());
-        if let Some(stand) = stand {
-            assert!(!unsafe { IsWindow(Some(stand)) }.as_bool());
-        }
+        assert!(!unsafe { IsWindow(Some(stand)) }.as_bool());
         Ok(())
     }
 }
