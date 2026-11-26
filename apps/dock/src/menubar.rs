@@ -48,7 +48,10 @@ use windows::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM},
         Graphics::{
             Dwm::{DWMWA_USE_HOSTBACKDROPBRUSH, DwmSetWindowAttribute},
-            Gdi::{CombineRgn, CreateRectRgn, DeleteObject, HRGN, RGN_ERROR, RGN_OR, SetWindowRgn},
+            Gdi::{
+                CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, HRGN, RGN_ERROR,
+                RGN_OR, SetWindowRgn,
+            },
         },
         System::{
             LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime,
@@ -77,7 +80,7 @@ use crate::{
     accessories, app,
     appearance::{self, Material},
     bluetooth, edge_watch,
-    gfx::{Gfx, Ink, LabelBrush},
+    gfx::{BARE_ISLAND_RADIUS, Gfx, Ink, LabelBrush},
     mascot,
     media::{self, Control as MediaControl, Track},
     scene::Theme,
@@ -122,6 +125,7 @@ const ACCESSORIES_CHANGED: u32 = WM_APP + 30;
 const CLOCK_TIMER: usize = 1;
 const POINTER_TIMER: usize = 2;
 const POINTER_CHECK_MS: u32 = 100;
+const ZONED_POINTER_CHECK_MS: u32 = 32;
 const HIDE_ANIMATION_TIMER: usize = 3;
 const REVEAL_MS: u32 = 180;
 const HIDE_MS: u32 = 130;
@@ -227,11 +231,11 @@ pub struct MenuBarWidgets {
 
 /// The halo under text and icons without a background: (blur, Y offset,
 /// alpha of the black), in logical pixels.
-const HALO: [(f32, f32, u8); 3] = [(1.5, 0.0, 230), (4.0, 1.0, 170), (12.0, 0.0, 140)];
+const HALO: [(f32, f32, u8); 2] = [(3.0, 1.0, 230), (12.0, 0.0, 115)];
+const CAPSULE_HALO: [(f32, f32, u8); 3] = [(1.5, 0.0, 230), (4.0, 1.0, 170), (12.0, 0.0, 140)];
 
 const BARE_NOTCH_EXTRA_HEIGHT: f32 = 2.0;
 const BARE_NOTCH_DIVIDER_HEIGHT: f32 = 14.0;
-const BARE_VEIL_ALPHA: u8 = 215;
 const BARE_MONITOR_FONT_SIZE: f32 = 12.5;
 const BARE_PLAYER_WIDTH: f32 = 152.0;
 const BARE_PLAYER_COVER_INSET: f32 = 14.0;
@@ -244,6 +248,7 @@ const BARE_PROVIDER_LOGO_SIZE: f32 = 15.0;
 const BARE_PROVIDER_LABEL_SIZE: f32 = 13.0;
 const BARE_PROVIDER_ITEM_GAP: f32 = 6.0;
 const BARE_PROVIDER_GROUP_GAP: f32 = 14.0;
+const EMPTY_ISLAND_ENTRY_WIDTH: f32 = 320.0;
 
 /// The island without a background: opaque, near black.
 const BARE_ISLAND: Color = Color {
@@ -253,20 +258,8 @@ const BARE_ISLAND: Color = Color {
     B: 6,
 };
 
-fn strip_veil(bare: bool, covered: bool) -> Option<Color> {
-    (bare && covered).then_some(Color {
-        A: BARE_VEIL_ALPHA,
-        ..BARE_ISLAND
-    })
-}
-
-/// Bare mode clears the strip on the desktop and dims a covering window.
+/// Bare mode has no full-width fill.
 fn strip_fills(gfx: &Gfx, look: &Look) -> Result<Vec<CompositionBrush>> {
-    if let Some(veil) = strip_veil(look.widgets.bare, look.covered) {
-        return Ok(vec![
-            gfx.compositor.CreateColorBrushWithColor(veil)?.cast()?,
-        ]);
-    }
     if look.widgets.bare {
         return Ok(Vec::new());
     }
@@ -286,9 +279,11 @@ fn add_halo(
     mask: &CompositionBrush,
     size: Vector2,
     offset: Vector3,
-    scale: f32,
+    look: &Look,
 ) -> Result<()> {
-    for (blur, lift, alpha) in HALO {
+    let scale = look.scale;
+    let halo: &[_] = if look.zoned { &CAPSULE_HALO } else { &HALO };
+    for &(blur, lift, alpha) in halo {
         let shadow = c.CreateDropShadow()?;
         shadow.SetMask(mask)?;
         shadow.SetBlurRadius(blur * scale)?;
@@ -354,8 +349,7 @@ struct Look {
     light: bool,
     /// See `system::transparency_enabled`.
     glass: bool,
-    /// Whether bare mode needs a veil behind the revealed strip.
-    covered: bool,
+    zoned: bool,
     app_name: String,
     clock: String,
     /// The input language indicator, when more than one is installed.
@@ -389,7 +383,7 @@ fn accessory_readings(snapshot: &AccessorySnapshot) -> [Option<AccessoryReading>
 
 impl Look {
     fn island_height(&self, bar_height: f32) -> f32 {
-        let extra = if self.widgets.bare && self.widgets.island_style == IslandStyle::Notch {
+        let extra = if self.zoned && self.widgets.island_style == IslandStyle::Notch {
             (BARE_NOTCH_EXTRA_HEIGHT * self.scale).round()
         } else {
             0.0
@@ -441,6 +435,56 @@ impl Span {
     fn width(self) -> f32 {
         self.right - self.left
     }
+
+    fn contains(self, x: f32) -> bool {
+        (self.left..self.right).contains(&x)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerZone {
+    Outside,
+    Left,
+    Center,
+    Right,
+}
+
+fn strip_zone(bounds: RECT, entrance: Span, point: POINT) -> PointerZone {
+    if !(bounds.left..bounds.right).contains(&point.x)
+        || !(bounds.top..bounds.bottom).contains(&point.y)
+    {
+        PointerZone::Outside
+    } else {
+        let x = (point.x - bounds.left) as f32;
+        if entrance.contains(x) {
+            PointerZone::Center
+        } else if x < entrance.left {
+            PointerZone::Left
+        } else {
+            PointerZone::Right
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RevealedSides {
+    left: bool,
+    right: bool,
+}
+
+fn revealed_at(sides: Option<RevealedSides>, zone: PointerZone) -> Option<RevealedSides> {
+    match zone {
+        PointerZone::Outside => None,
+        PointerZone::Center => Some(sides.unwrap_or_default()),
+        PointerZone::Left => sides.map(|sides| RevealedSides {
+            left: true,
+            ..sides
+        }),
+        PointerZone::Right => sides.map(|sides| RevealedSides {
+            right: true,
+            ..sides
+        }),
+    }
 }
 
 fn island_or_panel_span(
@@ -458,8 +502,8 @@ fn island_or_panel_span(
     }
 }
 
-/// How much of the bar is on screen. With the ghost bar, at rest only the
-/// island shows (`IslandOnly`); the top edge reveals the rest (`Full`).
+/// Whether the bar is hidden, resting on the island, or actively revealed.
+/// The zoned layout tracks its revealed sides separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Presence {
     Hidden,
@@ -511,54 +555,102 @@ fn ghost_region(triggers: Span, island_height: f32) -> Option<RECT> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct WindowRegion {
-    island: RECT,
-    strip: Option<RECT>,
+struct RegionPart {
+    rect: RECT,
+    radius: f32,
+    square_top: bool,
 }
 
-/// Clips the part of the full-width window below the strip to the island.
-fn strip_and_island_region(
-    width: i32,
-    bar_height: i32,
-    triggers: Span,
-    island_height: f32,
-    panel_open: bool,
-) -> Option<WindowRegion> {
-    if panel_open || island_height.round() as i32 <= bar_height {
-        return None;
+impl RegionPart {
+    fn rounded(span: Span, top: f32, height: f32, radius: f32) -> Option<Self> {
+        let mut rect = ghost_region(span, height)?;
+        rect.top = top.round() as i32;
+        rect.bottom += rect.top;
+        (rect.bottom > rect.top).then_some(Self {
+            rect,
+            radius: radius.min(span.width() / 2.0).min(height / 2.0),
+            square_top: false,
+        })
     }
-    Some(WindowRegion {
-        island: ghost_region(triggers, island_height)?,
-        strip: Some(RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: bar_height,
-        }),
-    })
+
+    fn create_handle(self) -> HRGN {
+        let RECT {
+            left,
+            top,
+            right,
+            bottom,
+        } = self.rect;
+        let diameter = (2.0 * self.radius).round() as i32;
+        // A notch meets the screen edge with square top corners. Its upper
+        // rounding sits above the window, leaving only the lower corners.
+        let top = if self.square_top { top - diameter } else { top };
+        // SAFETY: The arguments are window-relative pixel coordinates.
+        unsafe {
+            if diameter > 0 {
+                CreateRoundRectRgn(left, top, right, bottom, diameter, diameter)
+            } else {
+                CreateRectRgn(left, top, right, bottom)
+            }
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct CapsuleLayout {
+    island: Option<RegionPart>,
+    left: Option<RegionPart>,
+    right: Option<RegionPart>,
+    panel: Option<RegionPart>,
+    volume: Option<RegionPart>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowRegion {
+    Island(RECT),
+    Capsules([Option<RegionPart>; 5]),
+}
+
+impl CapsuleLayout {
+    fn region(self, sides: RevealedSides) -> WindowRegion {
+        WindowRegion::Capsules([
+            self.island,
+            self.left.filter(|_| sides.left),
+            self.right.filter(|_| sides.right),
+            self.panel,
+            self.volume,
+        ])
+    }
 }
 
 impl WindowRegion {
     fn create_handle(self) -> HRGN {
-        let rect_region = |r: RECT| unsafe { CreateRectRgn(r.left, r.top, r.right, r.bottom) };
-        let island = rect_region(self.island);
-        let Some(strip) = self.strip.filter(|_| !island.is_invalid()) else {
-            return island;
-        };
-        let strip = rect_region(strip);
-        // SAFETY: CombineRgn permits reusing the island as the destination.
-        // We own both handles until install_window_region transfers the result.
+        // SAFETY: CombineRgn permits reusing the destination as a source.
+        // All handles belong to us until install_window_region transfers one.
         unsafe {
-            if !strip.is_invalid() {
-                let combined = CombineRgn(Some(island), Some(island), Some(strip), RGN_OR);
-                let _ = DeleteObject(strip.into());
-                if combined != RGN_ERROR {
-                    return island;
+            match self {
+                Self::Island(r) => CreateRectRgn(r.left, r.top, r.right, r.bottom),
+                Self::Capsules(parts) => {
+                    let region = CreateRectRgn(0, 0, 0, 0);
+                    if region.is_invalid() {
+                        return region;
+                    }
+                    for part in parts.into_iter().flatten() {
+                        let handle = part.create_handle();
+                        if !handle.is_invalid() {
+                            let combined =
+                                CombineRgn(Some(region), Some(region), Some(handle), RGN_OR);
+                            let _ = DeleteObject(handle.into());
+                            if combined != RGN_ERROR {
+                                continue;
+                            }
+                        }
+                        let _ = DeleteObject(region.into());
+                        return HRGN::default();
+                    }
+                    region
                 }
             }
-            let _ = DeleteObject(island.into());
         }
-        HRGN::default()
     }
 }
 
@@ -777,6 +869,9 @@ pub struct MenuBar {
     ghost: bool,
     /// The window region set now, to call `SetWindowRgn` only on change.
     window_region: Option<WindowRegion>,
+    capsule_layout: CapsuleLayout,
+    capsule_layers: Option<[ContainerVisual; 2]>,
+    revealed_sides: RevealedSides,
     island_height: f32,
     /// How many times `place` reserved the strip (tests watch mode changes).
     #[cfg(test)]
@@ -1490,6 +1585,9 @@ impl MenuBar {
             island_hide_until: None,
             ghost: false,
             window_region: None,
+            capsule_layout: CapsuleLayout::default(),
+            capsule_layers: None,
+            revealed_sides: RevealedSides::default(),
             island_height: 0.0,
             #[cfg(test)]
             strip_reservations: 0,
@@ -1613,6 +1711,9 @@ impl MenuBar {
             return Ok(());
         }
         if self.ghost != ghost {
+            if self.widgets.bare {
+                self.panel = None;
+            }
             // Whichever layer animated so far starts over in its resting state.
             self.animation_epoch = self.animation_epoch.wrapping_add(1);
             self.exit_animation = None;
@@ -1644,9 +1745,33 @@ impl MenuBar {
             self.auto_hide,
             self.revealed,
             self.ghost,
-            self.covered,
+            self.covered && !self.zoned(),
             self.triggers_span.width() > 0.0,
         )
+    }
+
+    fn zoned(&self) -> bool {
+        self.ghost && self.widgets.bare
+    }
+
+    fn status_shown(&self) -> bool {
+        self.visible
+            && (!self.auto_hide || self.revealed)
+            && (!self.zoned() || self.revealed_sides.right)
+    }
+
+    fn zone_entrance(&self) -> Span {
+        if self.triggers_span.width() > 0.0 {
+            return self.triggers_span;
+        }
+        // Keep the side controls reachable when neither island widget shows.
+        let width = (self.bounds.right - self.bounds.left) as f32;
+        let scale = (self.bounds.bottom - self.bounds.top) as f32 / HEIGHT;
+        let half_entry = width.min((EMPTY_ISLAND_ENTRY_WIDTH * scale).round()) / 2.0;
+        Span {
+            left: width / 2.0 - half_entry,
+            right: width / 2.0 + half_entry,
+        }
     }
 
     /// What slides and fades when the bar hides: the strip alone with the
@@ -1663,6 +1788,7 @@ impl MenuBar {
     fn apply_hiding(&mut self) -> Result<()> {
         self.auto_hide = self.ghost || self.hide_setting || (self.smart && self.covered);
         self.revealed = false;
+        self.revealed_sides = RevealedSides::default();
         self.hide_until = None;
         // The reserved strip may change even when hiding does not.
         self.place()
@@ -1689,10 +1815,8 @@ impl MenuBar {
             return Ok(());
         }
         self.covered = covered;
-        self.refresh_bare_cover(gfx)?;
         if self.ghost {
-            // The ghost bar always auto-hides: covering it only takes the
-            // island away, and a revealed bar stays until the pointer leaves.
+            // Coverage can hide the island in the original ghost mode.
             return self.place();
         }
         if !self.smart || self.hide_setting {
@@ -1736,17 +1860,6 @@ impl MenuBar {
         self.refresh(gfx)
     }
 
-    fn refresh_bare_cover(&mut self, gfx: &Gfx) -> Result<()> {
-        if self.widgets.bare
-            && (self.presence_now() == Presence::Full || self.hide_until.is_some())
-            && let Some(look) = &self.look
-            && look.covered != self.covered
-        {
-            self.apply_look(gfx, look.clone())?;
-        }
-        Ok(())
-    }
-
     pub fn set_usage_enabled(&mut self, gfx: &Gfx, enabled: bool) -> Result<()> {
         if self.usage.is_some() == enabled {
             return Ok(());
@@ -1782,7 +1895,7 @@ impl MenuBar {
     }
 
     pub fn accessories_changed(&mut self, gfx: &Gfx) -> Result<()> {
-        if self.accessories_enabled && self.visible && (!self.auto_hide || self.revealed) {
+        if self.accessories_enabled && self.status_shown() {
             self.refresh(gfx)?;
         }
         Ok(())
@@ -1799,7 +1912,7 @@ impl MenuBar {
         self.accessories = accessories::Monitor::new(
             self.hwnd.0 as isize,
             ACCESSORIES_CHANGED,
-            self.visible && (!self.auto_hide || self.revealed),
+            self.status_shown(),
         )
         .inspect_err(|error| eprintln!("muelle: accesorios: {error:#}"))
         .ok();
@@ -1807,11 +1920,16 @@ impl MenuBar {
     }
 
     pub fn set_widgets(&mut self, gfx: &Gfx, widgets: MenuBarWidgets) -> Result<()> {
-        if self.widgets == widgets {
-            // The visibility preferences may have updated coverage first.
-            return self.refresh_bare_cover(gfx);
+        let was_zoned = self.look.as_ref().is_some_and(|look| look.zoned);
+        let zoned = self.ghost && widgets.bare;
+        if self.widgets == widgets && was_zoned == zoned {
+            return Ok(());
         }
         self.widgets = widgets;
+        if was_zoned != zoned {
+            self.panel = None;
+            self.apply_hiding()?;
+        }
         self.refresh(gfx)
     }
 
@@ -1838,6 +1956,9 @@ impl MenuBar {
         self.animation_epoch = self.animation_epoch.wrapping_add(1);
         self.exit_animation = None;
         self.revealed = inside;
+        if inside && self.zoned() {
+            self.revealed_sides = RevealedSides::default();
+        }
         self.hide_until = (!inside && animated)
             .then(|| Instant::now() + Duration::from_millis(u64::from(HIDE_FALLBACK_MS)));
         if !animated {
@@ -1854,7 +1975,7 @@ impl MenuBar {
             self.reset_surface()?;
             self.place()?;
         }
-        if inside {
+        if inside && !self.zoned() {
             let mut track = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -2101,6 +2222,31 @@ impl MenuBar {
             && point.y >= self.bounds.bottom
             && point.y < PANEL_BOTTOM.load(Ordering::Relaxed);
         let inside = within_bar || within_island || within_panel;
+        if self.zoned() {
+            if !self.revealed {
+                // Only another dwell over the island can interrupt the exit.
+                return Ok(());
+            }
+            let zone = if within_bar {
+                strip_zone(self.bounds, self.zone_entrance(), point)
+            } else if inside {
+                PointerZone::Center
+            } else {
+                PointerZone::Outside
+            };
+            let Some(sides) = revealed_at(Some(self.revealed_sides), zone) else {
+                return self.hover(gfx, false);
+            };
+            let changed = self.revealed_sides != sides;
+            self.revealed_sides = sides;
+            if self.panel.is_some() && matches!(zone, PointerZone::Left | PointerZone::Right) {
+                return self.dismiss_island(gfx);
+            }
+            if changed {
+                self.place()?;
+            }
+            return Ok(());
+        }
         if inside && self.hide_until.is_some() {
             self.hover(gfx, true)?;
         } else if !inside {
@@ -2114,6 +2260,15 @@ impl MenuBar {
         if let Some(span) = self.volume_drag {
             self.queue_volume(span, y);
             return self.paint_volume_preview(gfx);
+        }
+        if self.zoned() {
+            return self.pointer_left_at(
+                gfx,
+                POINT {
+                    x: self.bounds.left + x as i32,
+                    y: self.bounds.top + y as i32,
+                },
+            );
         }
         if self.ghost && !self.revealed && self.hide_until.is_none() {
             // The edge watcher applies the same dwell to the resting island.
@@ -2167,10 +2322,21 @@ impl MenuBar {
         let island_hiding = self.island_hide_until.is_some();
         let on_screen = show_bar || island_hiding;
         let full = presence == Presence::Full;
-        if let Some(monitor) = &self.accessories {
-            monitor.set_visible(full);
+        let zoned = self.zoned();
+        let sides = if full || hiding {
+            self.revealed_sides
+        } else {
+            RevealedSides::default()
+        };
+        if let Some([left, right]) = &self.capsule_layers {
+            left.SetIsVisible(sides.left)?;
+            right.SetIsVisible(sides.right)?;
         }
-        self.sync_monitor(full);
+        let show_status = self.status_shown();
+        if let Some(monitor) = &self.accessories {
+            monitor.set_visible(show_status);
+        }
+        self.sync_monitor(show_status);
         if !on_screen {
             // Keep the hidden tree transparent. Restoring opacity here races
             // HWND hiding and flashes its last opaque frame on the next show.
@@ -2189,19 +2355,12 @@ impl MenuBar {
         } else if !self.auto_hide {
             self.reset_surface()?;
         }
-        let region = if !hiding && (presence == Presence::IslandOnly || island_hiding) {
-            ghost_region(self.triggers_span, self.island_height).map(|island| WindowRegion {
-                island,
-                strip: None,
-            })
+        let region = if zoned {
+            Some(self.capsule_layout.region(sides))
+        } else if !hiding && (presence == Presence::IslandOnly || island_hiding) {
+            ghost_region(self.triggers_span, self.island_height).map(WindowRegion::Island)
         } else {
-            strip_and_island_region(
-                bounds.right - bounds.left,
-                bar_height,
-                self.triggers_span,
-                self.island_height,
-                self.panel.is_some(),
-            )
+            None
         };
         // An auto-hiding or intelligent bar leaves the whole screen to the
         // windows.
@@ -2217,7 +2376,17 @@ impl MenuBar {
         // a strip along the top edge took the clicks meant for the close
         // button of maximized windows and for browser tabs. The edge watcher
         // watches the pointer instead.
-        let show = if on_screen {
+        let clip_ready = if zoned && region != self.window_region {
+            let installed =
+                install_window_region(self.hwnd, region.map(WindowRegion::create_handle));
+            if installed {
+                self.window_region = region;
+            }
+            installed
+        } else {
+            true
+        };
+        let show = if on_screen && clip_ready {
             SWP_SHOWWINDOW
         } else {
             SWP_HIDEWINDOW
@@ -2233,7 +2402,7 @@ impl MenuBar {
                 self.visual_height,
                 SWP_NOACTIVATE | show,
             )?;
-            if region != self.window_region {
+            if !zoned && region != self.window_region {
                 let handle = region.map(WindowRegion::create_handle);
                 if install_window_region(self.hwnd, handle) {
                     self.window_region = region;
@@ -2249,7 +2418,12 @@ impl MenuBar {
                 // TrackMouseEvent may report a leave immediately after showing
                 // a window. Check real geometry while revealed, including if
                 // no further WM_MOUSEMOVE reaches this window.
-                SetTimer(Some(self.hwnd), POINTER_TIMER, POINTER_CHECK_MS, None);
+                let interval = if zoned {
+                    ZONED_POINTER_CHECK_MS
+                } else {
+                    POINTER_CHECK_MS
+                };
+                SetTimer(Some(self.hwnd), POINTER_TIMER, interval, None);
             } else {
                 let _ = KillTimer(Some(self.hwnd), POINTER_TIMER);
             }
@@ -2275,16 +2449,49 @@ impl MenuBar {
             bottom: bounds.top + self.island_height as i32,
             ..bounds
         });
-        edge_watch::set_menu_bar((self.visible && hidden).then_some(bounds), island);
+        let top = (self.visible && hidden).then(|| {
+            if zoned {
+                let entrance = self.zone_entrance();
+                RECT {
+                    left: bounds.left + entrance.left.floor() as i32,
+                    right: bounds.left + entrance.right.ceil() as i32,
+                    ..bounds
+                }
+            } else {
+                bounds
+            }
+        });
+        edge_watch::set_menu_bar(top, island);
         self.sync_outside_click_hook()
     }
 
     /// The edge watcher has verified the pointer's dwell on this bar.
     pub fn edge_rested(&mut self, gfx: &Gfx, point: POINT) -> Result<()> {
         if self.visible && self.auto_hide && !self.revealed {
+            if self.zoned() {
+                let entrance = RECT {
+                    bottom: self
+                        .bounds
+                        .bottom
+                        .max(self.bounds.top + self.island_height as i32),
+                    ..self.bounds
+                };
+                let zone = strip_zone(entrance, self.zone_entrance(), point);
+                if revealed_at(None, zone).is_none() {
+                    return Ok(());
+                }
+            }
             if muelle_shell::tracker::caption_button_at(point, self.bounds) {
                 edge_watch::retry_on_move(edge_watch::Target::MenuBar);
             } else {
+                if self.zoned()
+                    && self
+                        .island_hits
+                        .iter()
+                        .any(|hit| matches!(hit.action, IslandAction::Toggle(Island::Music)))
+                {
+                    self.panel = Some(Island::Music);
+                }
                 self.hover(gfx, true)?;
             }
         }
@@ -2605,7 +2812,7 @@ impl MenuBar {
             // like its popups, whatever the Windows theme.
             light: appearance.light && !self.widgets.bare,
             glass: appearance.glass,
-            covered: self.widgets.bare && self.covered,
+            zoned: self.zoned(),
             app_name: self.app_name.clone(),
             clock: system::clock_text(),
             input: system::input_language(),
@@ -2736,7 +2943,7 @@ impl MenuBar {
     }
 
     fn apply_look(&mut self, gfx: &Gfx, mut look: Look) -> Result<()> {
-        look.covered = look.widgets.bare && self.covered;
+        look.zoned = self.ghost && look.widgets.bare;
         look.active_providers = look.usage.visible_providers(look.active_providers);
         look.usage_enabled &= look.active_providers.any();
         self.panel = available_panel(look.panel, look.track.is_some(), look.usage_enabled);
@@ -2894,6 +3101,22 @@ impl MenuBar {
             Y: visual_height,
         })?;
         let layers = root.Children()?;
+        self.capsule_layout = CapsuleLayout::default();
+        let (left_layers, right_layers) = if look.zoned {
+            let left = c.CreateContainerVisual()?;
+            let right = c.CreateContainerVisual()?;
+            for side in [&left, &right] {
+                side.SetSize(Vector2::new(width, height))?;
+                side.SetIsVisible(false)?;
+                layers.InsertAtTop(side)?;
+            }
+            let collections = (left.Children()?, right.Children()?);
+            self.capsule_layers = Some([left, right]);
+            collections
+        } else {
+            self.capsule_layers = None;
+            (layers.clone(), layers.clone())
+        };
         // The island has its own root, so the ghost bar can hide the strip
         // while the island stays.
         let island_root = c.CreateContainerVisual()?;
@@ -2933,7 +3156,7 @@ impl MenuBar {
             visual.SetBrush(&item.brush)?;
             if look.widgets.bare {
                 let size = Vector2::new(item.width, item.height);
-                add_halo(c, layers, &item.brush.cast()?, size, offset, scale)?;
+                add_halo(c, layers, &item.brush.cast()?, size, offset, look)?;
             }
             layers.InsertAtTop(&visual)?;
             Ok(visual)
@@ -2950,13 +3173,13 @@ impl MenuBar {
                 ink,
                 px(220.0).min(width * 0.22),
             )?;
-            place(&layers, &name, px(LEFT_MARGIN))?;
+            place(&left_layers, &name, px(LEFT_MARGIN))?;
             left_end += name.width;
         }
 
         // Right side, from the edge inward.
         let slop = px(HIT_SLOP);
-        let right_margin = if look.widgets.bare {
+        let right_margin = if look.zoned {
             BARE_RIGHT_MARGIN
         } else {
             RIGHT_MARGIN
@@ -2976,7 +3199,7 @@ impl MenuBar {
             ));
         }
         items.push((
-            gfx.text_brush(&look.clock, scale, look.widgets.bare, ink)?,
+            gfx.text_brush(&look.clock, scale, look.zoned, ink)?,
             Action::Clock,
         ));
         items.push((gfx.control_center_brush(scale, ink)?, Action::QuickSettings));
@@ -3071,11 +3294,11 @@ impl MenuBar {
                 .find(|(item_index, _)| *item_index == index)
             {
                 right -= label.width;
-                place(&layers, label, right)?;
+                place(&right_layers, label, right)?;
                 right -= px(6.0);
             }
             let left = right - item.width;
-            place(&layers, item, left)?;
+            place(&right_layers, item, left)?;
             // The battery icon and its percentage form one control.
             // Accessory readings are passive status indicators, not controls.
             if *action != Action::AccessoryIndicator {
@@ -3092,7 +3315,7 @@ impl MenuBar {
             } else {
                 &[1, 0]
             };
-            let cpu_ram = if look.widgets.bare {
+            let cpu_ram = if look.zoned {
                 Some(gfx.text_brush_sized(
                     &format!("{} · {}", lines[0], lines[1]),
                     scale,
@@ -3131,7 +3354,7 @@ impl MenuBar {
                     && let Some(brush) = &cpu_ram
                 {
                     left -= self.monitor_widths.combined_cpu_ram;
-                    place(&layers, brush, left)?;
+                    place(&right_layers, brush, left)?;
                     continue;
                 }
                 left -= self.monitor_widths.stacked[column];
@@ -3156,9 +3379,9 @@ impl MenuBar {
                     visual.SetBrush(&brush.brush)?;
                     if look.widgets.bare {
                         let size = Vector2::new(brush.width, brush.height);
-                        add_halo(c, &layers, &brush.brush.cast()?, size, offset, scale)?;
+                        add_halo(c, &right_layers, &brush.brush.cast()?, size, offset, look)?;
                     }
-                    layers.InsertAtTop(&visual)?;
+                    right_layers.InsertAtTop(&visual)?;
                 }
                 if column == 1 {
                     left -= px(MONITOR_COLUMN_GAP);
@@ -3167,6 +3390,43 @@ impl MenuBar {
             self.zones
                 .push((left - slop, zone_right + slop, Action::SystemMonitor));
             right = left - px(ITEM_GAP);
+        }
+
+        if look.zoned {
+            let radius = BARE_ISLAND_RADIUS * scale;
+            if left_end > px(LEFT_MARGIN) {
+                let span = Span {
+                    left: (px(LEFT_MARGIN) - slop).max(0.0),
+                    right: (left_end + slop).min(width),
+                };
+                self.capsule_layout.left = RegionPart::rounded(span, 0.0, height, radius);
+            }
+            let span = Span {
+                left: (right + px(ITEM_GAP) - slop).max(0.0),
+                right: (width - px(right_margin) + slop).min(width),
+            };
+            self.capsule_layout.right = RegionPart::rounded(span, 0.0, height, radius);
+            for (layers, part) in [
+                (&left_layers, self.capsule_layout.left),
+                (&right_layers, self.capsule_layout.right),
+            ] {
+                if let Some(part) = part {
+                    let r = part.rect;
+                    let (fill, _) = retained_rounded_box(
+                        c,
+                        layers,
+                        r.left as f32,
+                        r.top as f32,
+                        (r.right - r.left) as f32,
+                        (r.bottom - r.top) as f32,
+                        part.radius,
+                        BARE_ISLAND,
+                        None,
+                    )?;
+                    layers.Remove(&fill)?;
+                    layers.InsertAtBottom(&fill)?;
+                }
+            }
         }
 
         self.island_hits.clear();
@@ -3298,7 +3558,7 @@ impl MenuBar {
                 look.scale,
                 look.track.is_some(),
                 look.active_providers.count(),
-                look.widgets.bare,
+                look.zoned,
             ),
             IslandStyle::Bubble => bubble_trigger_layout(
                 Span {
@@ -3325,7 +3585,7 @@ impl MenuBar {
                 (
                     island_surface(gfx, look, layers, geometry, height)?,
                     height,
-                    if look.widgets.bare {
+                    if look.zoned {
                         (height - px(BARE_NOTCH_DIVIDER_HEIGHT)) / 2.0
                     } else {
                         px(7.0)
@@ -3338,6 +3598,19 @@ impl MenuBar {
                 (surface, pill_height, px(5.0))
             }
         };
+        if look.zoned {
+            let (top, radius) = match style {
+                IslandStyle::Notch => (0.0, BARE_ISLAND_RADIUS * look.scale),
+                IslandStyle::Bubble => (px(BUBBLE_VERTICAL_INSET), compact_height / 2.0),
+            };
+            self.capsule_layout.island =
+                RegionPart::rounded(self.triggers_span, top, compact_height, radius).map(|part| {
+                    RegionPart {
+                        square_top: style == IslandStyle::Notch,
+                        ..part
+                    }
+                });
+        }
         let divider = music
             .zip(usage)
             .map(|(music, usage)| ((music.right + usage.left) / 2.0).round());
@@ -3438,6 +3711,10 @@ impl MenuBar {
             let height = px(look.panel_height());
             let theme = Theme::for_popup(look.light, look.glass);
             let content = popup_surface(gfx, theme, layers, geometry, height, px(PANEL_RADIUS))?;
+            if look.zoned {
+                self.capsule_layout.panel =
+                    RegionPart::rounded(self.panel_span, geometry.top, height, px(PANEL_RADIUS));
+            }
             match kind {
                 Island::Music => {
                     if let Some(track) = &look.track {
@@ -3454,6 +3731,10 @@ impl MenuBar {
                             span.width() / 2.0,
                         )?;
                         self.draw_volume_capsule(gfx, &volume_content, volume_geometry)?;
+                        if look.zoned {
+                            self.capsule_layout.volume =
+                                RegionPart::rounded(span, geometry.top, height, span.width() / 2.0);
+                        }
                         // Keep the small bridge between surfaces interactive,
                         // so moving towards the volume does not dismiss it.
                         self.panel_span.left = self.panel_span.left.min(span.left);
@@ -4222,7 +4503,7 @@ impl IslandGeometry {
             width: span.width(),
             scale: look.scale,
             light: look.light,
-            bare: look.widgets.bare,
+            bare: look.zoned,
         }
     }
 
@@ -4472,7 +4753,7 @@ fn island_surface(
     island.SetSize(size)?;
     island.SetOffset(Vector3::new(island_left.round(), 0.0, 0.0))?;
     let content = island.Children()?;
-    let silhouette = gfx.island_mask(island_width, island_height, scale, look.widgets.bare)?;
+    let silhouette = gfx.island_mask(island_width, island_height, scale, look.zoned)?;
     content.InsertAtTop(&island_shadow(c, &silhouette.cast()?, size, geometry)?)?;
 
     let tint = match (look.widgets.bare, look.light, look.glass) {
@@ -4554,13 +4835,14 @@ fn bubble_surface(
     bubble.SetOffset(Vector3::new(geometry.left.round(), inset_y, 0.0))?;
     let content = bubble.Children()?;
 
-    let tint = match (look.light, look.glass) {
-        (true, true) => rgba(247, 249, 252, 243),
-        (false, true) => rgba(7, 9, 13, 242),
-        (true, false) => rgba(247, 249, 252, 255),
-        (false, false) => rgba(10, 12, 17, 255),
+    let tint = match (look.zoned, look.light, look.glass) {
+        (true, _, _) => BARE_ISLAND,
+        (false, true, true) => rgba(247, 249, 252, 243),
+        (false, false, true) => rgba(7, 9, 13, 242),
+        (false, true, false) => rgba(247, 249, 252, 255),
+        (false, false, false) => rgba(10, 12, 17, 255),
     };
-    if look.glass {
+    if look.glass && !look.zoned {
         let glass = c.CreateContainerVisual()?;
         glass.SetSize(size)?;
         let outline = c.CreateRoundedRectangleGeometry()?;
@@ -5168,15 +5450,7 @@ mod island_tests {
             for bare in [false, true] {
                 look.glass = glass;
                 look.widgets.bare = bare;
-                for covered in [false, true] {
-                    look.covered = covered;
-                    assert_eq!(
-                        strip_fills(&gfx, &look)?.is_empty(),
-                        bare && !covered,
-                        "glass={glass} bare={bare} covered={covered}"
-                    );
-                }
-                look.covered = false;
+                assert_eq!(strip_fills(&gfx, &look)?.is_empty(), bare);
                 bar.apply_look(&gfx, look.clone())?;
                 let root: ContainerVisual = bar.content_root()?.cast()?;
                 let mut halos = 0;
@@ -5205,17 +5479,6 @@ mod island_tests {
         bar.set_widgets(&gfx, widgets)?;
         assert!(!bar.look.as_ref().context("look")?.light);
         Ok(())
-    }
-
-    #[test]
-    fn only_the_covered_bare_strip_gets_a_veil() {
-        for (bare, covered) in [(false, false), (false, true), (true, false)] {
-            assert!(strip_veil(bare, covered).is_none());
-        }
-        assert_eq!(
-            strip_veil(true, true).map(|color| (color.R, color.G, color.B, color.A)),
-            Some((4, 7, 6, 215)),
-        );
     }
 
     #[test]
@@ -5372,37 +5635,175 @@ mod island_tests {
     }
 
     #[test]
-    fn full_strip_clips_only_the_island_overhang_when_the_panel_is_closed() {
-        let island = Span {
+    fn sides_require_center_entry_and_stay_revealed_until_exit() {
+        let bounds = RECT {
+            left: -1920,
+            top: -30,
+            right: 0,
+            bottom: -2,
+        };
+        let entrance = Span {
             left: 800.0,
             right: 1120.0,
         };
-        let overhang = WindowRegion {
-            island: RECT {
-                left: 800,
-                top: 0,
-                right: 1120,
-                bottom: 30,
-            },
-            strip: Some(RECT {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 28,
-            }),
-        };
-        for (height, panel_open, expected) in [
-            (30.0, false, Some(overhang)),
-            (28.0, false, None),
-            (30.0, true, None),
-            (28.0, true, None),
+        let (left, center, right, below) = (
+            POINT { x: -1121, y: -30 },
+            POINT { x: -1120, y: -30 },
+            POINT { x: -800, y: -30 },
+            POINT { x: -900, y: -2 },
+        );
+        let both = Some(RevealedSides {
+            left: true,
+            right: true,
+        });
+        let center_only = Some(RevealedSides::default());
+        let mut sides = None;
+        for (point, expected) in [
+            (left, None),
+            (right, None),
+            (center, center_only),
+            (
+                right,
+                Some(RevealedSides {
+                    left: false,
+                    right: true,
+                }),
+            ),
+            (
+                center,
+                Some(RevealedSides {
+                    left: false,
+                    right: true,
+                }),
+            ),
+            (left, both),
+            (right, both),
+            (below, None),
+            (left, None),
+            (center, center_only),
+            (
+                left,
+                Some(RevealedSides {
+                    left: true,
+                    right: false,
+                }),
+            ),
         ] {
-            assert_eq!(
-                strip_and_island_region(1920, 28, island, height, panel_open),
-                expected,
-                "island height {height}, panel open {panel_open}"
-            );
+            sides = revealed_at(sides, strip_zone(bounds, entrance, point));
+            assert_eq!(sides, expected, "pointer at {point:?}");
         }
+    }
+
+    #[test]
+    fn ghost_clip_keeps_only_revealed_capsules_and_the_open_controls() {
+        let rounded =
+            |left, right, top, height| RegionPart::rounded(Span { left, right }, top, height, 15.0);
+        let island = rounded(800.0, 1120.0, 0.0, 30.0);
+        let left = rounded(7.0, 140.0, 0.0, 28.0);
+        let right = rounded(1550.0, 1917.0, 0.0, 28.0);
+        let panel = rounded(740.0, 1100.0, 33.0, 180.0);
+        let volume = rounded(1108.0, 1140.0, 33.0, 180.0);
+        let layout = CapsuleLayout {
+            island,
+            left,
+            right,
+            ..CapsuleLayout::default()
+        };
+        for (sides, expected) in [
+            (RevealedSides::default(), [island, None, None, None, None]),
+            (
+                RevealedSides {
+                    left: true,
+                    right: false,
+                },
+                [island, left, None, None, None],
+            ),
+            (
+                RevealedSides {
+                    left: false,
+                    right: true,
+                },
+                [island, None, right, None, None],
+            ),
+            (
+                RevealedSides {
+                    left: true,
+                    right: true,
+                },
+                [island, left, right, None, None],
+            ),
+        ] {
+            assert_eq!(layout.region(sides), WindowRegion::Capsules(expected));
+        }
+        let open = CapsuleLayout {
+            panel,
+            volume,
+            ..layout
+        };
+        assert_eq!(
+            open.region(RevealedSides::default()),
+            WindowRegion::Capsules([island, None, None, panel, volume])
+        );
+        assert_eq!(
+            panel.map(|part| part.rect),
+            Some(RECT {
+                left: 740,
+                top: 33,
+                right: 1100,
+                bottom: 213
+            })
+        );
+        assert_eq!(
+            CapsuleLayout::default().region(RevealedSides::default()),
+            WindowRegion::Capsules([None; 5])
+        );
+    }
+
+    #[test]
+    fn capsule_region_leaves_gaps_and_rounded_corners_click_through() {
+        use windows::Win32::Graphics::Gdi::PtInRegion;
+
+        let island = RegionPart::rounded(
+            Span {
+                left: 800.0,
+                right: 1120.0,
+            },
+            0.0,
+            30.0,
+            15.0,
+        )
+        .map(|part| RegionPart {
+            square_top: true,
+            ..part
+        });
+        let right = RegionPart::rounded(
+            Span {
+                left: 1550.0,
+                right: 1917.0,
+            },
+            0.0,
+            28.0,
+            15.0,
+        );
+        let region = CapsuleLayout {
+            island,
+            right,
+            ..CapsuleLayout::default()
+        }
+        .region(RevealedSides {
+            left: false,
+            right: true,
+        })
+        .create_handle();
+        assert!(!region.is_invalid());
+        // SAFETY: The region is owned by this test and deleted after querying it.
+        let covered = unsafe {
+            let covered = [(800, 0), (800, 29), (1300, 14), (1550, 0), (1700, 14)]
+                .map(|(x, y)| PtInRegion(region, x, y).as_bool());
+            let _ = DeleteObject(region.into());
+            covered
+        };
+        assert_eq!(covered, [true, false, false, false, true]);
     }
 
     #[test]

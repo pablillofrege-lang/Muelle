@@ -92,6 +92,7 @@ const WHITE: D2D1_COLOR_F = D2D1_COLOR_F {
 };
 
 const BARE_USAGE_RING_DIAMETER: f32 = 16.0;
+pub(crate) const BARE_ISLAND_RADIUS: f32 = 15.0;
 
 /// Shared font glyphs belong to drawing code, which is also used by the
 /// standalone diagnostics without a menu bar or application lifecycle.
@@ -1435,7 +1436,11 @@ const fn rgb(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
 }
 
 fn island_radii(width: f32, height: f32, scale: f32, bare: bool) -> (f32, f32) {
-    let (shoulder, corner) = if bare { (0.0, 15.0) } else { (12.0, 22.0) };
+    let (shoulder, corner) = if bare {
+        (0.0, BARE_ISLAND_RADIUS)
+    } else {
+        (12.0, 22.0)
+    };
     let shoulder = (shoulder * scale).min(width / 5.0).min(height / 2.0);
     let corner = (corner * scale)
         .min(width / 2.0 - shoulder)
