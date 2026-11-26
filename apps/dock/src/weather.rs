@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 
 pub const WORKER_FLAG: &str = "--weather-worker";
 const VALID_FOR: Duration = Duration::from_secs(30 * 60);
+/// After a failed query, the next reveal may ask again this soon.
+const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+/// A reading older than this is no longer shown when a query fails.
+const KEEP_FOR: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,15 +105,20 @@ fn parse_forecast(body: &[u8]) -> Option<Reading> {
     })
 }
 
-fn expired(last_attempt: Option<Instant>, now: Instant) -> bool {
-    last_attempt.is_none_or(|last| now.saturating_duration_since(last) >= VALID_FOR)
+/// How long to wait after an attempt before the next one, on reveal only.
+fn due(last_attempt: Option<Instant>, failed: bool, now: Instant) -> bool {
+    let wait = if failed { RETRY_AFTER } else { VALID_FOR };
+    last_attempt.is_none_or(|last| now.saturating_duration_since(last) >= wait)
 }
 
 #[derive(Default)]
 pub struct Cache {
     settings: Weather,
     last_attempt: Option<Instant>,
-    reading: Option<Reading>,
+    /// The last attempt brought nothing: the next reveal retries sooner.
+    failed: bool,
+    /// The last good reading and when it arrived.
+    reading: Option<(Reading, Instant)>,
     pending: Option<Receiver<Option<Reading>>>,
 }
 
@@ -118,58 +127,86 @@ impl Cache {
         if self.settings == settings {
             return false;
         }
-        self.settings = settings;
-        self.reading = None;
-        self.pending = None;
+        // New coordinates, or the weather turned on: ask on the next reveal.
+        *self = Self {
+            settings,
+            ..Self::default()
+        };
         true
     }
 
     pub fn reveal(&mut self) {
-        let now = Instant::now();
-        let Weather {
-            enabled,
-            latitude,
-            longitude,
-        } = self.settings;
-        if !enabled
-            || !(-90.0..=90.0).contains(&latitude)
-            || !(-180.0..=180.0).contains(&longitude)
-            || !expired(self.last_attempt, now)
+        self.reveal_at(Instant::now(), |latitude, longitude| {
+            let (send, receive) = mpsc::channel();
+            thread::Builder::new()
+                .name("muelle-weather".into())
+                .spawn(move || {
+                    let _ = send.send(fetch_in_child(latitude, longitude));
+                })
+                .ok()
+                .map(|_| receive)
+        });
+    }
+
+    fn reveal_at(
+        &mut self,
+        now: Instant,
+        start: impl FnOnce(f64, f64) -> Option<Receiver<Option<Reading>>>,
+    ) {
+        let settings = self.settings;
+        if !settings.enabled
+            || !settings.has_valid_coordinates()
+            || self.pending.is_some()
+            || !due(self.last_attempt, self.failed, now)
         {
             return;
         }
+        // The previous reading stays on screen until the new one arrives.
         self.last_attempt = Some(now);
-        self.reading = None;
-        let (send, receive) = mpsc::channel();
-        if thread::Builder::new()
-            .name("muelle-weather".into())
-            .spawn(move || {
-                let reading = fetch_in_child(latitude, longitude);
-                let _ = send.send(reading);
-            })
-            .is_ok()
-        {
-            self.pending = Some(receive);
-        }
+        self.pending = start(settings.latitude, settings.longitude);
     }
 
     /// Checked by the existing pointer timer, which runs during reveal.
+    /// True when what the capsule shows changed.
     pub fn poll(&mut self) -> bool {
+        self.poll_at(Instant::now())
+    }
+
+    fn poll_at(&mut self, now: Instant) -> bool {
         let Some(pending) = &self.pending else {
             return false;
         };
-        let reading = match pending.try_recv() {
-            Ok(reading) => reading,
+        let fetched = match pending.try_recv() {
+            Ok(fetched) => fetched,
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => None,
         };
         self.pending = None;
-        self.reading = reading;
-        reading.is_some()
+        self.failed = fetched.is_none();
+        match fetched {
+            Some(reading) => {
+                self.reading = Some((reading, now));
+                true
+            }
+            // A failed query keeps a recent reading; an old one goes.
+            None => {
+                let stale = self.reading.is_some() && self.reading_at(now).is_none();
+                if stale {
+                    self.reading = None;
+                }
+                stale
+            }
+        }
     }
 
     pub fn reading(&self) -> Option<Reading> {
+        self.reading_at(Instant::now())
+    }
+
+    fn reading_at(&self, now: Instant) -> Option<Reading> {
         self.reading
+            .filter(|(_, at)| now.saturating_duration_since(*at) < KEEP_FOR)
+            .map(|(reading, _)| reading)
     }
 }
 
@@ -277,10 +314,175 @@ mod tests {
     }
 
     #[test]
-    fn weather_attempt_expires_after_thirty_minutes() {
+    fn weather_attempt_waits_thirty_minutes_or_five_after_a_failure() {
         let started = Instant::now();
-        assert!(expired(None, started));
-        assert!(!expired(Some(started), started + Duration::from_secs(1799)));
-        assert!(expired(Some(started), started + Duration::from_secs(1800)));
+        assert!(due(None, false, started));
+        assert!(!due(
+            Some(started),
+            false,
+            started + Duration::from_secs(1799)
+        ));
+        assert!(due(
+            Some(started),
+            false,
+            started + Duration::from_secs(1800)
+        ));
+        assert!(!due(
+            Some(started),
+            true,
+            started + Duration::from_secs(299)
+        ));
+        assert!(due(Some(started), true, started + Duration::from_secs(300)));
+    }
+
+    const SUNNY: Reading = Reading {
+        condition: Some(Condition::Clear),
+        temperature: 21,
+        high_low: None,
+    };
+
+    /// A cache with coordinates other than the default ones.
+    fn cache() -> Cache {
+        let mut cache = Cache::default();
+        cache.configure(Weather {
+            latitude: 40.0,
+            ..Weather::default()
+        });
+        cache
+    }
+
+    /// The fake queries a cache started, still waiting for an answer.
+    #[derive(Default)]
+    struct Queries {
+        started: u32,
+        waiting: Vec<mpsc::Sender<Option<Reading>>>,
+    }
+
+    impl Queries {
+        /// Reveals at `now`; true when that started a query.
+        fn reveal(&mut self, cache: &mut Cache, now: Instant) -> bool {
+            let before = self.started;
+            cache.reveal_at(now, |_, _| {
+                self.started += 1;
+                let (send, receive) = mpsc::channel();
+                self.waiting.push(send);
+                Some(receive)
+            });
+            self.started > before
+        }
+
+        /// Answers the latest query, as the worker thread would.
+        fn answer(&mut self, reading: Option<Reading>) -> bool {
+            self.waiting
+                .pop()
+                .is_some_and(|send| send.send(reading).is_ok())
+        }
+
+        /// Reveals and answers at once.
+        fn fetch(&mut self, cache: &mut Cache, now: Instant, reading: Option<Reading>) -> bool {
+            self.reveal(cache, now) && self.answer(reading)
+        }
+    }
+
+    #[test]
+    fn reveal_asks_once_per_half_hour_and_keeps_the_reading_meanwhile() {
+        let t0 = Instant::now();
+        let mut cache = cache();
+        let mut queries = Queries::default();
+        assert!(queries.reveal(&mut cache, t0), "the first reveal asks");
+        assert!(!queries.reveal(&mut cache, t0), "one query at a time");
+        assert!(!cache.poll_at(t0), "nothing yet");
+        assert!(queries.answer(Some(SUNNY)));
+        let t1 = t0 + Duration::from_secs(2);
+        assert!(cache.poll_at(t1));
+        assert_eq!(cache.reading_at(t1), Some(SUNNY));
+
+        assert!(!queries.reveal(&mut cache, t0 + Duration::from_secs(29 * 60)));
+        let later = t0 + Duration::from_secs(30 * 60);
+        assert!(queries.reveal(&mut cache, later), "expired");
+        // No blank capsule while the new query runs.
+        assert!(!cache.poll_at(later));
+        assert_eq!(cache.reading_at(later), Some(SUNNY));
+        assert_eq!(queries.started, 2);
+    }
+
+    #[test]
+    fn a_failed_query_keeps_a_recent_reading_and_retries_after_five_minutes() {
+        let t0 = Instant::now();
+        let mut cache = cache();
+        let mut queries = Queries::default();
+        assert!(queries.fetch(&mut cache, t0, Some(SUNNY)));
+        assert!(cache.poll_at(t0));
+
+        let t1 = t0 + Duration::from_secs(30 * 60);
+        assert!(queries.fetch(&mut cache, t1, None));
+        assert!(!cache.poll_at(t1), "the capsule keeps what it shows");
+        assert_eq!(cache.reading_at(t1), Some(SUNNY));
+        assert!(!queries.reveal(&mut cache, t1 + Duration::from_secs(299)));
+        let t2 = t1 + Duration::from_secs(300);
+        assert!(queries.reveal(&mut cache, t2), "retried sooner");
+        // A worker thread that dies without answering fails as well.
+        queries.waiting.clear();
+        assert!(!cache.poll_at(t2));
+        assert_eq!(cache.reading_at(t2), Some(SUNNY));
+
+        // Past two hours a failure no longer shows the old reading.
+        let t3 = t0 + Duration::from_secs(2 * 60 * 60);
+        assert!(queries.fetch(&mut cache, t3, None));
+        assert!(cache.poll_at(t3), "the stale reading goes");
+        assert_eq!(cache.reading_at(t3), None);
+        assert_eq!(queries.started, 4);
+
+        // A success returns to the half-hour rhythm.
+        let t4 = t3 + Duration::from_secs(300);
+        assert!(queries.fetch(&mut cache, t4, Some(SUNNY)));
+        assert!(cache.poll_at(t4));
+        assert!(!queries.reveal(&mut cache, t4 + Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn configure_forgets_the_reading_and_asks_on_the_next_reveal() {
+        let t0 = Instant::now();
+        let mut cache = cache();
+        let mut queries = Queries::default();
+        assert!(queries.fetch(&mut cache, t0, Some(SUNNY)));
+        assert!(cache.poll_at(t0));
+        let settings = cache.settings;
+        assert!(!cache.configure(settings), "unchanged");
+        assert_eq!(cache.reading_at(t0), Some(SUNNY));
+
+        assert!(cache.configure(Weather {
+            longitude: -3.0,
+            ..settings
+        }));
+        assert_eq!(cache.reading_at(t0), None);
+        let moved = t0 + Duration::from_secs(60);
+        assert!(queries.reveal(&mut cache, moved), "no half-hour wait");
+
+        // Off, nothing is asked; turned back on, the next reveal asks.
+        let off = Weather {
+            enabled: false,
+            ..cache.settings
+        };
+        assert!(cache.configure(off));
+        assert!(!queries.reveal(&mut cache, moved));
+        assert!(cache.configure(Weather {
+            enabled: true,
+            ..off
+        }));
+        assert!(queries.reveal(&mut cache, moved));
+        assert_eq!(queries.started, 3);
+    }
+
+    #[test]
+    fn coordinates_out_of_range_never_start_a_query() {
+        let mut cache = Cache::default();
+        cache.configure(Weather {
+            latitude: 91.0,
+            ..Weather::default()
+        });
+        let mut queries = Queries::default();
+        assert!(!queries.reveal(&mut cache, Instant::now()));
+        assert_eq!(queries.started, 0);
     }
 }

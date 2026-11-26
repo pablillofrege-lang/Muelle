@@ -188,6 +188,14 @@ impl Default for Weather {
     }
 }
 
+impl Weather {
+    /// Latitude and longitude a forecast can be asked for.
+    #[must_use]
+    pub fn has_valid_coordinates(&self) -> bool {
+        (-90.0..=90.0).contains(&self.latitude) && (-180.0..=180.0).contains(&self.longitude)
+    }
+}
+
 /// Pinned apps the user gathered in one dock icon by dropping one on
 /// another. Its `id` stands for it in `pinned`, in its place.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1055,7 +1063,23 @@ mod tests {
         );
         let round_trip: Config = serde_json::from_str(&serde_json::to_string(&updated)?)?;
         assert_eq!(round_trip.weather, updated.weather);
+        assert!(legacy.weather.has_valid_coordinates());
+        assert!(updated.weather.has_valid_coordinates());
         Ok(())
+    }
+
+    #[test]
+    fn weather_coordinates_out_of_range_are_flagged() {
+        let at = |latitude, longitude| Weather {
+            enabled: true,
+            latitude,
+            longitude,
+        };
+        assert!(at(90.0, -180.0).has_valid_coordinates());
+        assert!(at(-90.0, 180.0).has_valid_coordinates());
+        assert!(!at(90.1, 0.0).has_valid_coordinates());
+        assert!(!at(0.0, -180.5).has_valid_coordinates());
+        assert!(!at(f64::NAN, 0.0).has_valid_coordinates());
     }
 
     #[test]
