@@ -230,7 +230,9 @@ pub struct MenuBarWidgets {
 const HALO: [(f32, f32, u8); 3] = [(1.5, 0.0, 230), (4.0, 1.0, 170), (12.0, 0.0, 140)];
 
 const BARE_NOTCH_EXTRA_HEIGHT: f32 = 2.0;
+const BARE_NOTCH_DIVIDER_HEIGHT: f32 = 14.0;
 const BARE_VEIL_ALPHA: u8 = 215;
+const BARE_MONITOR_FONT_SIZE: f32 = 12.5;
 const BARE_PLAYER_WIDTH: f32 = 152.0;
 const BARE_PLAYER_COVER_INSET: f32 = 14.0;
 const BARE_PLAYER_TITLE_GAP: f32 = 6.0;
@@ -3094,7 +3096,7 @@ impl MenuBar {
                 Some(gfx.text_brush_sized(
                     &format!("{} · {}", lines[0], lines[1]),
                     scale,
-                    12.5,
+                    BARE_MONITOR_FONT_SIZE,
                     false,
                     ink,
                 )?)
@@ -3324,7 +3326,7 @@ impl MenuBar {
                     island_surface(gfx, look, layers, geometry, height)?,
                     height,
                     if look.widgets.bare {
-                        (height - px(14.0)) / 2.0
+                        (height - px(BARE_NOTCH_DIVIDER_HEIGHT)) / 2.0
                     } else {
                         px(7.0)
                     },
