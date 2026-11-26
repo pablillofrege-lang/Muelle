@@ -18,10 +18,10 @@
 
 **Archivos.** `apps/dock/src/main.rs` y `apps/dock/src/desktop_layer_probe.rs` si se conserva una prueba nativa ignorada. Si la prueba se ejecuta fuera del árbol, retirar su código al terminar.
 
-- [ ] Identificar la sesión de Explorer y verificar que el escritorio interactivo está desbloqueado antes de capturar.
-- [ ] Crear una hija sin activación ni entrada, justo debajo de `SHELLDLL_DefView` dentro de `Progman`. Dibujar una muestra semitransparente con DirectComposition.
-- [ ] Comparar los píxeles con el fondo antes y después de Win+D. Cubrir la muestra con una ventana normal y verificar que el clic llega a la capa inferior.
-- [ ] Si falla, repetir el mismo ensayo con `WS_EX_LAYERED` y `UpdateLayeredWindow`. Si fallan ambas variantes, detener F3 y presentar los resultados a Pablo antes de considerar `HWND_BOTTOM`.
+- [x] Explorer y la prueba estaban en la sesión 2. `OpenInputDesktop` devolvió `Default` y `LogonUI` estaba ausente.
+- [x] Una hija deshabilitada y sin activación quedó justo debajo de `SHELLDLL_DefView`. El primer ensayo creó `WorkerW` con `0x052C`. La muestra se compuso mediante `ICompositorDesktopInterop`.
+- [x] La prueba nativa terminó con código 0. El píxel de fondo (`0c1600`, COLORREF) se mezcló con la muestra (`860b80`) y se mantuvo tras Win+D. La ventana de control cubrió la muestra. El clic mantuvo el mismo destino que con el fondo solo y la hija recibió cero.
+- [x] DirectComposition aprobó la puerta de entrada. El respaldo `WS_EX_LAYERED` no fue necesario. Se conservaron las capturas y se retiró el programa de prueba.
 
 ### Tarea 2 · Preferencias compatibles
 
