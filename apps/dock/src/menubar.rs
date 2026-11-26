@@ -2249,6 +2249,7 @@ impl MenuBar {
         let island = (presence == Presence::IslandOnly).then(|| RECT {
             left: bounds.left + self.triggers_span.left.floor() as i32,
             right: bounds.left + self.triggers_span.right.ceil() as i32,
+            bottom: bounds.top + self.island_height as i32,
             ..bounds
         });
         edge_watch::set_menu_bar((self.visible && hidden).then_some(bounds), island);
