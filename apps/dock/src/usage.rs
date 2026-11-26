@@ -106,7 +106,6 @@ impl ProviderUsage {
 
     /// The window closest to running out: the highest `used_percent`, the
     /// first one on a tie (the shortest, which providers list first).
-    #[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
     pub fn worst_window(&self) -> Option<&Window> {
         self.windows.iter().fold(None, |worst, window| match worst {
             Some(current) if window.used_percent <= current.used_percent => Some(current),
@@ -116,7 +115,6 @@ impl ProviderUsage {
 
     /// Alert level of the worst window. Only a `Ready` reading counts: a
     /// provider that is loading, signed out or unavailable is `Normal`.
-    #[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
     pub fn alert_level(&self) -> Level {
         match (self.state, self.worst_window()) {
             (State::Ready, Some(window)) => level(window.used_percent),
@@ -127,7 +125,6 @@ impl ProviderUsage {
 
 /// How close a limit is to running out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
 pub enum Level {
     Normal,
     Warn,
@@ -135,7 +132,6 @@ pub enum Level {
 }
 
 /// `<80` normal, `80..=94` warn, `>=95` critical (Codex can report over 100).
-#[allow(dead_code)] // lo usa la isla en las Tareas 3-5 de F2; quitar al conectarlo
 pub fn level(percent: u8) -> Level {
     match percent {
         0..=79 => Level::Normal,

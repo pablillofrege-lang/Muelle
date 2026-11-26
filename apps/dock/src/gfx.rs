@@ -405,7 +405,7 @@ impl Gfx {
                         ),
                         None,
                     )?;
-                    let steps = usize::from(percent) * 36 / 100;
+                    let steps = usize::from(percent.min(100)) * 36 / 100;
                     for index in 0..steps {
                         let start = -std::f32::consts::FRAC_PI_2
                             + index as f32 * std::f32::consts::TAU / 36.0;
@@ -959,7 +959,26 @@ impl Gfx {
         bold: bool,
         ink: Ink,
     ) -> Result<LabelBrush> {
-        self.draw_text_brush(text, scale, font_size, bold, ink, None)
+        self.draw_text_brush(text, scale, font_size, bold, ink.color(), None)
+    }
+
+    /// `text_brush_sized` in an exact color (the alert colors of the usage
+    /// island); its alpha is the text's opacity.
+    pub fn text_brush_tinted(
+        &self,
+        text: &str,
+        scale: f32,
+        font_size: f32,
+        bold: bool,
+        tint: Color,
+    ) -> Result<LabelBrush> {
+        let color = rgb(
+            f32::from(tint.R) / 255.0,
+            f32::from(tint.G) / 255.0,
+            f32::from(tint.B) / 255.0,
+            f32::from(tint.A) / 255.0,
+        );
+        self.draw_text_brush(text, scale, font_size, bold, color, None)
     }
 
     /// Single line, elided to the available physical width.
@@ -972,7 +991,7 @@ impl Gfx {
         ink: Ink,
         max_width: f32,
     ) -> Result<LabelBrush> {
-        self.draw_text_brush(text, scale, font_size, bold, ink, Some(max_width))
+        self.draw_text_brush(text, scale, font_size, bold, ink.color(), Some(max_width))
     }
 
     fn draw_text_brush(
@@ -981,7 +1000,7 @@ impl Gfx {
         scale: f32,
         font_size: f32,
         bold: bool,
-        ink: Ink,
+        color: D2D1_COLOR_F,
         fitted: Option<f32>,
     ) -> Result<LabelBrush> {
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
@@ -1038,7 +1057,7 @@ impl Gfx {
         let brush = self.draw(width as u32, height as u32, |dc| {
             // SAFETY: The brush and layout live for the drawing call.
             unsafe {
-                let ink = dc.CreateSolidColorBrush(&ink.color(), None)?;
+                let ink = dc.CreateSolidColorBrush(&color, None)?;
                 dc.DrawTextLayout(
                     Vector2 { X: 0.0, Y: 0.0 },
                     &layout,

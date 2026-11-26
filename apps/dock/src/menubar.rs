@@ -86,7 +86,8 @@ use crate::{
     scene::Theme,
     strings,
     usage::{
-        self, ActiveProviders, Monitor as UsageMonitor, Provider, ProviderUsage, Snapshot, State,
+        self, ActiveProviders, Level, Monitor as UsageMonitor, Provider, ProviderUsage, Snapshot,
+        State, Window,
     },
     weather,
 };
@@ -1412,6 +1413,7 @@ fn draw_usage_row(
     accent: Color,
     scale: f32,
     light: bool,
+    ai_alerts: bool,
     island_width: f32,
     y: f32,
 ) -> Result<()> {
@@ -1467,7 +1469,9 @@ fn draw_usage_row(
         ink,
         1.0,
     )?;
-    if let Some(main) = usage.main_window() {
+    if let Some(main) = shown_window(usage, ai_alerts) {
+        let level = shown_level(usage, ai_alerts);
+        let accent = alert_ink(level, accent);
         add_panel_text(
             gfx,
             layers,
@@ -1480,18 +1484,32 @@ fn draw_usage_row(
             ink,
             0.72,
         )?;
-        add_panel_text_right(
-            gfx,
-            layers,
-            &format!("{}%", main.used_percent),
-            right - px(14.0),
-            y + px(6.0),
-            scale,
-            20.0,
-            true,
-            ink,
-            1.0,
-        )?;
+        let percent = format!("{}%", main.used_percent);
+        if level == Level::Normal {
+            add_panel_text_right(
+                gfx,
+                layers,
+                &percent,
+                right - px(14.0),
+                y + px(6.0),
+                scale,
+                20.0,
+                true,
+                ink,
+                1.0,
+            )?;
+        } else {
+            let label = gfx.text_brush_tinted(&percent, scale, 20.0, true, accent)?;
+            add_visual(
+                c,
+                layers,
+                &label.brush.cast()?,
+                right - px(14.0) - label.width,
+                y + px(6.0),
+                label.width,
+                label.height,
+            )?;
+        }
         add_panel_text_right(
             gfx,
             layers,
@@ -1522,7 +1540,13 @@ fn draw_usage_row(
             },
             None,
         )?;
-        let fill = track_width * f32::from(main.used_percent) / 100.0;
+        // Codex can report over 100 %: with alerts the bar stops at full.
+        let filled = if ai_alerts {
+            main.used_percent.min(100)
+        } else {
+            main.used_percent
+        };
+        let fill = track_width * f32::from(filled) / 100.0;
         if fill > 0.0 {
             add_rounded_box(
                 c,
@@ -1566,7 +1590,11 @@ fn draw_usage_row(
                 0.7,
             )?;
         }
-        for (index, secondary) in usage.windows.iter().skip(1).enumerate() {
+        let others = usage
+            .windows
+            .iter()
+            .filter(|window| !std::ptr::eq(*window, main));
+        for (index, secondary) in others.enumerate() {
             add_visual(
                 c,
                 layers,
@@ -4126,6 +4154,7 @@ impl MenuBar {
                 *accent,
                 scale,
                 look.light,
+                look.widgets.ai_alerts,
                 island_width,
                 y,
             )?;
@@ -4767,6 +4796,8 @@ struct IslandGeometry {
     scale: f32,
     light: bool,
     bare: bool,
+    /// `MenuBarWidgets::ai_alerts`: the island shows the worst limit, in color.
+    ai_alerts: bool,
 }
 
 impl IslandGeometry {
@@ -4778,6 +4809,7 @@ impl IslandGeometry {
             scale: look.scale,
             light: look.light,
             bare: look.zoned,
+            ai_alerts: look.widgets.ai_alerts,
         }
     }
 
@@ -4951,6 +4983,82 @@ fn bubble_panel_span(anchor: Span, screen_width: f32, desired: f32) -> Span {
 }
 
 type IslandProvider<'a> = (Provider, &'a ProviderUsage, Color);
+
+/// Amber from 80 % and red from 95 % of the limit closest to running out.
+pub(crate) const ALERT_WARN: Color = Color {
+    A: 255,
+    R: 0xf6,
+    G: 0xb7,
+    B: 0x3c,
+};
+pub(crate) const ALERT_CRITICAL: Color = Color {
+    A: 255,
+    R: 0xff,
+    G: 0x5a,
+    B: 0x4a,
+};
+
+/// The color of a figure at `level`: the provider's own until 80 %.
+fn alert_ink(level: Level, accent: Color) -> Color {
+    match level {
+        Level::Normal => accent,
+        Level::Warn => ALERT_WARN,
+        Level::Critical => ALERT_CRITICAL,
+    }
+}
+
+/// The limit the island and the panel show for a provider: the first one,
+/// as always, or with `ai_alerts` the one closest to running out.
+fn shown_window(usage: &ProviderUsage, ai_alerts: bool) -> Option<&Window> {
+    if ai_alerts {
+        usage.worst_window()
+    } else {
+        usage.main_window()
+    }
+}
+
+/// "NN%" of `shown_window`, or a dash with no reading.
+fn shown_text(usage: &ProviderUsage, ai_alerts: bool) -> String {
+    if ai_alerts {
+        shown_window(usage, true).map_or_else(
+            || "—".to_owned(),
+            |window| format!("{}%", window.used_percent),
+        )
+    } else {
+        usage.compact_text()
+    }
+}
+
+/// Without `ai_alerts` nothing is ever colored.
+fn shown_level(usage: &ProviderUsage, ai_alerts: bool) -> Level {
+    if ai_alerts {
+        usage.alert_level()
+    } else {
+        Level::Normal
+    }
+}
+
+/// A figure's label: the bar's ink while normal, amber or red when the limit
+/// nears.
+fn usage_label(
+    gfx: &Gfx,
+    text: &str,
+    scale: f32,
+    font_size: f32,
+    ink: Ink,
+    level: Level,
+) -> Result<LabelBrush> {
+    match level {
+        Level::Normal => gfx.text_brush_sized(text, scale, font_size, true, ink),
+        _ => gfx.text_brush_tinted(
+            text,
+            scale,
+            font_size,
+            true,
+            alert_ink(level, rgba(0, 0, 0, 255)),
+        ),
+    }
+}
 
 fn island_providers(look: &Look) -> Vec<IslandProvider<'_>> {
     Provider::ALL
@@ -5240,6 +5348,7 @@ fn draw_compact_usage(
         });
     let ring_size = Gfx::usage_ring_size(scale, bare);
     let max_gap = px(BARE_PROVIDER_ITEM_GAP);
+    let alerts = geometry.ai_alerts;
     let show_labels = if bare { with_ring } else { half > px(106.0) };
     let mut labels = [const { None }; Provider::COUNT];
     if show_labels {
@@ -5252,7 +5361,14 @@ fn draw_compact_usage(
             } else {
                 12.0
             };
-            let label = gfx.text_brush_sized(&usage.compact_text(), scale, font, true, ink)?;
+            let label = usage_label(
+                gfx,
+                &shown_text(usage, alerts),
+                scale,
+                font,
+                ink,
+                shown_level(usage, alerts),
+            )?;
             let reserve = if bare {
                 icon_size as f32 + ring_size
             } else {
@@ -5342,9 +5458,9 @@ fn draw_compact_usage(
         }
         if with_ring {
             let ring = gfx.usage_ring(
-                usage.main_window().map(|window| window.used_percent),
+                shown_window(usage, alerts).map(|window| window.used_percent),
                 scale,
-                *accent,
+                alert_ink(shown_level(usage, alerts), *accent),
                 bare,
             )?;
             let x = if bare {
@@ -5402,9 +5518,10 @@ fn draw_bubble_usage(
     for (index, (provider, usage, _accent)) in providers.iter().enumerate() {
         let slot_left = inset + index as f32 * slot;
         anchors.push((*provider, slot_left + slot / 2.0));
-        let percent = usage.compact_text();
+        let alerts = geometry.ai_alerts;
+        let percent = shown_text(usage, alerts);
         let label = if slot >= px(44.0) {
-            let label = gfx.text_brush_sized(&percent, scale, 11.5, true, ink)?;
+            let label = usage_label(gfx, &percent, scale, 11.5, ink, shown_level(usage, alerts))?;
             (label.width + icon_size as f32 + gap <= slot).then_some(label)
         } else {
             None
@@ -7746,6 +7863,61 @@ mod island_tests {
         Ok(())
     }
 
+    fn window(minutes: i64, used_percent: u8) -> usage::Window {
+        usage::Window {
+            label: None,
+            minutes,
+            used_percent,
+            resets_at: None,
+        }
+    }
+
+    #[test]
+    fn alert_ink_keeps_the_brand_color_until_the_limit_nears() {
+        let accent = rgba(217, 119, 87, 255);
+        assert_eq!(alert_ink(usage::Level::Normal, accent), accent);
+        assert_eq!(alert_ink(usage::Level::Warn, accent), ALERT_WARN);
+        assert_eq!(alert_ink(usage::Level::Critical, accent), ALERT_CRITICAL);
+        assert_eq!(ALERT_WARN, rgba(0xf6, 0xb7, 0x3c, 255));
+        assert_eq!(ALERT_CRITICAL, rgba(0xff, 0x5a, 0x4a, 255));
+    }
+
+    #[test]
+    fn the_island_shows_the_first_window_or_the_worst_one_with_alerts() {
+        let usage = ProviderUsage {
+            state: State::Ready,
+            windows: vec![window(300, 30), window(10_080, 96)],
+            fetched_at: None,
+        };
+        assert_eq!(
+            shown_window(&usage, false).map(|w| w.minutes),
+            Some(300),
+            "without alerts: today's main window"
+        );
+        assert_eq!(shown_window(&usage, true).map(|w| w.minutes), Some(10_080));
+        assert_eq!(shown_text(&usage, false), "30%");
+        assert_eq!(shown_text(&usage, true), "96%");
+        assert_eq!(shown_text(&ProviderUsage::default(), true), "—");
+    }
+
+    #[test]
+    fn only_a_ready_provider_is_colored_by_its_level() {
+        let windows = vec![window(300, 97)];
+        let ready = ProviderUsage {
+            state: State::Ready,
+            windows: windows.clone(),
+            fetched_at: None,
+        };
+        let stale = ProviderUsage {
+            state: State::Unavailable,
+            windows,
+            fetched_at: None,
+        };
+        assert_eq!(shown_level(&ready, true), usage::Level::Critical);
+        assert_eq!(shown_level(&ready, false), usage::Level::Normal);
+        assert_eq!(shown_level(&stale, true), usage::Level::Normal);
+    }
+
     #[test]
     fn clicking_usage_replaces_music_and_clicking_again_closes_it() {
         let open = toggle_panel(Some(Island::Music), Island::Usage);
@@ -7881,6 +8053,7 @@ mod island_tests {
                 scale: 1.0,
                 light,
                 bare: false,
+                ai_alerts: false,
             };
             popup_surface(
                 &gfx,
