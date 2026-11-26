@@ -228,6 +228,8 @@ pub struct MenuBarWidgets {
     /// No background (`Config::menu_bar_bare`): a clear strip over the desktop,
     /// white text and icons with a dark halo, and an opaque black island.
     pub bare: bool,
+    /// AI limit alerts (`Config::menu_bar_ai_alerts`).
+    pub ai_alerts: bool,
 }
 
 /// The halo under text and icons without a background: (blur, Y offset,
@@ -318,6 +320,7 @@ impl Default for MenuBarWidgets {
             system_monitor: false,
             essentials: false,
             bare: false,
+            ai_alerts: false,
         }
     }
 }

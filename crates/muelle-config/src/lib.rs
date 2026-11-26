@@ -129,6 +129,10 @@ pub struct Config {
     /// widgets, hidden-icons arrow or notifications bell. Off by default: off,
     /// every chosen item shows.
     pub menu_bar_essentials: bool,
+    /// AI limit alerts in the island: amber from 80 %, red from 95 % with the
+    /// time the limit returns. Off by default: off, the island shows the main
+    /// window's usage as always.
+    pub menu_bar_ai_alerts: bool,
     /// Opt-in peripheral monitoring. Off means no accessory reader or queries.
     pub accessory_battery: bool,
     /// The dot under apps that have windows open.
@@ -429,6 +433,7 @@ impl Default for Config {
             menu_bar_system_monitor: false,
             menu_bar_ghost: false,
             menu_bar_bare: false,
+            menu_bar_ai_alerts: false,
             menu_bar_essentials: false,
             menu_bar_clock_target: None,
             weather: Weather::default(),
@@ -1030,8 +1035,12 @@ mod tests {
     fn the_fork_menu_bar_options_are_off_unless_chosen() -> Result<(), serde_json::Error> {
         let fresh = Config::default();
         assert!(!fresh.menu_bar_ghost && !fresh.menu_bar_bare && !fresh.menu_bar_essentials);
+        assert!(!fresh.menu_bar_ai_alerts);
         let older: Config = serde_json::from_str("{}")?;
         assert!(!older.menu_bar_ghost && !older.menu_bar_bare && !older.menu_bar_essentials);
+        assert!(!older.menu_bar_ai_alerts);
+        let alerts: Config = serde_json::from_str(r#"{"menuBarAiAlerts":true}"#)?;
+        assert!(alerts.menu_bar_ai_alerts);
         let chosen: Config = serde_json::from_str(
             r#"{"menuBarGhost":true,"menuBarBare":true,"menuBarEssentials":true}"#,
         )?;

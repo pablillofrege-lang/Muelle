@@ -76,6 +76,8 @@
   "menuBarHidingGhostHint": "En reposo solo se ve la isla con la música y el uso de IA. El resto aparece al acercar el puntero al borde superior. Con una ventana maximizada también se oculta la isla, y en pantalla completa no aparece nada.",
   "menuBarBare": "Sin fondo",
   "menuBarBareHint": "Sin franja detrás de la barra: texto e iconos blancos con un halo oscuro, directamente sobre el fondo de escritorio. La isla sigue siendo negra.",
+  "menuBarAiAlerts": "Avisos de límite de IA",
+  "menuBarAiAlertsHint": "Ámbar al 80 %, rojo y hora de vuelta al 95 %",
   "menuBarEssentials": "Solo lo esencial",
   "menuBarEssentialsHint": "Quita la velocidad de red, la búsqueda, la vista de tareas, los widgets, la flecha de iconos ocultos y la campana de notificaciones.",
   "clockTarget": "El reloj abre",

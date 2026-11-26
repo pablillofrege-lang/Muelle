@@ -344,6 +344,7 @@ impl App {
             system_monitor: self.config.menu_bar_system_monitor,
             essentials: self.config.menu_bar_essentials,
             bare: self.config.menu_bar_bare,
+            ai_alerts: self.config.menu_bar_ai_alerts,
         };
         if !self.config.menu_bar {
             self.menubar = None;

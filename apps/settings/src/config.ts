@@ -52,6 +52,8 @@ export interface Config {
   menuBarGhost?: boolean;
   /** No strip behind the bar: white text and icons with a dark halo. */
   menuBarBare?: boolean;
+  /** Amber from 80 %, red from 95 % with the time the AI limit returns. */
+  menuBarAiAlerts?: boolean;
   /** Hides network speed and the Windows shell buttons. */
   menuBarEssentials?: boolean;
   showIndicators: boolean;

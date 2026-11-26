@@ -76,6 +76,8 @@
   "menuBarHidingGhostHint": "At rest only the island with music and AI usage shows. The rest appears when the pointer reaches the top edge. A maximized window hides the island too; nothing shows over full-screen apps.",
   "menuBarBare": "No background",
   "menuBarBareHint": "No strip behind the bar: white text and icons with a dark halo, right on the wallpaper. The island stays black.",
+  "menuBarAiAlerts": "AI limit alerts",
+  "menuBarAiAlertsHint": "Amber at 80 %, red with the time it returns at 95 %",
   "menuBarEssentials": "Essentials only",
   "menuBarEssentialsHint": "Hides network speed, search, Task View, widgets, the hidden-icons arrow and the notifications bell.",
   "clockTarget": "النقر على الساعة يفتح",

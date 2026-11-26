@@ -232,7 +232,7 @@ test("retired Windows status-item overrides expose no controls and create no sav
         texts[language].menuBarMusic, texts[language].aiUsage,
         texts[language].accessoryBattery, texts[language].menuBarSystemMonitor,
         texts[language].menuBarNotifications, texts[language].menuBarBare,
-        texts[language].menuBarEssentials]);
+        texts[language].menuBarAiAlerts, texts[language].menuBarEssentials]);
       view.fire(60);
       await settle();
       assert.deepEqual(view.calls, []);
@@ -401,10 +401,11 @@ test("ghost mode is a fourth visibility choice and both new switches save", asyn
     view.change(texts.en.menuBarHidingMode, "ghost");
     view.change(texts.en.menuBarBare, true);
     view.change(texts.en.menuBarEssentials, true);
+    view.change(texts.en.menuBarAiAlerts, true);
     view.fire(60);
     await settle();
     assert.deepEqual(view.calls, [{ menuBarAutoHide: false, menuBarSmartHide: false,
-      menuBarGhost: true, menuBarBare: true, menuBarEssentials: true }]);
+      menuBarGhost: true, menuBarBare: true, menuBarEssentials: true, menuBarAiAlerts: true }]);
     assert.equal(texts.es.menuBarHidingGhost, "Fantasma (solo la isla)");
   } finally { unmount(); }
 });

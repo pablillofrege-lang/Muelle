@@ -697,6 +697,13 @@ export function App() {
                     onChange={(menuBarBare) => update({ menuBarBare })}
                   />
                 </SubRow>
+                <SubRow label={t.menuBarAiAlerts} hint={t.menuBarAiAlertsHint} open={config.menuBar}>
+                  <Toggle
+                    label={t.menuBarAiAlerts}
+                    checked={config.menuBarAiAlerts ?? false}
+                    onChange={(menuBarAiAlerts) => update({ menuBarAiAlerts })}
+                  />
+                </SubRow>
                 <SubRow label={t.menuBarEssentials} hint={t.menuBarEssentialsHint} open={config.menuBar}>
                   <Toggle
                     label={t.menuBarEssentials}
