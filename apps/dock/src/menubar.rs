@@ -429,7 +429,7 @@ enum Island {
     Usage,
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Span {
     left: f32,
     right: f32,
@@ -5367,6 +5367,67 @@ mod island_tests {
             );
         }
         assert_eq!(ghost_region(Span::default(), 28.0), None);
+    }
+
+    #[test]
+    fn full_strip_clips_only_the_island_overhang_when_the_panel_is_closed() {
+        let island = Span {
+            left: 800.0,
+            right: 1120.0,
+        };
+        let overhang = WindowRegion {
+            island: RECT {
+                left: 800,
+                top: 0,
+                right: 1120,
+                bottom: 30,
+            },
+            strip: Some(RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 28,
+            }),
+        };
+        for (height, panel_open, expected) in [
+            (30.0, false, Some(overhang)),
+            (28.0, false, None),
+            (30.0, true, None),
+            (28.0, true, None),
+        ] {
+            assert_eq!(
+                strip_and_island_region(1920, 28, island, height, panel_open),
+                expected,
+                "island height {height}, panel open {panel_open}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_crosses_from_the_island_to_the_wider_panel() {
+        let island = Span {
+            left: 800.0,
+            right: 1120.0,
+        };
+        let panel = Span {
+            left: 760.0,
+            right: 1160.0,
+        };
+        for (x, y, height, expected) in [
+            (780.0, 27.0, 30.0, island),
+            (799.0, 28.0, 30.0, panel),
+            (800.0, 28.0, 30.0, island),
+            (1119.0, 29.0, 30.0, island),
+            (1120.0, 29.0, 30.0, panel),
+            (960.0, 30.0, 30.0, panel),
+            (960.0, 28.0, 28.0, panel),
+        ] {
+            assert_eq!(
+                island_or_panel_span(x, y, 28.0, height, island, panel),
+                expected,
+                "point ({x}, {y}), island height {height}"
+            );
+        }
     }
 
     #[test]
