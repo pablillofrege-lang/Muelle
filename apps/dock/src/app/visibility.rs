@@ -3,12 +3,13 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use muelle_config::DockPosition;
+use muelle_config::{Config, DockPosition};
 use muelle_core::{frame::DockEdge, layout::Rect, spring::Spring};
 use muelle_shell::{
     appbar::ABN_FULLSCREENAPP,
     system::{Monitor, monitor_at, monitor_rects, primary_monitor},
-    taskbar, tracker,
+    taskbar,
+    tracker::{self, TrackedWindow},
 };
 use windows::Win32::{
     Foundation::{HWND, POINT, RECT},
@@ -57,6 +58,31 @@ pub(super) fn rects_overlap(a: RECT, b: RECT) -> bool {
         && b.left < a.right
         && a.top < b.bottom
         && b.top < a.bottom
+}
+
+pub(super) fn current_menu_bar_cover(
+    config: &Config,
+    windows: &[TrackedWindow],
+    front: isize,
+    fullscreen: bool,
+    bar: RECT,
+) -> bool {
+    let front_rect = windows
+        .iter()
+        .any(|window| window.hwnd == front)
+        .then(|| {
+            let rect = tracker::visible_rect(front)?;
+            let maximized = tracker::screen_rect(front).is_some_and(|(_, zoomed)| zoomed);
+            Some((rect, maximized))
+        })
+        .flatten();
+    menu_bar_covered(
+        config.menu_bar_ghost,
+        config.menu_bar_smart_hide,
+        fullscreen,
+        front_rect,
+        bar,
+    )
 }
 
 pub(super) fn arm_fullscreen_recheck(visual: HWND) {
@@ -342,19 +368,11 @@ impl App {
             // Intelligent hiding (issue #61): the same test as the dock's,
             // against the bar's strip. The ghost bar asks for a maximized
             // window instead (see `menu_bar_covered`).
-            let tracked = self.windows.iter().any(|window| window.hwnd == front);
-            let front_rect = tracked
-                .then(|| {
-                    let rect = tracker::visible_rect(front)?;
-                    let maximized = tracker::screen_rect(front).is_some_and(|(_, zoomed)| zoomed);
-                    Some((rect, maximized))
-                })
-                .flatten();
-            let covered = menu_bar_covered(
-                self.config.menu_bar_ghost,
-                self.config.menu_bar_smart_hide,
+            let covered = current_menu_bar_cover(
+                &self.config,
+                &self.windows,
+                front,
                 bar_fullscreen,
-                front_rect,
                 bar.bounds(),
             );
             if let Err(error) = bar.set_covered(&self.gfx, covered) {

@@ -1,4 +1,4 @@
-//! Observes screen edges on a dedicated timer thread while auto-hide is active.
+//! Observes screen edges and the resting island while auto-hide is active.
 
 use std::{
     sync::{Mutex, MutexGuard, PoisonError},
@@ -48,6 +48,7 @@ pub enum Reveal {
 struct Edges {
     window: isize,
     top: Option<RECT>,
+    island: Option<RECT>,
     /// The displays a hidden dock can be revealed on, and the edge it sits on.
     screens: Vec<RECT>,
     dock_edge: DockEdge,
@@ -59,6 +60,7 @@ struct Edges {
 static EDGES: Mutex<Edges> = Mutex::new(Edges {
     window: 0,
     top: None,
+    island: None,
     screens: Vec::new(),
     dock_edge: DockEdge::Bottom,
     pointer_screen: None,
@@ -71,6 +73,9 @@ impl Edges {
         if self.top.is_some_and(|top| {
             (top.left..top.right).contains(&point.x)
                 && (top.top..top.top + EDGE_DEPTH).contains(&point.y)
+        }) || self.island.is_some_and(|island| {
+            (island.left..island.right).contains(&point.x)
+                && (island.top..island.bottom).contains(&point.y)
         }) {
             return Some(Target::MenuBar);
         }
@@ -100,9 +105,10 @@ impl Edges {
         true
     }
 
-    fn set_top(&mut self, top: Option<RECT>) {
-        if top != self.top {
+    fn set_top(&mut self, top: Option<RECT>, island: Option<RECT>) {
+        if (top, island) != (self.top, self.island) {
             self.top = top;
+            self.island = island;
             if self.target == Some(Target::MenuBar) {
                 self.target = None;
                 self.entered = None;
@@ -140,8 +146,8 @@ fn lock() -> MutexGuard<'static, Edges> {
     EDGES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-pub fn set_menu_bar(top: Option<RECT>) {
-    lock().set_top(top);
+pub fn set_menu_bar(top: Option<RECT>, island: Option<RECT>) {
+    lock().set_top(top, island);
 }
 
 /// The displays a hidden dock can come out on, from `edge` of each.
@@ -284,12 +290,15 @@ mod tests {
             let result = (|| -> Result<()> {
                 let mut point = POINT::default();
                 GetCursorPos(&mut point)?;
-                set_menu_bar(Some(RECT {
-                    left: point.x - 200,
-                    right: point.x + 200,
-                    top: point.y,
-                    bottom: point.y + 30,
-                }));
+                set_menu_bar(
+                    Some(RECT {
+                        left: point.x - 200,
+                        right: point.x + 200,
+                        top: point.y,
+                        bottom: point.y + 30,
+                    }),
+                    None,
+                );
                 let watch = EdgeWatch::start(window)?;
                 let deadline = Instant::now() + Duration::from_secs(2);
                 let mut msg = MSG::default();
@@ -306,7 +315,7 @@ mod tests {
                     "edge notification must arrive without a new mouse event"
                 );
                 drop(watch);
-                set_menu_bar(None);
+                set_menu_bar(None, None);
                 Ok(())
             })();
             let _ = DestroyWindow(window);
@@ -323,10 +332,13 @@ mod tests {
             bottom: 1080,
         };
         let mut edges = Edges::default();
-        edges.set_top(Some(RECT {
-            bottom: 35,
-            ..screen
-        }));
+        edges.set_top(
+            Some(RECT {
+                bottom: 35,
+                ..screen
+            }),
+            None,
+        );
         edges.set_screens(vec![screen], DockEdge::Left);
         assert_eq!(
             edges.at(POINT { x: 0, y: 500 }, Some(screen)),
@@ -357,7 +369,7 @@ mod tests {
         let top = POINT { x: 700, y: 0 };
         let bottom = POINT { x: 700, y: 1079 };
         let mut edges = Edges::default();
-        edges.set_top(Some(screen));
+        edges.set_top(Some(screen), None);
         edges.set_screens(vec![screen], DockEdge::Bottom);
         edges.observe(top, start);
         assert!(matches!(
@@ -376,6 +388,37 @@ mod tests {
     }
 
     #[test]
+    fn ghost_island_reveals_only_after_the_menu_bar_dwell() {
+        let mut edges = Edges::default();
+        let island = RECT {
+            left: 700,
+            top: 0,
+            right: 980,
+            bottom: 28,
+        };
+        let inside = POINT { x: 800, y: 15 };
+        let outside = POINT { x: 985, y: 15 };
+        let now = Instant::now();
+        edges.set_top(None, Some(island));
+
+        assert!(edges.observe(inside, now));
+        assert!(matches!(
+            edges.dwell(outside, now + MENU_DWELL),
+            Reveal::Idle
+        ));
+        let entered = now + MENU_DWELL * 2;
+        assert!(edges.observe(inside, entered));
+        assert!(matches!(
+            edges.dwell(inside, entered + MENU_DWELL / 2),
+            Reveal::Wait(_)
+        ));
+        assert!(matches!(
+            edges.dwell(inside, entered + MENU_DWELL),
+            Reveal::Ready(Target::MenuBar)
+        ));
+    }
+
+    #[test]
     fn an_unchanged_bar_layout_does_not_cancel_hover_dwell() {
         let mut edges = Edges::default();
         let screen = RECT {
@@ -386,9 +429,9 @@ mod tests {
         };
         let point = POINT { x: 700, y: 1 };
         let start = Instant::now();
-        edges.set_top(Some(screen));
+        edges.set_top(Some(screen), None);
         assert!(edges.observe(point, start));
-        edges.set_top(Some(screen));
+        edges.set_top(Some(screen), None);
         assert!(matches!(
             edges.dwell(point, start + DWELL),
             Reveal::Ready(Target::MenuBar)

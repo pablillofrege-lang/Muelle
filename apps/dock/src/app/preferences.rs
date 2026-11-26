@@ -20,7 +20,10 @@ use crate::{
     strings,
 };
 
-use super::{App, Role, visibility::arm_fullscreen_recheck};
+use super::{
+    App, Role,
+    visibility::{arm_fullscreen_recheck, current_menu_bar_cover},
+};
 
 pub(super) fn explorer_id() -> String {
     normalize_id(&format!(
@@ -334,6 +337,15 @@ impl App {
         }
         if let Some(bar) = &mut self.menubar {
             bar.set_clock_target(self.config.menu_bar_clock_target.as_deref());
+            let fullscreen = primary_monitor()
+                .is_some_and(|monitor| tracker::screen_is_covered_by_fullscreen(monitor.screen));
+            let covered = current_menu_bar_cover(
+                &self.config,
+                &self.windows,
+                tracker::foreground_window(),
+                fullscreen,
+                bar.bounds(),
+            );
             // All three at once: one at a time, a switch between two modes
             // would pass through "always visible" and resize maximized windows.
             let applied = bar
@@ -341,18 +353,16 @@ impl App {
                     self.config.menu_bar_ghost,
                     self.config.menu_bar_auto_hide,
                     self.config.menu_bar_smart_hide,
+                    covered,
                 )
                 .and_then(|()| bar.set_usage_enabled(&self.gfx, self.config.ai_usage))
                 .and_then(|()| bar.set_media_enabled(&self.gfx, self.config.menu_bar_music))
                 .and_then(|()| bar.set_widgets(&self.gfx, widgets))
                 .and_then(|()| {
-                    let covered = primary_monitor().is_some_and(|monitor| {
-                        tracker::screen_is_covered_by_fullscreen(monitor.screen)
-                    });
-                    if covered {
+                    if fullscreen {
                         arm_fullscreen_recheck(self.visual);
                     }
-                    bar.set_visible(!covered)
+                    bar.set_visible(!fullscreen)
                 })
                 .and_then(|()| {
                     bar.set_accessories_enabled(&self.gfx, self.config.accessory_battery)
