@@ -1779,7 +1779,10 @@ impl MenuBar {
             return Ok(());
         }
         self.island_hide_until = None;
-        if self.visible && previous.is_some() && system::animations_enabled() {
+        // An island left without content has nothing to fade, and no region
+        // to clip to: fading it would leave a full-width window eating clicks.
+        let has_region = self.triggers_span.width() > 0.0;
+        if self.visible && previous.is_some() && has_region && system::animations_enabled() {
             let started = (|| -> Result<()> {
                 let c = self.island_layer.Compositor()?;
                 let (ease, duration) = Self::visibility_easing(&c, shown)?;
@@ -5150,6 +5153,17 @@ mod island_tests {
         assert_eq!(bar.presence_now(), Presence::IslandOnly);
         assert!(visible(&bar));
         assert_eq!(bar.island_shown, Some(true));
+
+        // An island emptied in place has no region to clip to: it must hide
+        // at once, never fade as a full-width window that eats clicks.
+        let kept = bar.triggers_span;
+        bar.triggers_span = Span::default();
+        bar.place()?;
+        assert!(bar.island_hide_until.is_none(), "no fade without a region");
+        assert!(!visible(&bar));
+        bar.triggers_span = kept;
+        bar.place()?;
+        assert!(visible(&bar));
 
         let mut scaled = bar.look.clone().context("look")?;
         scaled.scale = 1.5;
