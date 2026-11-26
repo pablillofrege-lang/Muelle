@@ -11,7 +11,6 @@ use std::{
     env,
     io::{BufRead, BufReader, Read},
     os::windows::{io::AsRawHandle, process::CommandExt},
-    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -70,7 +69,6 @@ struct Shared {
     child: Mutex<Option<Child>>,
     alive: AtomicBool,
     timed_out: AtomicBool,
-    executable: PathBuf,
     window: isize,
     message: u32,
 }
@@ -128,25 +126,35 @@ pub struct Monitor {
 }
 impl Monitor {
     pub fn new(window: isize, message: u32, visible: bool) -> Result<Self> {
-        Self::start(window, message, env::current_exe()?, visible)
+        let executable = env::current_exe()?;
+        Self::start(window, message, visible, |visibility| {
+            let mut worker = Command::new(executable);
+            worker.arg(FLAG).arg(visibility);
+            worker
+        })
     }
-    fn start(window: isize, message: u32, executable: PathBuf, visible: bool) -> Result<Self> {
+    fn start(
+        window: isize,
+        message: u32,
+        visible: bool,
+        worker: impl FnOnce(&str) -> Command,
+    ) -> Result<Self> {
         let shared = Arc::new(Shared {
             visibility: visibility::Controller::new(visible)?,
             snapshot: Mutex::new(Arc::new(Snapshot::default())),
             child: Mutex::new(None),
             alive: AtomicBool::new(true),
             timed_out: AtomicBool::new(false),
-            executable,
             window,
             message,
         });
+        let worker = worker(&shared.visibility.name);
         let background = shared.clone();
         thread::Builder::new()
             .name("muelle-accessories".into())
             .spawn(move || {
                 if background.alive.load(Ordering::Acquire) {
-                    let _ = read_worker(&background);
+                    let _ = read_worker(&background, worker);
                 }
                 background.kill();
                 background
@@ -254,11 +262,9 @@ impl Drop for WorkerJob {
     }
 }
 
-fn read_worker(shared: &Arc<Shared>) -> Result<()> {
+fn read_worker(shared: &Arc<Shared>, mut worker: Command) -> Result<()> {
     let job = WorkerJob::new()?;
-    let mut child = Command::new(&shared.executable)
-        .arg(FLAG)
-        .arg(&shared.visibility.name)
+    let mut child = worker
         .creation_flags(0x0800_0000)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

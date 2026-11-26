@@ -187,7 +187,6 @@ hardware para evitar lectores que interfieran con software del fabricante.
 cargo test -p muelle -p muelle-shell -p muelle-config --locked
 cargo clippy -p muelle -p muelle-shell -p muelle-config --all-targets --locked -- -D warnings
 cargo build -p muelle --locked
-$env:MUELLE_ACCESSORY_TEST_EXE = 'C:\Users\USUARIO\.cargo-target\muelle\debug\muelle.exe'
 cargo test -p muelle --locked monitor_repeated_shutdown_and_timeout_are_bounded -- --ignored --test-threads=1
 cargo test -p muelle --locked usb_process_deadline_terminates_a_stalled_provider -- --ignored --test-threads=1
 cargo test -p muelle --locked accessory_indicators_render_without_controls_or_popups -- --ignored --test-threads=1
