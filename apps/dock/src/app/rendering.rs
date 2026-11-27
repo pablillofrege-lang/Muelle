@@ -144,6 +144,7 @@ impl App {
             top_inset: self.menu_bar_inset(monitor.screen, edge),
             scale: monitor.scale,
             look: crate::appearance::current(),
+            dock_style: self.config.dock_style,
             bin_full: self.bin_full,
             auto_hide: self.config.auto_hide,
             smart_hide: self.config.smart_hide,
@@ -177,7 +178,7 @@ impl App {
             ..Metrics::DEFAULT
         }
         .scaled(scale);
-        let theme = Theme::new(key.look);
+        let theme = Theme::for_dock(key.look, key.dock_style);
         let px = |logical: f32| (logical * scale).round();
         let screen = monitor.screen;
         let screen_width = (screen.right - screen.left) as f32;
@@ -212,6 +213,7 @@ impl App {
         }
         dock.width = dock.width.round();
         dock.height = dock.height.round();
+        theme.adjust_dock_layout(&mut dock, scale);
 
         self.entries = key.entries.clone();
         self.prepare_assets(

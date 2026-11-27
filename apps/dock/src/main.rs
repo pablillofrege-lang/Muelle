@@ -17,6 +17,7 @@ mod app;
 mod appearance;
 mod assets;
 mod bluetooth;
+mod desktop_clock;
 mod drop;
 mod edge_watch;
 mod flight;
@@ -90,9 +91,16 @@ fn main() -> Result<()> {
         ["--autostart", "off"] => Ok(autostart::set(None)?),
         [guard::FLAG, pid] => guard::run(pid.parse().context("pid no válido")?),
         ["--usage-worker"] => usage::worker_main(),
-        [weather::WORKER_FLAG, latitude, longitude] => weather::worker_main(latitude, longitude),
-        [accessories::FLAG] => accessories::worker_main(None),
-        [accessories::FLAG, visibility] => accessories::worker_main(Some(visibility)),
+        [weather::WORKER_FLAG] => weather::worker_main(),
+        [accessories::FLAG] => accessories::worker_main(None, true, false),
+        [accessories::FLAG, visibility] => accessories::worker_main(Some(visibility), true, false),
+        [accessories::BLUETOOTH_FLAG] => accessories::worker_main(None, false, true),
+        [accessories::BLUETOOTH_FLAG, visibility] => {
+            accessories::worker_main(Some(visibility), false, true)
+        }
+        [accessories::BLUETOOTH_FLAG, visibility, "legacy"] => {
+            accessories::worker_main(Some(visibility), true, true)
+        }
         [accessories::USB_FLAG] => accessories::usb_worker_main(),
         [shell_work::FLAG] => shell_work::worker_main(),
         _ => bail!("uso: muelle [--quit | --restore | --autostart on|off]"),

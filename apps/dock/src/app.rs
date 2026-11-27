@@ -31,6 +31,7 @@ mod visibility;
 use std::{
     cell::RefCell,
     collections::HashMap,
+    rc::Rc,
     sync::{
         OnceLock,
         atomic::{AtomicIsize, AtomicU8, Ordering},
@@ -40,7 +41,7 @@ use std::{
 };
 
 use anyhow::Result;
-use muelle_config::{Config, DockDensity};
+use muelle_config::{Config, DockDensity, DockStyle};
 use muelle_core::{
     attention::Attention,
     frame::{DockEdge, Frame as DockFrame},
@@ -72,6 +73,7 @@ use windows::{
 
 use crate::{
     assets::Visuals,
+    desktop_clock,
     edge_watch::EdgeWatch,
     flight::{Flight, Snapshot},
     gfx::{Gfx, LabelBrush},
@@ -82,6 +84,7 @@ use crate::{
     multi_window_view::MultiWindowView,
     scene::Scene,
     thumbnails::Thumbnails,
+    weather,
 };
 
 use menus::run_outside;
@@ -542,6 +545,7 @@ struct StageKey {
     /// backdrop brush made while Windows had transparency off stays black
     /// after it comes back, so its `glass` rebuilds the dock both ways.
     look: crate::appearance::Look,
+    dock_style: DockStyle,
     bin_full: bool,
     auto_hide: bool,
     smart_hide: bool,
@@ -699,6 +703,8 @@ pub(crate) struct App {
     placeholder: Option<CompositionSurfaceBrush>,
     remove_label: Option<LabelBrush>,
     config: Config,
+    weather: Rc<RefCell<weather::Cache>>,
+    desktop_clock: Option<desktop_clock::Clock>,
     /// 0 = shown, 1 = hidden (auto-hide).
     slide: Spring,
     press: Option<Press>,

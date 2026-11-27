@@ -3,6 +3,8 @@
 
 #[path = "gfx/backdrop.rs"]
 mod backdrop;
+#[path = "gfx/clock.rs"]
+pub(crate) mod clock;
 
 use anyhow::{Context, Result};
 use muelle_core::frame::DockEdge;

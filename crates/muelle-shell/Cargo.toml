@@ -16,6 +16,7 @@ windows = { workspace = true, features = [
     "Foundation",
     "Networking_Connectivity",
     "Win32_Foundation",
+    "Win32_Devices_Display",
     "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

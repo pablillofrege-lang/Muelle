@@ -7,9 +7,9 @@
 //! draws reads `current()` when it builds, and a change rebuilds through the
 //! same keys a Windows theme change does.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use muelle_config::Appearance;
+use muelle_config::{Appearance, DockStyle};
 use muelle_shell::system::{transparency_enabled, uses_light_theme};
 
 /// What the glass is made of.
@@ -43,6 +43,7 @@ pub struct Look {
 }
 
 static CHOICE: AtomicU8 = AtomicU8::new(Appearance::Auto as u8);
+static DOCK_GLASS_A: AtomicBool = AtomicBool::new(false);
 /// The menu bar's own theme, or `SAME` for the dock's.
 static MENU_BAR_CHOICE: AtomicU8 = AtomicU8::new(SAME);
 /// Stored for "the menu bar takes the dock's theme": no theme has this value.
@@ -50,6 +51,10 @@ const SAME: u8 = u8::MAX;
 
 pub fn set(choice: Appearance) {
     CHOICE.store(choice as u8, Ordering::Relaxed);
+}
+
+pub fn set_dock_style(style: DockStyle) {
+    DOCK_GLASS_A.store(style == DockStyle::A, Ordering::Relaxed);
 }
 
 /// The menu bar's own theme; `None` gives it the dock's.
@@ -109,7 +114,12 @@ fn look_of(choice: Appearance) -> Look {
 /// The dock's look, and its menus' and panels'.
 #[must_use]
 pub fn current() -> Look {
-    look_of(decode(CHOICE.load(Ordering::Relaxed)))
+    let choice = if DOCK_GLASS_A.load(Ordering::Relaxed) {
+        Appearance::Dark
+    } else {
+        decode(CHOICE.load(Ordering::Relaxed))
+    };
+    look_of(choice)
 }
 
 /// The menu bar's look, and its menus' and panels': its own theme, or the

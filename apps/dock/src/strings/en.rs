@@ -1,4 +1,10 @@
-use super::Strings;
+use super::{Strings, WeatherText};
+
+pub(super) const WEATHER: WeatherText = WeatherText {
+    conditions: ["Clear", "Cloudy", "Fog", "Rain", "Snow", "Thunderstorm"],
+    high: "high",
+    low: "low",
+};
 
 pub(super) const TEXT: Strings = Strings {
     jump_pinned: "Pinned",

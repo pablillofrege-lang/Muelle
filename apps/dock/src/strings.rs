@@ -78,6 +78,41 @@ pub struct Strings {
     pub jump_tasks: &'static str,
 }
 
+pub fn bluetooth_devices(
+    language: Language,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match language {
+        Language::Es => (
+            "Dispositivos Bluetooth",
+            "Sin conectar",
+            "Conectado",
+            "Mando DualSense",
+        ),
+        Language::Fr => (
+            "Appareils Bluetooth",
+            "Non connecté",
+            "Connecté",
+            "Manette DualSense",
+        ),
+        Language::Pt => (
+            "Dispositivos Bluetooth",
+            "Desconectado",
+            "Conectado",
+            "Comando DualSense",
+        ),
+        Language::Zh => ("蓝牙设备", "未连接", "已连接", "DualSense 手柄"),
+        Language::Hi => ("ब्लूटूथ डिवाइस", "कनेक्ट नहीं है", "कनेक्ट है", "DualSense कंट्रोलर"),
+        Language::Ar => ("أجهزة Bluetooth", "غير متصل", "متصل", "وحدة تحكم DualSense"),
+        Language::Bn => ("ব্লুটুথ ডিভাইস", "সংযুক্ত নয়", "সংযুক্ত", "DualSense কন্ট্রোলার"),
+        Language::Auto | Language::En => (
+            "Bluetooth devices",
+            "Disconnected",
+            "Connected",
+            "DualSense controller",
+        ),
+    }
+}
+
 /// 0 = not chosen yet (follow Windows). Nonzero values identify static catalogs.
 static LANGUAGE: AtomicU8 = AtomicU8::new(0);
 
@@ -135,6 +170,20 @@ pub(crate) fn text_in(language: Language) -> &'static Strings {
     match language {
         Language::Es => &es::TEXT,
         _ => &en::TEXT,
+    }
+}
+
+pub(crate) struct WeatherText {
+    pub conditions: [&'static str; 6],
+    pub high: &'static str,
+    pub low: &'static str,
+}
+
+pub(crate) fn weather(language: Language) -> &'static WeatherText {
+    if language == Language::Es {
+        &es::WEATHER
+    } else {
+        &en::WEATHER
     }
 }
 

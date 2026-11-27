@@ -7,7 +7,7 @@ use muelle_config::{Config, DockPosition};
 use muelle_core::{frame::DockEdge, layout::Rect, spring::Spring};
 use muelle_shell::{
     appbar::ABN_FULLSCREENAPP,
-    system::{Monitor, monitor_at, monitor_rects, primary_monitor},
+    system::{Monitor, monitor_at, monitor_rects, primary_monitor, selected_monitor},
     taskbar,
     tracker::{self, TrackedWindow},
 };
@@ -67,7 +67,17 @@ pub(super) fn current_menu_bar_cover(
     fullscreen: bool,
     bar: RECT,
 ) -> bool {
-    let front_rect = windows
+    menu_bar_covered(
+        config.menu_bar_ghost,
+        config.menu_bar_smart_hide,
+        fullscreen,
+        front_geometry(windows, front),
+        bar,
+    )
+}
+
+fn front_geometry(windows: &[TrackedWindow], front: isize) -> Option<(RECT, bool)> {
+    windows
         .iter()
         .any(|window| window.hwnd == front)
         .then(|| {
@@ -75,14 +85,7 @@ pub(super) fn current_menu_bar_cover(
             let maximized = tracker::screen_rect(front).is_some_and(|(_, zoomed)| zoomed);
             Some((rect, maximized))
         })
-        .flatten();
-    menu_bar_covered(
-        config.menu_bar_ghost,
-        config.menu_bar_smart_hide,
-        fullscreen,
-        front_rect,
-        bar,
-    )
+        .flatten()
 }
 
 pub(super) fn arm_fullscreen_recheck(visual: HWND) {
@@ -92,6 +95,50 @@ pub(super) fn arm_fullscreen_recheck(visual: HWND) {
 }
 
 impl App {
+    pub(super) fn refresh_desktop_clock(&mut self, tick: bool) {
+        if self.desktop_clock.is_some()
+            && let Some(monitor) = primary_monitor()
+        {
+            self.sync_desktop_clock(
+                monitor,
+                tracker::screen_is_covered_by_fullscreen(monitor.screen),
+                tracker::foreground_window(),
+                tick,
+            );
+        }
+    }
+
+    fn sync_desktop_clock(
+        &mut self,
+        primary: Monitor,
+        primary_fullscreen: bool,
+        front: isize,
+        tick: bool,
+    ) {
+        if let Some(clock) = &mut self.desktop_clock {
+            let monitor = selected_monitor(self.config.desktop_clock_monitor.as_deref(), primary);
+            let fullscreen = if monitor.screen == primary.screen {
+                primary_fullscreen
+            } else {
+                tracker::screen_is_covered_by_fullscreen(monitor.screen)
+            };
+            let covered = menu_bar_covered(
+                true,
+                false,
+                fullscreen,
+                front_geometry(&self.windows, front),
+                monitor.screen,
+            );
+            clock.sync(
+                &self.gfx,
+                monitor,
+                covered,
+                &mut self.weather.borrow_mut(),
+                tick,
+            );
+        }
+    }
+
     pub(super) fn hide_if_unused(&mut self) -> Result<()> {
         // One decision for timer, settings and overlap changes. Automatic
         // hiding wins; intelligent hiding matters only in its absence.
@@ -347,6 +394,7 @@ impl App {
             return Ok(());
         };
         let bar_fullscreen = tracker::screen_is_covered_by_fullscreen(monitor.screen);
+        self.sync_desktop_clock(monitor, bar_fullscreen, front, false);
         let fullscreen = self.dock_monitor().map_or(bar_fullscreen, |dock| {
             if dock.screen == monitor.screen {
                 bar_fullscreen

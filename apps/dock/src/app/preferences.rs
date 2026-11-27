@@ -81,7 +81,7 @@ fn warn_about_weather(config: &Config) {
 }
 
 fn weather_warning(config: &Config) -> Option<&'static str> {
-    (config.weather.enabled && !config.weather.has_valid_coordinates())
+    (config.weather.enabled && !config.weather.auto && !config.weather.has_valid_coordinates())
         .then_some("tiempo: coordenadas fuera de rango en la configuración; no se consulta")
 }
 
@@ -209,6 +209,7 @@ impl App {
         }
         // The dock and the menu bar key their looks on it: `refresh` redraws both.
         crate::appearance::set(config.appearance);
+        crate::appearance::set_dock_style(config.dock_style);
         crate::appearance::set_menu_bar(config.menu_bar_appearance);
         if !config.genie {
             self.restore_transitions();
@@ -234,6 +235,7 @@ impl App {
         }
         self.sync_thumbnails();
         self.apply_menu_bar_setting();
+        self.apply_desktop_clock_setting();
         self.update_menu_bar_app()?;
         self.calm_windows();
         self.refresh()?;
@@ -338,6 +340,7 @@ impl App {
 
     /// Creates or removes the menu bar to match the settings.
     pub(super) fn apply_menu_bar_setting(&mut self) {
+        let weather_changed = self.weather.borrow_mut().configure(&self.config.weather);
         let widgets = MenuBarWidgets {
             island_style: self.config.menu_bar_island_style,
             notifications: self.config.menu_bar_notifications,
@@ -359,6 +362,9 @@ impl App {
             )
             .inspect_err(|error| eprintln!("muelle: barra superior: {error:#}"))
             .ok();
+            if let Some(bar) = &mut self.menubar {
+                bar.attach_weather(self.weather.clone());
+            }
         }
         if let Some(bar) = &mut self.menubar {
             bar.set_clock_target(self.config.menu_bar_clock_target.as_deref());
@@ -390,14 +396,33 @@ impl App {
                     bar.set_visible(!fullscreen)
                 })
                 .and_then(|()| {
-                    bar.set_accessories_enabled(&self.gfx, self.config.accessory_battery)
+                    bar.set_accessories_enabled(
+                        &self.gfx,
+                        self.config.accessory_battery,
+                        self.config.bluetooth_accessory_battery,
+                    )
                 })
-                .and_then(|()| bar.set_weather(&self.gfx, self.config.weather));
+                .and_then(|()| {
+                    if weather_changed {
+                        bar.weather_changed(&self.gfx)?;
+                    }
+                    Ok(())
+                });
             if let Err(error) = applied {
                 eprintln!("muelle: barra superior: {error:#}");
             }
         }
         self.apply_edge_settings();
+    }
+
+    pub(super) fn apply_desktop_clock_setting(&mut self) {
+        if self.config.desktop_clock {
+            self.desktop_clock
+                .get_or_insert_with(|| crate::desktop_clock::Clock::new(self.visual));
+            self.refresh_desktop_clock(false);
+        } else {
+            self.desktop_clock = None;
+        }
     }
 
     /// Shows the name of the app in front, as the macOS menu bar does.
