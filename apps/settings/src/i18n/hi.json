@@ -1,6 +1,9 @@
 {
   "groupDesktop": "Desktop",
   "desktopClock": "Desktop clock",
+  "desktopClockDisplay": "Display",
+  "desktopClockDisplayAuto": "Primary (automatic)",
+  "desktopClockDisplayDisconnected": "Disconnected display (using primary)",
   "dockStyle": "Dock style",
   "dockStyleOriginal": "Original",
   "dockStyleGlassA": "Glass A",

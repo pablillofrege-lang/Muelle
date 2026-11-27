@@ -1,6 +1,9 @@
 {
   "groupDesktop": "Escritorio",
   "desktopClock": "Reloj en el escritorio",
+  "desktopClockDisplay": "Pantalla",
+  "desktopClockDisplayAuto": "Principal (automática)",
+  "desktopClockDisplayDisconnected": "Pantalla desconectada (se usa la principal)",
   "dockStyle": "Estilo del dock",
   "dockStyleOriginal": "Original",
   "dockStyleGlassA": "Cristal A",

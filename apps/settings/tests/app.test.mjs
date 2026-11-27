@@ -79,7 +79,7 @@ function fixture(section = "menubar", config = {}, save = async () => {}, galler
       switch (command) {
         case "get_config": return { ...loaded };
         case "get_autostart": return false;
-        case "windows_preferences": return { animations: true };
+        case "windows_preferences": return { animations: true, displays: galleryNative.displays ?? [] };
         case "wallpaper_preview": return null;
         case "wallpaper_selection": return typeof galleryNative.selection === "function" ? galleryNative.selection() : galleryNative.selection ?? null;
         case "apply_wallpaper": wallpaperCalls.push({ ...args }); return galleryNative.apply?.(args.id);
@@ -175,6 +175,29 @@ test("Cristal A is a dock style independent of appearance", async () => {
   view.fire(60);
   await settle();
   assert.deepEqual(view.calls, [{ dockStyle: "a" }]);
+});
+
+test("desktop clock keeps the disconnected display selected until another is chosen", async () => {
+  const view = fixture("appearance", { desktopClock: true, desktopClockMonitor: "old-id" }, undefined, {
+    displays: [{ id: "connected-id", name: "LG FULL HD" }],
+  });
+  const unmount = await view.mount();
+  try {
+    const html = renderToStaticMarkup(view.body());
+    assert.match(html, /<label[^>]+for="desktop-clock-display">Display/);
+    assert.match(html, /<option value="old-id" dir="auto" selected="">Disconnected/);
+    assert.match(html, /<option value="connected-id" dir="auto">LG FULL HD/);
+    assert.deepEqual(view.calls, []);
+    view.change("Display", "connected-id");
+    view.fire(60);
+    await settle();
+    view.change("Display", "");
+    view.fire(60);
+    await settle();
+    assert.deepEqual(view.calls, [{ desktopClockMonitor: "connected-id" }, { desktopClockMonitor: null }]);
+  } finally {
+    unmount();
+  }
 });
 
 test("the gallery bundles only offline previews and appears only inside Appearance", () => {

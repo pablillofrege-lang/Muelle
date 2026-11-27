@@ -289,6 +289,8 @@ export function App() {
   // An update the user asked for keeps its banner even after "Later".
   const showBanner =
     waiting !== null && (!bannerDismissed || updateState.kind !== "available");
+  const clockMonitor = config?.desktopClockMonitor ?? "";
+  const clockDisplays = (windowsPreferences?.displays ?? []).map(({ id, name }) => ({ value: id, label: name }));
 
   return (
     <div className="window" lang={language} dir={language === "ar" ? "rtl" : "ltr"}>
@@ -415,6 +417,16 @@ export function App() {
                   <Toggle label={t.desktopClock} checked={config.desktopClock ?? false}
                     onChange={(desktopClock) => update({ desktopClock })} />
                 </Row>
+                <SubRow open={config.desktopClock ?? false} label={t.desktopClockDisplay} controlId="desktop-clock-display">
+                  <Select id="desktop-clock-display" label={t.desktopClockDisplay} value={clockMonitor}
+                    options={[
+                      { value: "", label: t.desktopClockDisplayAuto },
+                      ...clockDisplays,
+                      ...(clockMonitor && !clockDisplays.some(({ value }) => value === clockMonitor)
+                        ? [{ value: clockMonitor, label: t.desktopClockDisplayDisconnected }] : []),
+                    ]}
+                    onChange={(value) => update({ desktopClockMonitor: value || null })} />
+                </SubRow>
                 <Row label={t.weatherEnabled}>
                   <Toggle label={t.weatherEnabled} checked={weather.enabled}
                     onChange={(enabled) => update({ weather: { enabled } })} />

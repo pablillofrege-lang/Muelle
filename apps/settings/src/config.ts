@@ -57,6 +57,7 @@ export interface Config {
   /** What the clock opens (an app, shortcut or URI); null for the notification center. */
   menuBarClockTarget: string | null;
   desktopClock: boolean;
+  desktopClockMonitor: string | null;
   weather: Weather;
   accessoryBattery: boolean;
   menuBarSystemMonitor?: boolean;
@@ -105,6 +106,7 @@ export const getAutostart = () => invoke<boolean>("get_autostart");
 /** Current Windows values for display only; never merge these into Config. */
 export interface WindowsPreferences {
   animations: boolean;
+  displays: { id: string; name: string }[];
 }
 
 let windowsPreferencesRequest: Promise<WindowsPreferences> | undefined;

@@ -18,18 +18,20 @@ export function Card({ title, children }: CardProps) {
 
 interface RowProps {
   label: string;
+  controlId?: string;
   hint?: string;
   icon?: ReactNode;
   stacked?: boolean;
   children: ReactNode;
 }
 
-export function Row({ label, hint, icon, stacked, children }: RowProps) {
+export function Row({ label, controlId, hint, icon, stacked, children }: RowProps) {
   return (
     <div className={stacked ? "row row-stacked" : "row"}>
       {icon ? <span className="row-icon">{icon}</span> : null}
       <div className="row-text">
-        <span className="row-label">{label}</span>
+        {controlId ? <label className="row-label" htmlFor={controlId}>{label}</label>
+          : <span className="row-label">{label}</span>}
         {hint ? <span className="row-hint">{hint}</span> : null}
       </div>
       <div className="row-control">{children}</div>
@@ -116,6 +118,7 @@ export function Slider({ value, min, max, label, unit = "px", disabled, onChange
 interface SelectProps<T extends string> {
   value: T;
   label: string;
+  id?: string;
   options: readonly { value: T; label: string }[];
   onChange: (value: T) => void;
 }
@@ -177,9 +180,9 @@ export function PreferenceInput({ label, value, min, max, maxLength, invalidText
 }
 
 /** Native popup and keyboard navigation, styled like the other Settings controls. */
-export function Select<T extends string>({ value, label, options, onChange }: SelectProps<T>) {
+export function Select<T extends string>({ value, label, id, options, onChange }: SelectProps<T>) {
   return <span className="select-wrap">
-    <select className="select-control" aria-label={label} value={value}
+    <select className="select-control" id={id} aria-label={id ? undefined : label} value={value}
       onChange={(event) => onChange(event.target.value as T)}>
       {options.map((option) => <option key={option.value} value={option.value} dir="auto">{option.label}</option>)}
     </select>

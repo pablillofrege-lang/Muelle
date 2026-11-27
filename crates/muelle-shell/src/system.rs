@@ -1,5 +1,8 @@
 use std::mem::size_of;
 
+mod displays;
+pub use displays::{DesktopDisplay, desktop_displays, selected_monitor};
+
 use windows::{
     Win32::{
         Foundation::{LPARAM, POINT, RECT},

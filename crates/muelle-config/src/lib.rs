@@ -111,8 +111,10 @@ pub struct Config {
     /// (e.g. the Clock app or a calendar). `None` keeps the notification
     /// center and calendar, as on the Windows taskbar.
     pub menu_bar_clock_target: Option<String>,
-    /// Show the date, time and forecast on the primary desktop.
+    /// Show the date, time and forecast on the desktop.
     pub desktop_clock: bool,
+    /// Windows monitor device path. None follows the primary display.
+    pub desktop_clock_monitor: Option<String>,
     /// Forecast shown by the desktop clock and in the left capsule of the zoned ghost bar.
     pub weather: Weather,
     /// CPU, memory and network speed in the menu bar (issue #64). Off by
@@ -402,6 +404,10 @@ impl Config {
             .menu_bar_clock_target
             .map(|target| target.trim().to_owned())
             .filter(|target| !target.is_empty());
+        self.desktop_clock_monitor = self
+            .desktop_clock_monitor
+            .map(|monitor| monitor.trim().to_owned())
+            .filter(|monitor| !monitor.is_empty());
         self
     }
 
@@ -456,6 +462,7 @@ impl Default for Config {
             menu_bar_essentials: false,
             menu_bar_clock_target: None,
             desktop_clock: false,
+            desktop_clock_monitor: None,
             weather: Weather::default(),
             accessory_battery: false,
             show_indicators: true,
@@ -1110,13 +1117,18 @@ mod tests {
     fn desktop_clock_and_glass_a_are_opt_in() -> Result<(), serde_json::Error> {
         let legacy: Config = serde_json::from_str(r#"{"weather":{"enabled":false}}"#)?;
         assert!(!legacy.desktop_clock);
+        assert_eq!(legacy.desktop_clock_monitor, None);
         assert_eq!(legacy.dock_style, DockStyle::Original);
         assert!(!legacy.weather.auto);
         assert_eq!(legacy.weather.city, "Jaén");
         let selected: Config = serde_json::from_str(
-            r#"{"desktopClock":true,"dockStyle":"a","weather":{"auto":true,"city":"Málaga"}}"#,
+            r#"{"desktopClock":true,"desktopClockMonitor":"monitor-path","dockStyle":"a","weather":{"auto":true,"city":"Málaga"}}"#,
         )?;
         assert!(selected.desktop_clock && selected.weather.auto);
+        assert_eq!(
+            selected.desktop_clock_monitor.as_deref(),
+            Some("monitor-path")
+        );
         assert_eq!(selected.dock_style, DockStyle::A);
         assert_eq!(selected.weather.city, "Málaga");
         assert_eq!(

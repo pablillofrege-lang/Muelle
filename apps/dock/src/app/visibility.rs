@@ -7,7 +7,7 @@ use muelle_config::{Config, DockPosition};
 use muelle_core::{frame::DockEdge, layout::Rect, spring::Spring};
 use muelle_shell::{
     appbar::ABN_FULLSCREENAPP,
-    system::{Monitor, monitor_at, monitor_rects, primary_monitor},
+    system::{Monitor, monitor_at, monitor_rects, primary_monitor, selected_monitor},
     taskbar,
     tracker::{self, TrackedWindow},
 };
@@ -108,8 +108,20 @@ impl App {
         }
     }
 
-    fn sync_desktop_clock(&mut self, monitor: Monitor, fullscreen: bool, front: isize, tick: bool) {
+    fn sync_desktop_clock(
+        &mut self,
+        primary: Monitor,
+        primary_fullscreen: bool,
+        front: isize,
+        tick: bool,
+    ) {
         if let Some(clock) = &mut self.desktop_clock {
+            let monitor = selected_monitor(self.config.desktop_clock_monitor.as_deref(), primary);
+            let fullscreen = if monitor.screen == primary.screen {
+                primary_fullscreen
+            } else {
+                tracker::screen_is_covered_by_fullscreen(monitor.screen)
+            };
             let covered = menu_bar_covered(
                 true,
                 false,
