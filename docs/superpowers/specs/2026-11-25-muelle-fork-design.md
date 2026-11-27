@@ -48,7 +48,7 @@ Se descartaron OpenTaskbar (60-120 MB, ~22 % de un núcleo en reposo, reescribe 
    - En la barra solo aparece el dispositivo conectado. En el detalle, la lista completa con «Sin conectar».
    - **Sony WH-1000XM5**: Windows sí da el nivel en el nodo «Hands-Free AG» de clase System {4d36e97d-e325-11ce-bfc1-08002be10318}, que la consulta `NODES` de `apps/dock/src/accessories/worker.rs:34` no mira. Es una hipótesis por confirmar.
    - **DualSense**: leer el nivel por HID. Se puede tomar la lógica de OpenTaskbar (`GamepadHidBatteryProvider.cs`, licencia MIT, citando la atribución).
-   - **AirPods Max**: experimental. Windows no da su batería; habría que leer los anuncios BLE de Apple. Si no sale bien, se queda fuera sin bloquear lo demás.
+   - **AirPods Max**: se descarta la lectura de batería (F5). El detalle conserva la fila si Windows los conoce.
 7. **Dock A**: el dock flotante de cristal redondeado de la vista previa, con magnificación, punto de app abierta, separador y Papelera. Es casi el de Muelle actual; solo se ajusta el aspecto al diseño.
 
 ## Fuera de alcance
@@ -72,14 +72,14 @@ Se descartaron OpenTaskbar (60-120 MB, ~22 % de un núcleo en reposo, reescribe 
 
 ## Enfoques considerados
 
-1. **Fork propio** ← **elegido por Pablo.** Todo en su GitHub y actualizaciones desde sus propias versiones.
+1. **Fork propio** ← **elegido por Pablo.** Todo en su GitHub.
 2. Fork y además enviar al original los arreglos generales: descartado por Pablo.
 3. Sin fork, solo ajustes y Rainmeter: no permite la barra fantasma, la transparencia real, los avisos ni el arreglo de la batería.
 
 ## Lo que ya está decidido sobre el cómo
 
 - **Repo**: fork de `crafter-station/Muelle` en la cuenta de GitHub `pablillofrege-lang`. Copia local en `C:/Users/pablofrege/Desktop/Proyectos de desarrollo/muelle`. *(Decisión de Claude: sigue la convención de sus otros proyectos.)*
-- **Actualizaciones**: la actualización automática apuntará a **las versiones del fork**, firmadas con una clave minisign propia de Pablo, y nunca a las oficiales. *(Decisión de Claude: el cómo exacto de publicar, con GitHub Actions o compilando en local, queda para el plan.)* Mientras no exista, la instalación del fork desactiva la actualización oficial.
+- **Actualizaciones**. La instalación del fork mantiene desactivadas las actualizaciones automáticas. Pablo descartó el sistema de actualizaciones propias (F6).
 - **Traer novedades del original**: a petición de Pablo, fusionando `upstream/main` en el fork.
 - **El tiempo**: ciudad por defecto Jaén, configurable. Se consulta cada 30 min y solo con el escritorio a la vista. *(Decisión de Claude.)*
 - **Reparto de modelos** (regla de Pablo): Codex programa el Rust, Fable revisa que se parezca a la vista previa, Opus revisa el código y Haiku mide la RAM.
@@ -89,8 +89,8 @@ Se descartaron OpenTaskbar (60-120 MB, ~22 % de un núcleo en reposo, reescribe 
   - F2: avisos de IA.
   - F3: reloj y tiempo.
   - F4: batería de los Sony y del DualSense.
-  - F5: AirPods Max (experimental).
-  - F6: actualizaciones propias.
+  - F5: lectura de batería de los AirPods Max descartada por decisión de Pablo.
+  - F6: actualizaciones propias descartadas por decisión de Pablo. La actualización automática sigue apagada.
 
 ## Respuestas de Pablo tras la revisión
 
