@@ -5,6 +5,48 @@ use anyhow::{Result, ensure};
 use muelle_shell::accessories::Kind;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+mod dualsense_tests {
+    use super::*;
+
+    #[test]
+    fn dualsense_decodes_usb_and_full_bluetooth_reports() {
+        let mut usb = [0; 64];
+        usb[0] = 0x01;
+        usb[53] = 0x14;
+        assert_eq!(dualsense_percent(&usb, false), Some(40));
+        let mut bluetooth = [0; 78];
+        bluetooth[0] = 0x31;
+        bluetooth[54] = 0x20;
+        assert_eq!(dualsense_percent(&bluetooth, true), Some(100));
+        bluetooth[54] = 0x00;
+        assert_eq!(dualsense_percent(&bluetooth, true), Some(0));
+    }
+
+    #[test]
+    fn dualsense_rejects_short_bluetooth_mode_and_invalid_status() {
+        let mut report = [0; 78];
+        report[0] = 0x01;
+        assert_eq!(dualsense_percent(&report, true), None);
+        report[0] = 0x31;
+        assert_eq!(dualsense_percent(&report[..77], true), None);
+        report[54] = 0xa0;
+        assert_eq!(dualsense_percent(&report, true), None);
+        report[54] = 0x0b;
+        assert_eq!(dualsense_percent(&report, true), None);
+    }
+
+    #[test]
+    fn dualsense_accepts_the_windows_bluetooth_hid_path() {
+        let path = r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&0ce6#instance#{hid-guid}";
+        assert_eq!(
+            profile_path(path).map(|profile| profile.model),
+            Some(Model::DualSense)
+        );
+        assert!(profile_path(&path.replace("0ce6", "0ce61")).is_none());
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Profile {
     pub vendor: u16,
@@ -18,6 +60,7 @@ pub struct Profile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Model {
     Logitech,
+    DualSense,
     LogitechHeadset,
     ProX2,
     NovaDiscrete,
@@ -40,6 +83,9 @@ impl Profile {
     /// Reject unrelated collections before opening them for data access.
     pub fn accepts_collection(self, page: u16, usage: u16, input: usize, output: usize) -> bool {
         match self.model {
+            Model::DualSense => {
+                page == self.page && usage == self.usage && (64..=78).contains(&input)
+            }
             Model::Logitech => {
                 page == self.page && matches!((usage, input, output), (1, 7, 7) | (2, 20, 20))
             }
@@ -97,6 +143,7 @@ const fn logitech_receiver(product: u16, slots: u8) -> Profile {
 // Receiver identities from Solaar's base_usb.py. Battery support is discovered
 // on the paired device, never inferred from a marketing name or a PID range.
 pub const PROFILES: &[Profile] = &[
+    headset(0x054c, 0x0ce6, 1, 5, Model::DualSense),
     logitech_receiver(0xc52b, 6), // Unifying
     logitech_receiver(0xc532, 6),
     logitech_receiver(0xc548, 6), // Bolt
@@ -170,15 +217,20 @@ pub fn profile_path(path: &str) -> Option<Profile> {
         return None;
     }
     let path = path.to_ascii_lowercase();
-    if !path.starts_with(r"\\?\hid#vid_") {
-        return None;
+    if dualsense_bluetooth_path(&path) {
+        return PROFILES
+            .iter()
+            .copied()
+            .find(|p| p.model == Model::DualSense);
     }
     PROFILES.iter().copied().find(|profile| {
         let prefix = format!(
             r"\\?\hid#vid_{:04x}&pid_{:04x}&",
             profile.vendor, profile.product
         );
-        path.starts_with(&prefix)
+        (path.starts_with(&prefix)
+            || (profile.model == Model::DualSense
+                && path.starts_with(r"\\?\hid#vid_054c&pid_0ce6#")))
             && profile.model.interface().is_none_or(|interface| {
                 let expected = format!("mi_{interface:02x}");
                 path.split('#')
@@ -186,6 +238,27 @@ pub fn profile_path(path: &str) -> Option<Profile> {
                     .is_some_and(|hardware| hardware.split('&').any(|part| part == expected))
             })
     })
+}
+
+pub fn dualsense_bluetooth_path(path: &str) -> bool {
+    path.strip_prefix(r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&0ce6")
+        .is_some_and(|suffix| suffix.starts_with(['&', '#']))
+}
+
+// Report layout and power states from OpenTaskbar (MIT). See ACCESSORIES.md.
+pub fn dualsense_percent(report: &[u8], bluetooth: bool) -> Option<u8> {
+    let offset = match (bluetooth, report.first()?) {
+        (false, 0x01) if report.len() >= 64 => 53,
+        (true, 0x31) if report.len() >= 78 => 54,
+        _ => return None,
+    };
+    let status = *report.get(offset)?;
+    let step = status & 0x0f;
+    match status >> 4 {
+        0 | 1 if step <= 10 => Some(step * 10),
+        2 => Some(100),
+        _ => None,
+    }
 }
 
 /// Windows exposes short and long HID++ reports as separate collections.

@@ -21,7 +21,10 @@
 use anyhow::Result;
 use muelle_config::{IslandStyle, Language};
 use muelle_shell::{
-    accessories::{Kind as AccessoryKind, Snapshot as AccessorySnapshot},
+    accessories::{
+        BluetoothDevices, BluetoothModel, Kind as AccessoryKind, Snapshot as AccessorySnapshot,
+        State as AccessoryState,
+    },
     appbar::{AppBar, Edge},
     launcher,
     status::{self, AudioWatch, Network, NetworkWatch, Privacy, TaskbarButtons, Volume},
@@ -182,11 +185,15 @@ static TRIGGERS_BOTTOM: AtomicI32 = AtomicI32::new(0);
 static TRIGGERS_RIGHT: AtomicI32 = AtomicI32::new(0);
 static PANEL_LEFT: AtomicI32 = AtomicI32::new(0);
 static PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
+static BLUETOOTH_TRIGGER_LEFT: AtomicI32 = AtomicI32::new(0);
+static BLUETOOTH_TRIGGER_RIGHT: AtomicI32 = AtomicI32::new(0);
 static BAR_TOP: AtomicI32 = AtomicI32::new(0);
 static BAR_BOTTOM: AtomicI32 = AtomicI32::new(0);
 static PANEL_BOTTOM: AtomicI32 = AtomicI32::new(0);
 /// The hook exists only while the island is expanded.
 static ISLAND_HOOK_WINDOW: AtomicIsize = AtomicIsize::new(0);
+mod bluetooth_panel;
+
 /// Segoe Fluent Icons code points.
 pub(crate) mod glyph {
     pub const ETHERNET: char = '\u{E839}';
@@ -202,6 +209,8 @@ pub(crate) mod glyph {
     pub const CAMERA: char = '\u{E722}';
     pub const MOUSE: char = '\u{E962}';
     pub const HEADSET: char = '\u{E95B}';
+    pub const HEADPHONE: char = '\u{E7F6}';
+    pub const GAMEPAD: char = '\u{E7FC}';
     pub const BLUETOOTH: char = '\u{E702}';
     /// The bell of the Windows 11 notification center ("Ringer").
     pub const NOTIFICATIONS: char = '\u{EA8F}';
@@ -227,6 +236,7 @@ enum Action {
     Microphone,
     Camera,
     Bluetooth,
+    BluetoothDetails,
     /// The system monitor: Task Manager, which lists what uses each.
     SystemMonitor,
 }
@@ -356,6 +366,7 @@ struct Status {
 #[derive(Clone, PartialEq)]
 struct Look {
     accessories: [Option<AccessoryReading>; 2],
+    bluetooth_devices: Option<BluetoothDevices>,
     /// The system monitor's lines (see `MenuBar::monitor_lines`) while on.
     monitor: Option<[String; 4]>,
     language: Language,
@@ -422,6 +433,13 @@ fn accessory_readings(snapshot: &AccessorySnapshot) -> [Option<AccessoryReading>
     })
 }
 
+fn bluetooth_icon(model: BluetoothModel) -> char {
+    match model {
+        BluetoothModel::Sony | BluetoothModel::AirPods => glyph::HEADPHONE,
+        BluetoothModel::DualSense => glyph::GAMEPAD,
+    }
+}
+
 impl Look {
     fn island_height(&self, bar_height: f32) -> f32 {
         let extra = if self.zoned && self.widgets.island_style == IslandStyle::Notch {
@@ -436,6 +454,13 @@ impl Look {
         match self.panel {
             Some(Island::Music) => 180.0,
             Some(Island::Usage) if self.widgets.ai_alerts => USAGE_DETAIL_HEIGHT,
+            Some(Island::Bluetooth) => {
+                let airpods_known = self
+                    .bluetooth_devices
+                    .and_then(|devices| devices.status(BluetoothModel::AirPods))
+                    .is_some();
+                103.0 + if airpods_known { 27.0 } else { 0.0 }
+            }
             Some(Island::Usage) => {
                 74.0 + Provider::ALL
                     .into_iter()
@@ -484,6 +509,7 @@ impl Look {
 enum Island {
     Music,
     Usage,
+    Bluetooth,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1026,6 +1052,7 @@ pub struct MenuBar {
     bluetooth: Option<bluetooth::Monitor>,
     accessories: Option<accessories::Monitor>,
     accessories_enabled: bool,
+    bluetooth_accessories_enabled: bool,
     accessory_retry_at: Instant,
     /// The system monitor's counters, only while it samples (issue #64).
     monitor: Option<muelle_shell::monitor::Sampler>,
@@ -1308,7 +1335,11 @@ unsafe extern "system" fn outside_click_proc(code: i32, w: WPARAM, l: LPARAM) ->
             && point.y < PANEL_BOTTOM.load(Ordering::Relaxed)
             && point.x >= PANEL_LEFT.load(Ordering::Relaxed)
             && point.x < PANEL_RIGHT.load(Ordering::Relaxed);
-        if !in_triggers && !in_panel {
+        let in_bluetooth = point.y >= BAR_TOP.load(Ordering::Relaxed)
+            && point.y < BAR_BOTTOM.load(Ordering::Relaxed)
+            && point.x >= BLUETOOTH_TRIGGER_LEFT.load(Ordering::Relaxed)
+            && point.x < BLUETOOTH_TRIGGER_RIGHT.load(Ordering::Relaxed);
+        if !in_triggers && !in_panel && !in_bluetooth {
             let window = ISLAND_HOOK_WINDOW.load(Ordering::Relaxed);
             if window != 0 {
                 // SAFETY: The window remains live until the hook is removed in Drop.
@@ -1970,6 +2001,7 @@ impl MenuBar {
         let mut bar = Self {
             accessories: None,
             accessories_enabled: false,
+            bluetooth_accessories_enabled: false,
             accessory_retry_at: Instant::now() + Duration::from_secs(60),
             monitor: None,
             monitor_reading: muelle_shell::monitor::Reading::default(),
@@ -2302,12 +2334,18 @@ impl MenuBar {
         self.refresh(gfx)
     }
 
-    pub fn set_accessories_enabled(&mut self, gfx: &Gfx, enabled: bool) -> Result<()> {
-        if self.accessories_enabled == enabled {
+    pub fn set_accessories_enabled(
+        &mut self,
+        gfx: &Gfx,
+        legacy: bool,
+        bluetooth: bool,
+    ) -> Result<()> {
+        if (self.accessories_enabled, self.bluetooth_accessories_enabled) == (legacy, bluetooth) {
             return Ok(());
         }
-        self.accessories_enabled = enabled;
-        if enabled {
+        self.accessories_enabled = legacy;
+        self.bluetooth_accessories_enabled = bluetooth;
+        if self.wants_accessories() {
             self.restart_accessories(gfx)
         } else {
             self.accessories = None;
@@ -2315,8 +2353,12 @@ impl MenuBar {
         }
     }
 
+    fn wants_accessories(&self) -> bool {
+        self.accessories_enabled || self.bluetooth_accessories_enabled
+    }
+
     pub fn accessories_changed(&mut self, gfx: &Gfx) -> Result<()> {
-        if self.accessories_enabled && self.status_shown() {
+        if self.wants_accessories() && self.status_shown() {
             self.refresh(gfx)?;
         }
         Ok(())
@@ -2325,7 +2367,7 @@ impl MenuBar {
     pub fn restart_accessories(&mut self, gfx: &Gfx) -> Result<()> {
         // Resume/audio notifications and the minute tick must never start a
         // disabled reader, including after a previously enabled one failed.
-        if !self.accessories_enabled {
+        if !self.wants_accessories() {
             return Ok(());
         }
         self.accessory_retry_at = Instant::now() + Duration::from_secs(60);
@@ -2334,6 +2376,8 @@ impl MenuBar {
             self.hwnd.0 as isize,
             ACCESSORIES_CHANGED,
             self.status_shown(),
+            self.accessories_enabled,
+            self.bluetooth_accessories_enabled,
         )
         .inspect_err(|error| eprintln!("muelle: accesorios: {error:#}"))
         .ok();
@@ -2710,11 +2754,17 @@ impl MenuBar {
             };
             let changed = self.revealed_sides != sides;
             self.revealed_sides = sides;
-            if self.panel.is_some() && matches!(zone, PointerZone::Left | PointerZone::Right) {
+            if self.panel.is_some()
+                && matches!(zone, PointerZone::Left | PointerZone::Right)
+                && !(self.panel == Some(Island::Bluetooth) && self.bluetooth_trigger().contains(x))
+            {
                 return self.dismiss_island(gfx);
             }
             if changed {
                 self.place()?;
+                if sides.right && self.bluetooth_accessories_enabled {
+                    self.accessories_changed(gfx)?;
+                }
             }
             return Ok(());
         }
@@ -2746,12 +2796,17 @@ impl MenuBar {
             // The edge watcher applies the same dwell to the resting island.
             return Ok(());
         }
+        let trigger = if self.panel == Some(Island::Bluetooth) {
+            self.bluetooth_trigger()
+        } else {
+            self.triggers_span
+        };
         let span = island_or_panel_span(
             x,
             y,
             (self.bounds.bottom - self.bounds.top) as f32,
             self.island_height,
-            self.triggers_span,
+            trigger,
             self.panel_span,
         );
         if self.panel.is_some() && (x < span.left || x >= span.right) {
@@ -2864,10 +2919,12 @@ impl MenuBar {
 
     fn desired_window_region(&self, presence: Presence, hiding: bool) -> Option<WindowRegion> {
         if self.zoned() {
-            Some(self.capsule_layout.region(
-                self.visible_sides(presence, hiding),
-                self.island_hide_until.is_none(),
-            ))
+            let sides = self.visible_sides(presence, hiding);
+            let mut layout = self.capsule_layout;
+            if self.panel == Some(Island::Bluetooth) && !sides.right {
+                layout.panel = None;
+            }
+            Some(layout.region(sides, self.island_hide_until.is_none()))
         } else if presence == Presence::Full
             && let Some(panel) = self.capsule_layout.panel
         {
@@ -3140,7 +3197,7 @@ impl MenuBar {
             && self.accessories.as_ref().is_none_or(|monitor| {
                 monitor.snapshot().state == muelle_shell::accessories::State::Unavailable
             });
-        if self.accessories_enabled && (audio_changed || retry_due) {
+        if self.wants_accessories() && (audio_changed || retry_due) {
             self.restart_accessories(gfx)?;
         }
         if self.clock_running {
@@ -3157,7 +3214,7 @@ impl MenuBar {
             .audio
             .as_ref()
             .is_some_and(AudioWatch::take_default_changed)
-            && self.accessories_enabled
+            && self.wants_accessories()
         {
             self.status.volume = volume;
             self.restart_accessories(gfx)?;
@@ -3315,6 +3372,13 @@ impl MenuBar {
         if resting_island || y >= (self.bounds.bottom - self.bounds.top) as f32 {
             return Ok(());
         }
+        if self.status_shown()
+            && self.zones.iter().any(|(left, right, action)| {
+                *action == Action::BluetoothDetails && x >= *left && x < *right
+            })
+        {
+            return self.toggle_bluetooth_panel(gfx);
+        }
         self.dismiss_island(gfx)?;
         let hit = self
             .zones
@@ -3328,7 +3392,7 @@ impl MenuBar {
             )
         });
         match hit.map(|(_, _, action)| *action) {
-            Some(Action::AccessoryIndicator) => {}
+            Some(Action::AccessoryIndicator | Action::BluetoothDetails) => {}
             Some(Action::QuickSettings) => launcher::open_quick_settings(),
             Some(Action::Notifications) => launcher::open_notifications(),
             Some(Action::Clock) => match &self.clock_target {
@@ -3397,7 +3461,12 @@ impl MenuBar {
             ActiveProviders::default()
         };
         let track = self.media.as_ref().and_then(media::Watch::snapshot);
-        self.panel = available_panel(self.panel, track.is_some(), active_providers.any());
+        self.panel = available_panel(
+            self.panel,
+            track.is_some(),
+            active_providers.any(),
+            self.bluetooth_accessories_enabled,
+        );
         if !active_providers.any() {
             if let Some(usage) = &mut self.usage {
                 usage.mark_inactive();
@@ -3421,6 +3490,13 @@ impl MenuBar {
         let look = Look {
             accessories: self.accessories.as_ref().map_or([None, None], |monitor| {
                 accessory_readings(&monitor.snapshot())
+            }),
+            bluetooth_devices: self.bluetooth_accessories_enabled.then(|| {
+                self.accessories
+                    .as_ref()
+                    .map(accessories::Monitor::snapshot)
+                    .filter(|snapshot| snapshot.state == AccessoryState::Ready)
+                    .map_or_else(BluetoothDevices::default, |snapshot| snapshot.bluetooth)
             }),
             monitor: self.monitor_lines(),
             language: strings::language(),
@@ -3566,7 +3642,12 @@ impl MenuBar {
             self.look = Some(look);
             return self.progress_tick(gfx);
         }
-        self.panel = available_panel(self.panel, look.track.is_some(), look.usage_enabled);
+        self.panel = available_panel(
+            self.panel,
+            look.track.is_some(),
+            look.usage_enabled,
+            look.bluetooth_devices.is_some(),
+        );
         look.panel = self.panel;
         self.apply_look(gfx, look)
     }
@@ -3575,7 +3656,12 @@ impl MenuBar {
         look.zoned = self.ghost && look.widgets.bare;
         look.active_providers = look.usage.visible_providers(look.active_providers);
         look.usage_enabled &= look.active_providers.any();
-        self.panel = available_panel(look.panel, look.track.is_some(), look.usage_enabled);
+        self.panel = available_panel(
+            look.panel,
+            look.track.is_some(),
+            look.usage_enabled,
+            look.bluetooth_devices.is_some(),
+        );
         look.panel = self.panel;
         if look.panel != Some(Island::Usage) {
             self.usage_scroll = 0.0;
@@ -4081,6 +4167,7 @@ impl MenuBar {
         let status = look.status;
         let symbol = |layers: &[(char, f32)]| gfx.glyph_brush(layers, scale, ink);
         let mut items: Vec<(LabelBrush, Action)> = Vec::new();
+        let mut accessory_labels = Vec::new();
         // Checked at each push, not filtered afterwards: the battery and
         // accessory labels remember indexes into `items`.
         let wanted = |action: Action| !look.widgets.essentials || essential(action);
@@ -4110,7 +4197,27 @@ impl MenuBar {
         if status.buttons.search && wanted(Action::Search) {
             items.push((symbol(&[(glyph::SEARCH, 1.0)])?, Action::Search));
         }
-        if status.bluetooth_on {
+        if let Some(devices) = look.bluetooth_devices {
+            let first_index = items.len();
+            for model in BluetoothModel::ALL.into_iter().rev() {
+                if let Some(percent) = devices.status(model).and_then(|status| status.percent) {
+                    accessory_labels.push((
+                        items.len(),
+                        gfx.text_brush(&format!("{percent} %"), scale, false, ink)?,
+                    ));
+                    items.push((
+                        symbol(&[(bluetooth_icon(model), 1.0)])?,
+                        Action::BluetoothDetails,
+                    ));
+                }
+            }
+            if items.len() == first_index {
+                items.push((
+                    symbol(&[(glyph::BLUETOOTH, 1.0)])?,
+                    Action::BluetoothDetails,
+                ));
+            }
+        } else if status.bluetooth_on {
             items.push((symbol(&[(glyph::BLUETOOTH, 1.0)])?, Action::Bluetooth));
         }
         // The control center already opens all of quick settings: the network
@@ -4150,16 +4257,16 @@ impl MenuBar {
                 Action::Power,
             ));
         }
-        let mut accessory_labels = Vec::new();
         for device in look.accessories.into_iter().flatten().rev() {
             let value = device
                 .percent
                 .map_or_else(|| "—".to_owned(), |percent| format!("{percent}%"));
-            accessory_labels.push((items.len(), gfx.text_brush(&value, scale, false, ink)?));
             let icon = match device.kind {
                 AccessoryKind::Mouse => glyph::MOUSE,
                 AccessoryKind::Headset => glyph::HEADSET,
+                AccessoryKind::Gamepad => continue,
             };
+            accessory_labels.push((items.len(), gfx.text_brush(&value, scale, false, ink)?));
             items.push((symbol(&[(icon, 1.0)])?, Action::AccessoryIndicator));
         }
         if let Some(language) = &look.input {
@@ -4331,6 +4438,15 @@ impl MenuBar {
         self.triggers_span = Span::default();
         self.panel_span = Span::default();
         self.draw_island(gfx, look, &island_layers, width, height, left_end, right)?;
+        let bluetooth_trigger = if look.panel == Some(Island::Bluetooth) {
+            let trigger = self.bluetooth_trigger();
+            if trigger.width() > 0.0 {
+                self.draw_bluetooth_panel(gfx, look, &right_layers, width, height, trigger)?;
+            }
+            trigger
+        } else {
+            Span::default()
+        };
         self.island_height = if self.triggers_span.width() > 0.0 {
             island_height
         } else {
@@ -4383,6 +4499,14 @@ impl MenuBar {
             screen.left + self.panel_span.right as i32,
             Ordering::Relaxed,
         );
+        BLUETOOTH_TRIGGER_LEFT.store(
+            screen.left + bluetooth_trigger.left as i32,
+            Ordering::Relaxed,
+        );
+        BLUETOOTH_TRIGGER_RIGHT.store(
+            screen.left + bluetooth_trigger.right as i32,
+            Ordering::Relaxed,
+        );
         BAR_TOP.store(screen.top, Ordering::Relaxed);
         BAR_BOTTOM.store(screen.top + height as i32, Ordering::Relaxed);
         TRIGGERS_BOTTOM.store(screen.top + self.island_height as i32, Ordering::Relaxed);
@@ -4393,6 +4517,18 @@ impl MenuBar {
         };
         PANEL_BOTTOM.store(screen.top + clickable_height as i32, Ordering::Relaxed);
         self.place()
+    }
+
+    fn bluetooth_trigger(&self) -> Span {
+        self.zones
+            .iter()
+            .filter(|(_, _, action)| *action == Action::BluetoothDetails)
+            .map(|&(left, right, _)| Span { left, right })
+            .reduce(|a, b| Span {
+                left: a.left.min(b.left),
+                right: a.right.max(b.right),
+            })
+            .unwrap_or_default()
     }
 
     #[expect(
@@ -4634,10 +4770,12 @@ impl MenuBar {
                         Vec::new()
                     };
                 }
+                Island::Bluetooth => continue,
             }
             let (left, right) = match kind {
                 Island::Music => (span.left, divider.unwrap_or(span.right)),
                 Island::Usage => (divider.unwrap_or(span.left), span.right),
+                Island::Bluetooth => continue,
             };
             self.island_hits.push(IslandHit {
                 bounds: (left, 0.0, right, bar_height.max(compact_height)),
@@ -4649,6 +4787,7 @@ impl MenuBar {
             let desired = px(match kind {
                 Island::Music => 360.0,
                 Island::Usage => ISLAND_EXPANDED_WIDTH,
+                Island::Bluetooth => continue,
             });
             self.panel_span = match style {
                 IslandStyle::Notch => panel_span(span, width, desired),
@@ -4698,6 +4837,7 @@ impl MenuBar {
                 Island::Usage => {
                     self.draw_usage_panel(gfx, &content, geometry, height, look, &providers)?
                 }
+                Island::Bluetooth => continue,
             }
         }
         Ok(())
@@ -5513,10 +5653,16 @@ fn toggle_panel(open: Option<Island>, clicked: Island) -> Option<Island> {
     (open != Some(clicked)).then_some(clicked)
 }
 
-fn available_panel(open: Option<Island>, music: bool, usage: bool) -> Option<Island> {
+fn available_panel(
+    open: Option<Island>,
+    music: bool,
+    usage: bool,
+    bluetooth: bool,
+) -> Option<Island> {
     open.filter(|island| match island {
         Island::Music => music,
         Island::Usage => usage,
+        Island::Bluetooth => bluetooth,
     })
 }
 
@@ -7874,9 +8020,36 @@ mod island_tests {
                 usize::from(on)
             );
         }
+        use muelle_shell::accessories::{BluetoothDevices, BluetoothModel};
+        let mut devices = BluetoothDevices::default();
+        devices.observe(BluetoothModel::Sony, true, Some(40));
+        devices.observe(BluetoothModel::AirPods, false, None);
+        look.bluetooth_devices = Some(devices);
+        look.status.bluetooth_on = true;
+        bar.apply_look(&gfx, look.clone())?;
+        let (left, right, _) = *bar
+            .zones
+            .iter()
+            .find(|(_, _, action)| *action == Action::BluetoothDetails)
+            .context("missing Bluetooth detail trigger")?;
+        bar.toggle_bluetooth_panel(&gfx)?;
+        assert!(bar.panel_span.contains((left + right) / 2.0));
+        assert_eq!(
+            bar.look.as_ref().context("missing look")?.panel_height(),
+            130.0
+        );
+        bar.toggle_bluetooth_panel(&gfx)?;
+        assert!(bar.panel.is_none() && bar.panel_span.width() == 0.0);
+        bar.toggle_bluetooth_panel(&gfx)?;
+        look.panel = Some(Island::Bluetooth);
+        look.bluetooth_devices = None;
+        bar.apply_look(&gfx, look.clone())?;
+        assert!(bar.panel.is_none() && bar.panel_span.width() == 0.0);
+
         // The native event handler updates the cached Look instead of running
         // provider/process scans or re-reading unrelated Windows preferences.
         look.status.bluetooth_on = true;
+        look.panel = None;
         bar.apply_look(&gfx, look)?;
         bar.bluetooth_changed(&gfx)?;
         assert!(
@@ -8544,9 +8717,9 @@ mod island_tests {
         bar.restart_accessories(&gfx)?;
         bar.tick(&gfx)?;
         assert!(bar.accessories.is_none());
-        bar.set_accessories_enabled(&gfx, true)?;
+        bar.set_accessories_enabled(&gfx, true, false)?;
         assert!(bar.accessories.is_some());
-        bar.set_accessories_enabled(&gfx, false)?;
+        bar.set_accessories_enabled(&gfx, false, false)?;
         bar.accessory_retry_at = Instant::now() - Duration::from_secs(1);
         bar.restart_accessories(&gfx)?;
         bar.tick(&gfx)?;
@@ -9578,8 +9751,14 @@ mod island_tests {
 
     #[test]
     fn losing_a_session_closes_its_panel_without_opening_the_other() {
-        assert_eq!(available_panel(Some(Island::Music), false, true), None);
-        assert_eq!(available_panel(Some(Island::Usage), true, false), None);
+        assert_eq!(
+            available_panel(Some(Island::Music), false, true, false),
+            None
+        );
+        assert_eq!(
+            available_panel(Some(Island::Usage), true, false, false),
+            None
+        );
     }
 
     #[test]

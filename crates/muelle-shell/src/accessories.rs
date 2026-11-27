@@ -11,6 +11,7 @@ pub const MAX_DEVICES: usize = 32;
 pub enum Kind {
     Mouse,
     Headset,
+    Gamepad,
 }
 
 impl Kind {
@@ -49,11 +50,72 @@ pub enum State {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BluetoothModel {
+    Sony,
+    AirPods,
+    DualSense,
+}
+
+impl BluetoothModel {
+    pub const ALL: [Self; 3] = [Self::Sony, Self::AirPods, Self::DualSense];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase();
+        if name.contains("wh-1000xm5") {
+            Some(Self::Sony)
+        } else if name.contains("airpods max") {
+            Some(Self::AirPods)
+        } else if name.contains("dualsense") && !name.contains("edge") {
+            Some(Self::DualSense)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BluetoothStatus {
+    pub connected: bool,
+    pub percent: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BluetoothDevices([Option<BluetoothStatus>; 3]);
+
+impl BluetoothDevices {
+    pub fn status(self, model: BluetoothModel) -> Option<BluetoothStatus> {
+        self.0[model as usize]
+    }
+
+    pub fn observe(&mut self, model: BluetoothModel, connected: bool, percent: Option<u8>) {
+        let connected = connected && model != BluetoothModel::AirPods;
+        let percent = percent.filter(|&value| connected && value <= 100);
+        let slot = &mut self.0[model as usize];
+        if slot.is_none_or(|old| {
+            (connected, percent.is_some()) > (old.connected, old.percent.is_some())
+        }) {
+            *slot = Some(BluetoothStatus { connected, percent });
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.0.into_iter().flatten().all(|device| {
+            device
+                .percent
+                .is_none_or(|percent| device.connected && percent <= 100)
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub state: State,
     pub devices: Vec<Device>,
+    #[serde(default)]
+    pub bluetooth: BluetoothDevices,
     /// Time Windows' cached data was received, not a measurement by the peripheral.
     pub received_at: Option<u64>,
 }
@@ -61,7 +123,8 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn valid(&self) -> bool {
         let mut ids = BTreeSet::new();
-        self.devices.len() <= MAX_DEVICES
+        self.bluetooth.valid()
+            && self.devices.len() <= MAX_DEVICES
             && self.devices.iter().all(|device| {
                 !device.id.is_empty()
                     && device.id.len() <= 512
@@ -141,6 +204,42 @@ pub fn assemble(endpoints: Vec<Endpoint>, levels: BTreeMap<String, BTreeSet<u8>>
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_paired_bluetooth_device_never_presents_cached_battery_when_disconnected() {
+        let mut devices = BluetoothDevices::default();
+        devices.observe(BluetoothModel::Sony, false, Some(80));
+        assert_eq!(
+            devices.status(BluetoothModel::Sony),
+            Some(BluetoothStatus {
+                connected: false,
+                percent: None,
+            })
+        );
+        devices.observe(BluetoothModel::Sony, true, Some(0));
+        devices.observe(BluetoothModel::Sony, false, Some(80));
+        assert_eq!(
+            devices.status(BluetoothModel::Sony),
+            Some(BluetoothStatus {
+                connected: true,
+                percent: Some(0),
+            })
+        );
+        assert_eq!(devices.status(BluetoothModel::AirPods), None);
+    }
+
+    #[test]
+    fn airpods_are_listed_but_their_battery_is_deferred() {
+        let mut devices = BluetoothDevices::default();
+        devices.observe(BluetoothModel::AirPods, true, Some(65));
+        assert_eq!(
+            devices.status(BluetoothModel::AirPods),
+            Some(BluetoothStatus {
+                connected: false,
+                percent: None,
+            })
+        );
+    }
+
     fn endpoint(id: &str, connected: Option<bool>) -> Endpoint {
         Endpoint {
             id: id.into(),
@@ -196,6 +295,7 @@ mod tests {
             state: State::Ready,
             devices: assemble(vec![endpoint("a", Some(true))], BTreeMap::new()),
             received_at: Some(1),
+            ..Snapshot::default()
         };
         assert_eq!(snapshot.compact().into_iter().flatten().count(), 1);
         snapshot.state = State::Unavailable;
@@ -256,6 +356,7 @@ mod tests {
             state: State::Ready,
             devices: assemble(vec![endpoint("a", Some(true))], BTreeMap::new()),
             received_at: None,
+            ..Snapshot::default()
         };
         assert!(data.valid());
         data.devices[0].percent = Some(101);

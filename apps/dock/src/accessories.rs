@@ -36,6 +36,7 @@ use windows::Win32::{
 };
 
 pub const FLAG: &str = "--accessories-worker";
+pub const BLUETOOTH_FLAG: &str = "--bluetooth-accessories-worker";
 pub const USB_FLAG: &str = usb::FLAG;
 pub fn usb_worker_main() -> Result<()> {
     usb::query_main()
@@ -55,8 +56,8 @@ enum Frame {
     Failed,
 }
 
-pub fn worker_main(visibility: Option<&str>) -> Result<()> {
-    if let Err(error) = worker::run(visibility) {
+pub fn worker_main(visibility: Option<&str>, legacy: bool, bluetooth: bool) -> Result<()> {
+    if let Err(error) = worker::run(visibility, legacy, bluetooth) {
         let _ = worker::emit(&Frame::Failed);
         return Err(error);
     }
@@ -125,11 +126,24 @@ pub struct Monitor {
     shared: Arc<Shared>,
 }
 impl Monitor {
-    pub fn new(window: isize, message: u32, visible: bool) -> Result<Self> {
+    pub fn new(
+        window: isize,
+        message: u32,
+        visible: bool,
+        legacy: bool,
+        bluetooth: bool,
+    ) -> Result<Self> {
         let executable = env::current_exe()?;
         Self::start(window, message, visible, |visibility| {
             let mut worker = Command::new(executable);
-            worker.arg(FLAG).arg(visibility);
+            if bluetooth {
+                worker.arg(BLUETOOTH_FLAG).arg(visibility);
+                if legacy {
+                    worker.arg("legacy");
+                }
+            } else {
+                worker.arg(FLAG).arg(visibility);
+            }
             worker
         })
     }
