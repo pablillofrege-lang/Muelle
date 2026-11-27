@@ -1555,15 +1555,14 @@ fn draw_usage_row(
     if let Some(image) = usage::logo(provider) {
         let icon_size = px(20.0) as u32;
         let image_brush = gfx.icon_brush(image, icon_size)?;
-        let brush: CompositionBrush =
-            if !matches!(provider, Provider::Claude | Provider::Gemini) && light {
-                let tinted = c.CreateMaskBrush()?;
-                tinted.SetMask(&image_brush)?;
-                tinted.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
-                tinted.cast()?
-            } else {
-                image_brush.cast()?
-            };
+        let brush: CompositionBrush = if !provider.logo_in_color() && light {
+            let tinted = c.CreateMaskBrush()?;
+            tinted.SetMask(&image_brush)?;
+            tinted.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
+            tinted.cast()?
+        } else {
+            image_brush.cast()?
+        };
         add_visual(
             c,
             layers,
@@ -1805,15 +1804,14 @@ fn draw_usage_column(
     let icon = px(13.0);
     if let Some(image) = usage::logo(*provider) {
         let image = gfx.icon_brush(image, icon as u32)?;
-        let brush: CompositionBrush =
-            if geometry.light && !matches!(provider, Provider::Claude | Provider::Gemini) {
-                let mask = c.CreateMaskBrush()?;
-                mask.SetMask(&image)?;
-                mask.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
-                mask.cast()?
-            } else {
-                image.cast()?
-            };
+        let brush: CompositionBrush = if geometry.light && !provider.logo_in_color() {
+            let mask = c.CreateMaskBrush()?;
+            mask.SetMask(&image)?;
+            mask.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
+            mask.cast()?
+        } else {
+            image.cast()?
+        };
         add_visual(c, layers, &brush, left, px(10.0), icon, icon)?;
     }
     let label = |text: &str, x, y, size, bold, opacity| -> Result<()> {
@@ -6161,8 +6159,7 @@ fn island_providers(look: &Look) -> Vec<IslandProvider<'_>> {
                 Provider::Claude => rgba(217, 119, 87, 255),
                 Provider::Codex => rgba(135, 190, 245, 255),
                 Provider::OpenCode => rgba(132, 196, 166, 255),
-                Provider::Gemini => rgba(111, 146, 255, 255),
-                Provider::Antigravity => rgba(143, 167, 255, 255),
+                Provider::Gemini | Provider::Antigravity => rgba(111, 146, 255, 255),
                 Provider::Zai => rgba(79, 110, 247, 255),
             };
             (provider, look.usage.get(provider), accent)
@@ -6568,15 +6565,14 @@ fn draw_compact_usage(
         let mut beat = None;
         if let Some(image) = usage::logo(*provider) {
             let image_brush = gfx.icon_brush(image, icon_size)?;
-            let brush: CompositionBrush =
-                if !matches!(provider, Provider::Claude | Provider::Gemini) && geometry.light {
-                    let tinted = c.CreateMaskBrush()?;
-                    tinted.SetMask(&image_brush)?;
-                    tinted.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
-                    tinted.cast()?
-                } else {
-                    image_brush.cast()?
-                };
+            let brush: CompositionBrush = if !provider.logo_in_color() && geometry.light {
+                let tinted = c.CreateMaskBrush()?;
+                tinted.SetMask(&image_brush)?;
+                tinted.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
+                tinted.cast()?
+            } else {
+                image_brush.cast()?
+            };
             beat = Some(add_visual(
                 c,
                 content,
@@ -6703,15 +6699,14 @@ fn draw_bubble_usage(
         let mut beat = None;
         if let Some(image) = usage::logo(*provider) {
             let image_brush = gfx.icon_brush(image, icon_size)?;
-            let brush: CompositionBrush =
-                if !matches!(provider, Provider::Claude | Provider::Gemini) && geometry.light {
-                    let tinted = c.CreateMaskBrush()?;
-                    tinted.SetMask(&image_brush)?;
-                    tinted.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
-                    tinted.cast()?
-                } else {
-                    image_brush.cast()?
-                };
+            let brush: CompositionBrush = if !provider.logo_in_color() && geometry.light {
+                let tinted = c.CreateMaskBrush()?;
+                tinted.SetMask(&image_brush)?;
+                tinted.SetSource(&c.CreateColorBrushWithColor(rgba(27, 34, 45, 255))?)?;
+                tinted.cast()?
+            } else {
+                image_brush.cast()?
+            };
             beat = Some(add_visual(
                 c,
                 content,

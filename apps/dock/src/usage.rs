@@ -2,10 +2,10 @@
 
 use std::{
     env, fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -280,6 +280,10 @@ impl Provider {
         Self::Antigravity,
     ];
 
+    pub fn logo_in_color(self) -> bool {
+        matches!(self, Self::Claude | Self::Gemini | Self::Antigravity)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
@@ -493,11 +497,7 @@ pub fn logo(provider: Provider) -> Option<&'static IconImage> {
     static OPENCODE: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
     static GEMINI: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
     static ZAI: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
-    static ANTIGRAVITY: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
     match provider {
-        Provider::Antigravity => ANTIGRAVITY
-            .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/antigravity.png")))
-            .as_ref(),
         Provider::Claude => CLAUDE
             .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/claude.png")))
             .as_ref(),
@@ -507,7 +507,7 @@ pub fn logo(provider: Provider) -> Option<&'static IconImage> {
         Provider::OpenCode => OPENCODE
             .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/opencode.png")))
             .as_ref(),
-        Provider::Gemini => GEMINI
+        Provider::Gemini | Provider::Antigravity => GEMINI
             .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/gemini.png")))
             .as_ref(),
         Provider::Zai => ZAI
@@ -717,11 +717,9 @@ fn fetch_all() -> Snapshot {
                 Provider::Codex => fetch_codex(&client),
                 Provider::OpenCode => fetch_opencode(&client),
                 Provider::Gemini => fetch_gemini(&client),
-                Provider::Antigravity if antigravity_desktop => {
-                    fetch_antigravity().unwrap_or_else(unavailable)
-                }
-                // ACP does not expose quota. Never substitute Gemini CLI's account.
-                Provider::Antigravity => unavailable(),
+                Provider::Antigravity => fetch_antigravity_acp()
+                    .or_else(|| antigravity_desktop.then(fetch_antigravity).flatten())
+                    .unwrap_or_else(unavailable),
                 Provider::Zai => fetch_zai(&client),
             }
         }),
@@ -1224,6 +1222,86 @@ fn fetch_gemini(client: &Client) -> ProviderUsage {
     } else {
         ready(windows)
     }
+}
+
+fn fetch_antigravity_acp() -> Option<ProviderUsage> {
+    let system = env::var_os("SystemRoot")?;
+    let mut child =
+        Command::new(PathBuf::from(system).join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+    const SCRIPT: &str = concat!("& {\n", include_str!("antigravity-quota.ps1"), "\n}\n\n");
+    let sent = child
+        .stdin
+        .take()
+        .is_some_and(|mut input| input.write_all(SCRIPT.as_bytes()).is_ok());
+    if !sent {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().ok()?;
+    if !sent || !output.status.success() || output.stdout.len() > 128 * 1024 {
+        return None;
+    }
+    let value = serde_json::from_slice(&output.stdout).ok()?;
+    let windows = parse_antigravity_cli(&value);
+    (!windows.is_empty()).then(|| ready(windows))
+}
+
+fn parse_antigravity_cli(value: &Value) -> Vec<Window> {
+    if value.pointer("/command/name").and_then(Value::as_str) != Some("usage") {
+        return Vec::new();
+    }
+    let Some(groups) = value
+        .pointer("/command/data/groups")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let buckets = groups
+        .iter()
+        .filter_map(|group| group.get("buckets")?.as_array())
+        .flatten();
+    let mut windows: [Option<Window>; 2] = [None, None];
+    for bucket in buckets {
+        let (index, minutes) = match bucket.get("window").and_then(Value::as_str) {
+            Some("5h") => (0, 300),
+            Some("weekly") => (1, 10_080),
+            _ => continue,
+        };
+        let Some(fraction) = bucket
+            .get("remaining_fraction")
+            .and_then(Value::as_f64)
+            .filter(|fraction| (0.0..=1.0).contains(fraction))
+        else {
+            continue;
+        };
+        let Some(resets_at) = bucket
+            .get("reset_time")
+            .and_then(Value::as_str)
+            .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+            .filter(|time| time.timestamp() > 0)
+        else {
+            continue;
+        };
+        let used_percent = ((1.0 - fraction) * 100.0).round() as u8;
+        if windows[index]
+            .as_ref()
+            .is_none_or(|old| old.used_percent < used_percent)
+        {
+            windows[index] = Some(Window {
+                label: None,
+                minutes,
+                used_percent,
+                resets_at: Some(resets_at.with_timezone(&Utc)),
+            });
+        }
+    }
+    windows.into_iter().flatten().collect()
 }
 
 fn fetch_antigravity() -> Option<ProviderUsage> {
@@ -1856,6 +1934,28 @@ mod tests {
         })();
         fs::remove_dir_all(&root)?;
         result
+    }
+
+    #[test]
+    fn antigravity_cli_keeps_the_most_used_real_quota_per_window() {
+        let value = json!({"command": {"name": "usage", "data": {"groups": [
+            {"buckets": [
+                {"window":"5h","remaining_fraction":0.2,"reset_time":"2026-11-27T17:00:00Z"},
+                {"window":"weekly","remaining_fraction":0.7,"reset_time":"2026-12-04T10:00:00Z"}
+            ]},
+            {"buckets": [
+                {"window":"5h","remaining_fraction":0.05,"reset_time":"1970-01-01T00:00:00Z"},
+                {"window":"weekly","remaining_fraction":0.4,"reset_time":"2026-12-04T10:00:00Z"}
+            ]}
+        ]}}});
+        let windows = parse_antigravity_cli(&value);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|w| (w.minutes, w.used_percent))
+                .collect::<Vec<_>>(),
+            [(300, 80), (10_080, 60)]
+        );
     }
 
     #[test]
