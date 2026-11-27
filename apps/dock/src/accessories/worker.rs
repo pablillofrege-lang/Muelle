@@ -353,7 +353,7 @@ pub fn run(visibility: Option<&str>, legacy: bool, bluetooth: bool) -> Result<()
         .ok();
     let mut usb = usb::Sources::default();
     let (mut endpoints, mut nodes) = (BTreeMap::new(), BTreeMap::new());
-    let mut complete = [false, !legacy, false, _hands_free.is_none()];
+    let mut complete = [false; 2];
     let mut deadline = Some(Instant::now() + Duration::from_millis(120));
     let mut busy = true;
     let mut last: Option<Snapshot> = None;
@@ -384,11 +384,10 @@ pub fn run(visibility: Option<&str>, legacy: bool, bluetooth: bool) -> Result<()
                 continue;
             }
             deadline = None;
-            // Optional USB discovery must not delay the established Bluetooth source.
-            if complete[Source::Endpoint as usize]
-                && complete[Source::Node as usize]
-                && complete[Source::HandsFree as usize]
-            {
+            // AEP can deliver paired endpoints without ever completing enumeration.
+            // F4 publishes the known connections and lets subsequent events fill in
+            // the levels. Keep the original reader's startup behavior when F4 is off.
+            if bluetooth || complete.into_iter().all(|done| done) {
                 let mut current = snapshot(&endpoints, &nodes, &usb, legacy, bluetooth)?;
                 if let Some(previous) = &last
                     && current.devices == previous.devices
@@ -450,11 +449,13 @@ pub fn run(visibility: Option<&str>, legacy: bool, bluetooth: bool) -> Result<()
                 })
                 .remove(&update.Id()?.to_string());
             }
-            Event::Complete(source) => complete[source as usize] = true,
+            Event::Complete(source @ (Source::Endpoint | Source::Node)) => {
+                complete[source as usize] = true;
+            }
+            Event::Complete(_) => {}
             Event::Stopped(Source::Usb) => usb = usb::Sources::default(),
             Event::Stopped(Source::HandsFree) => {
                 nodes.retain(|path, _| !hands_free_id(path));
-                complete[Source::HandsFree as usize] = true;
             }
             Event::Stopped(_) => bail!("accessory watcher stopped"),
         }
