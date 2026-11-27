@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 
 interface CardProps {
   /** Heading above the group, as macOS System Settings labels its groups. */
@@ -18,18 +18,20 @@ export function Card({ title, children }: CardProps) {
 
 interface RowProps {
   label: string;
+  controlId?: string;
   hint?: string;
   icon?: ReactNode;
   stacked?: boolean;
   children: ReactNode;
 }
 
-export function Row({ label, hint, icon, stacked, children }: RowProps) {
+export function Row({ label, controlId, hint, icon, stacked, children }: RowProps) {
   return (
     <div className={stacked ? "row row-stacked" : "row"}>
       {icon ? <span className="row-icon">{icon}</span> : null}
       <div className="row-text">
-        <span className="row-label">{label}</span>
+        {controlId ? <label className="row-label" htmlFor={controlId}>{label}</label>
+          : <span className="row-label">{label}</span>}
         {hint ? <span className="row-hint">{hint}</span> : null}
       </div>
       <div className="row-control">{children}</div>
@@ -116,14 +118,71 @@ export function Slider({ value, min, max, label, unit = "px", disabled, onChange
 interface SelectProps<T extends string> {
   value: T;
   label: string;
+  id?: string;
   options: readonly { value: T; label: string }[];
   onChange: (value: T) => void;
 }
 
+interface PreferenceInputProps {
+  label: string;
+  value: string | number;
+  min?: number;
+  max?: number;
+  maxLength?: number;
+  invalidText?: string;
+  onChange: (value: string) => void;
+}
+
+/** Commits once the user leaves the field or presses Enter. */
+export function PreferenceInput({ label, value, min, max, maxLength, invalidText, onChange }: PreferenceInputProps) {
+  const errorId = useId();
+  const [draft, setDraft] = useState<string | null>(null);
+  const [invalid, setInvalid] = useState(false);
+  const number = typeof value === "number";
+  return (
+    <div className="preference-field">
+      <input
+        type={number ? "number" : "text"}
+        inputMode={number ? "decimal" : undefined}
+        step={number ? "any" : undefined}
+        required={number}
+        min={min}
+        max={max}
+        maxLength={maxLength}
+        aria-label={label}
+        aria-invalid={invalid || undefined}
+        aria-describedby={invalid ? errorId : undefined}
+        value={draft ?? value}
+        onChange={(event) => {
+          const input = event.currentTarget;
+          setDraft(input.value);
+          if (input.validity.valid) setInvalid(false);
+        }}
+        onBlur={(event) => {
+          if (draft === null) return;
+          const input = event.currentTarget;
+          if (!input.validity.valid) {
+            setInvalid(true);
+            return;
+          }
+          const next = input.value.trim();
+          if (next !== String(value)) onChange(next);
+          setDraft(null);
+          setInvalid(false);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.nativeEvent.isComposing) event.currentTarget.blur();
+        }}
+      />
+      {invalid && <span id={errorId} className="row-hint" role="status">{invalidText}</span>}
+    </div>
+  );
+}
+
 /** Native popup and keyboard navigation, styled like the other Settings controls. */
-export function Select<T extends string>({ value, label, options, onChange }: SelectProps<T>) {
+export function Select<T extends string>({ value, label, id, options, onChange }: SelectProps<T>) {
   return <span className="select-wrap">
-    <select className="select-control" aria-label={label} value={value}
+    <select className="select-control" id={id} aria-label={id ? undefined : label} value={value}
       onChange={(event) => onChange(event.target.value as T)}>
       {options.map((option) => <option key={option.value} value={option.value} dir="auto">{option.label}</option>)}
     </select>

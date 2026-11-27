@@ -18,24 +18,27 @@ use windows::Win32::{
             SetTimer, WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
             WM_DWMCOLORIZATIONCOLORCHANGED, WM_INITMENUPOPUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
             WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP,
-            WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK,
+            WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+            WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
         },
     },
 };
 
-use crate::{edge_watch, folder_menu, multi_window_view::MultiWindowAction};
+use crate::{
+    desktop_clock, edge_watch, folder_menu, multi_window_view::MultiWindowAction, weather,
+};
 
 use super::{
-    APPBAR_CALLBACK, ASSETS_DELAY_MS, ASSETS_READY, ASSETS_TIMER, App, BIN_CHANGED, BIN_DELAY_MS,
-    BIN_STATE, BIN_TIMER, BREAK_TIMER, CONFIG_CHANGED, DRAG_CANCELLED, DRAG_TIMER, DROP_RUN,
-    EDGE_TIMER, FULLSCREEN_TIMER, HEALTH_CHECK, HIDE_TIMER, HSHELL_FLASH, HSHELL_LANGUAGE,
-    HSHELL_REDRAW, HSHELL_RUDEAPPACTIVATED, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWDESTROYED,
-    LAST_FRONT, MASCOT_TIMER, Outside, PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC,
-    PBT_POWERSETTINGCHANGE, PINS_CHANGED, PINS_DELAY_MS, PINS_TIMER, PREVIEW_TIMER,
-    REFRESH_DELAY_MS, REFRESH_TIMER, SHELL_HOOK, SPI_SETWORKAREA, SPRING_TIMER, SWITCHER_TIMER,
-    SYNC_DELAY_MS, SYNC_TIMER, TASKBAR_CREATED, TASKBAR_DELAY_MS, TASKBAR_PREFS_CHANGED,
-    TASKBAR_TAKEN, TASKBAR_TIMER, TRIM_TIMER, UPDATE_TIMER, WELCOME_TIMER, WM_MOUSELEAVE,
-    WM_POWERBROADCAST,
+    APP, APPBAR_CALLBACK, ASSETS_DELAY_MS, ASSETS_READY, ASSETS_TIMER, App, BIN_CHANGED,
+    BIN_DELAY_MS, BIN_STATE, BIN_TIMER, BREAK_TIMER, CONFIG_CHANGED, DRAG_CANCELLED, DRAG_TIMER,
+    DROP_RUN, EDGE_TIMER, FULLSCREEN_TIMER, HEALTH_CHECK, HIDE_TIMER, HSHELL_FLASH,
+    HSHELL_LANGUAGE, HSHELL_REDRAW, HSHELL_RUDEAPPACTIVATED, HSHELL_WINDOWACTIVATED,
+    HSHELL_WINDOWDESTROYED, LAST_FRONT, MASCOT_TIMER, Outside, PBT_APMPOWERSTATUSCHANGE,
+    PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, PINS_CHANGED, PINS_DELAY_MS, PINS_TIMER,
+    PREVIEW_TIMER, REFRESH_DELAY_MS, REFRESH_TIMER, SHELL_HOOK, SPI_SETWORKAREA, SPRING_TIMER,
+    SWITCHER_TIMER, SYNC_DELAY_MS, SYNC_TIMER, TASKBAR_CREATED, TASKBAR_DELAY_MS,
+    TASKBAR_PREFS_CHANGED, TASKBAR_TAKEN, TASKBAR_TIMER, TRIM_TIMER, UPDATE_TIMER, WELCOME_TIMER,
+    WM_MOUSELEAVE, WM_POWERBROADCAST,
     feedback::query_bin_in_background,
     lifecycle::{is_tracked, main_window},
     with_app, with_app_then,
@@ -84,6 +87,27 @@ pub(super) unsafe extern "system" fn on_win_event(
             with_app("ventana activa", App::on_foreground_changed);
         }
     } else if event == EVENT_OBJECT_LOCATIONCHANGE {
+        if child == 0
+            && APP.with(|cell| {
+                cell.try_borrow().ok().is_some_and(|app| {
+                    app.as_ref()
+                        .and_then(|app| app.desktop_clock.as_ref())
+                        .is_some_and(|clock| clock.uses_parent(hwnd))
+                })
+            })
+        {
+            // Explorer may finish moving the parent after our display refresh.
+            // SAFETY: Only a payload-free message is queued to the dock.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(main_window()),
+                    desktop_clock::GEOMETRY_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+            return;
+        }
         // Only the foreground top-level window matters. Ignore child controls,
         // carets and background animations, and coalesce resize bursts using
         // the existing full-screen timer, without enumerating apps or polling.
@@ -368,6 +392,23 @@ pub fn menu_bar_finish_hide(completed_epoch: Option<usize>) {
     });
 }
 
+/// The compositor ended an announcement of the usage island; `generation`
+/// tells a stale end from the current one.
+pub fn menu_bar_alert_done(generation: usize) {
+    with_app("aviso de límite de IA", |app| match &mut app.menubar {
+        Some(bar) => bar.alert_done(&app.gfx, generation),
+        None => Ok(()),
+    });
+}
+
+/// The pointer rested on the usage island long enough to open its detail.
+pub fn menu_bar_usage_hover() {
+    with_app("detalle de uso de IA", |app| match &mut app.menubar {
+        Some(bar) => bar.usage_hover_fired(&app.gfx),
+        None => Ok(()),
+    });
+}
+
 pub fn menu_bar_pointer_moved(x: f32, y: f32) {
     with_app("barra superior", |app| match &mut app.menubar {
         Some(bar) => bar.pointer_moved(&app.gfx, x, y),
@@ -488,6 +529,14 @@ pub(super) unsafe extern "system" fn wndproc(
         DROP_RUN => with_app_then("soltar archivos", |app| Ok(app.pending_drop.take())),
         WM_RBUTTONUP => with_app_then("menú", App::on_right_click),
         BIN_STATE => with_app("papelera", |app| app.set_bin_full(w.0 != 0)),
+        weather::READY => with_app("pronóstico del tiempo", |app| {
+            app.weather.borrow_mut().poll();
+            app.refresh_desktop_clock(false);
+            if let Some(bar) = &mut app.menubar {
+                bar.weather_changed(&app.gfx)?;
+            }
+            Ok(())
+        }),
         TASKBAR_PREFS_CHANGED => {
             with_app("preferencias de badges", App::taskbar_preferences_changed)
         }
@@ -583,10 +632,36 @@ pub(super) unsafe extern "system" fn wndproc(
         WM_TIMER if w.0 == MASCOT_TIMER => with_app("mascota", App::mascot_tick),
         WM_TIMER if w.0 == WELCOME_TIMER => with_app("bienvenida", App::welcome),
         WM_TIMER if w.0 == BREAK_TIMER => with_app("descanso", App::break_tick),
+        WM_TIMER if w.0 == desktop_clock::TIMER => with_app("minuto del escritorio", |app| {
+            app.refresh_desktop_clock(true);
+            Ok(())
+        }),
+        desktop_clock::GEOMETRY_CHANGED => with_app("posición del reloj del escritorio", |app| {
+            app.refresh_desktop_clock(false);
+            Ok(())
+        }),
+        WM_TIMECHANGE if hwnd == main_window() => {
+            with_app("cambio de hora del escritorio", |app| {
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.time_changed();
+                    app.refresh_desktop_clock(false);
+                }
+                Ok(())
+            })
+        }
         // Unlocked: maybe the first time today (see `App::welcome`).
-        WM_WTSSESSION_CHANGE if w.0 == WTS_SESSION_UNLOCK as usize => {
-            with_app("desbloqueo", |app| {
-                app.arm_welcome();
+        WM_WTSSESSION_CHANGE
+            if [WTS_SESSION_LOCK as usize, WTS_SESSION_UNLOCK as usize].contains(&w.0) =>
+        {
+            with_app("estado de sesión", |app| {
+                let unlocked = w.0 == WTS_SESSION_UNLOCK as usize;
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.set_unlocked(unlocked);
+                    app.refresh_desktop_clock(false);
+                }
+                if unlocked {
+                    app.arm_welcome();
+                }
                 Ok(())
             });
         }
@@ -641,6 +716,10 @@ pub(super) unsafe extern "system" fn wndproc(
                 // Asleep was a pause; awake may be the first time today.
                 app.moments.rested();
                 app.arm_welcome();
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.time_changed();
+                    app.refresh_desktop_clock(false);
+                }
                 Ok(())
             });
             // SAFETY: `hwnd` is this live window on its owning UI thread.
@@ -663,6 +742,10 @@ pub(super) unsafe extern "system" fn wndproc(
             crate::overlays::reclaim();
             with_app("Explorer reiniciado", |app| {
                 app.taskbar_attempts = 0;
+                if let Some(clock) = &mut app.desktop_clock {
+                    clock.reset_explorer();
+                    app.refresh_desktop_clock(false);
+                }
                 Ok(())
             });
             // SAFETY: `hwnd` is this live window on its owning UI thread.

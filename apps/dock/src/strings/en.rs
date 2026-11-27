@@ -1,4 +1,10 @@
-use super::Strings;
+use super::{Strings, WeatherText};
+
+pub(super) const WEATHER: WeatherText = WeatherText {
+    conditions: ["Clear", "Cloudy", "Fog", "Rain", "Snow", "Thunderstorm"],
+    high: "high",
+    low: "low",
+};
 
 pub(super) const TEXT: Strings = Strings {
     jump_pinned: "Pinned",
@@ -39,6 +45,16 @@ pub(super) const TEXT: Strings = Strings {
     usage_resets: "Resets",
     usage_updated: "Updated",
     usage_used: "used",
+    usage_almost_out: "{name} almost out",
+    usage_back_today_long: "back at {time}",
+    usage_back_tomorrow_long: "back tomorrow at {time}",
+    usage_back_day_long: "back {day} at {time}",
+    usage_back: "back",
+    usage_back_today: "{time}",
+    usage_weekly: "Weekly",
+    usage_back_tomorrow: "tomorrow {time}",
+    usage_back_day: "{day} {time}",
+    weekdays_short: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
     media_title: "Now playing",
     media_no_output: "No output device",
     media_no_progress: "Progress unavailable",

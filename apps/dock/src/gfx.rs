@@ -3,6 +3,8 @@
 
 #[path = "gfx/backdrop.rs"]
 mod backdrop;
+#[path = "gfx/clock.rs"]
+pub(crate) mod clock;
 
 use anyhow::{Context, Result};
 use muelle_core::frame::DockEdge;
@@ -278,8 +280,14 @@ impl Gfx {
         height: f32,
         scale: f32,
         bare: bool,
+        attached: bool,
     ) -> Result<CompositionSurfaceBrush> {
         let (shoulder, corner) = island_radii(width, height, scale, bare);
+        let corner = if attached {
+            corner.min(BARE_ISLAND_RADIUS * scale)
+        } else {
+            corner
+        };
         self.draw(width.ceil() as u32, height.ceil() as u32, |dc| {
             // SAFETY: The geometries, sink and brush stay alive through the drawing calls.
             unsafe {
@@ -373,8 +381,27 @@ impl Gfx {
         accent: Color,
         bare: bool,
     ) -> Result<LabelBrush> {
-        let stroke = if bare { 3.0 } else { 2.4 };
-        let side = Self::usage_ring_size(scale, bare);
+        let diameter = if bare { BARE_USAGE_RING_DIAMETER } else { 18.0 };
+        self.usage_ring_sized(
+            used_percent,
+            scale,
+            accent,
+            diameter,
+            if bare { 3.0 } else { 2.4 },
+        )
+    }
+
+    /// The usage ring at any logical `diameter` and `stroke`: the dials of
+    /// the usage detail are 28 px.
+    pub fn usage_ring_sized(
+        &self,
+        used_percent: Option<u8>,
+        scale: f32,
+        accent: Color,
+        diameter: f32,
+        stroke: f32,
+    ) -> Result<LabelBrush> {
+        let side = (diameter * scale).round();
         let center = side / 2.0;
         let radius = center - 2.0 * scale;
         let stroke = (stroke * scale).max(1.0);
@@ -405,7 +432,7 @@ impl Gfx {
                         ),
                         None,
                     )?;
-                    let steps = usize::from(percent) * 36 / 100;
+                    let steps = usize::from(percent.min(100)) * 36 / 100;
                     for index in 0..steps {
                         let start = -std::f32::consts::FRAC_PI_2
                             + index as f32 * std::f32::consts::TAU / 36.0;
@@ -959,7 +986,26 @@ impl Gfx {
         bold: bool,
         ink: Ink,
     ) -> Result<LabelBrush> {
-        self.draw_text_brush(text, scale, font_size, bold, ink, None)
+        self.draw_text_brush(text, scale, font_size, bold, ink.color(), None)
+    }
+
+    /// `text_brush_sized` in an exact color (the alert colors of the usage
+    /// island); its alpha is the text's opacity.
+    pub fn text_brush_tinted(
+        &self,
+        text: &str,
+        scale: f32,
+        font_size: f32,
+        bold: bool,
+        tint: Color,
+    ) -> Result<LabelBrush> {
+        let color = rgb(
+            f32::from(tint.R) / 255.0,
+            f32::from(tint.G) / 255.0,
+            f32::from(tint.B) / 255.0,
+            f32::from(tint.A) / 255.0,
+        );
+        self.draw_text_brush(text, scale, font_size, bold, color, None)
     }
 
     /// Single line, elided to the available physical width.
@@ -972,7 +1018,7 @@ impl Gfx {
         ink: Ink,
         max_width: f32,
     ) -> Result<LabelBrush> {
-        self.draw_text_brush(text, scale, font_size, bold, ink, Some(max_width))
+        self.draw_text_brush(text, scale, font_size, bold, ink.color(), Some(max_width))
     }
 
     fn draw_text_brush(
@@ -981,7 +1027,7 @@ impl Gfx {
         scale: f32,
         font_size: f32,
         bold: bool,
-        ink: Ink,
+        color: D2D1_COLOR_F,
         fitted: Option<f32>,
     ) -> Result<LabelBrush> {
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
@@ -1038,7 +1084,7 @@ impl Gfx {
         let brush = self.draw(width as u32, height as u32, |dc| {
             // SAFETY: The brush and layout live for the drawing call.
             unsafe {
-                let ink = dc.CreateSolidColorBrush(&ink.color(), None)?;
+                let ink = dc.CreateSolidColorBrush(&color, None)?;
                 dc.DrawTextLayout(
                     Vector2 { X: 0.0, Y: 0.0 },
                     &layout,
@@ -1449,7 +1495,7 @@ const fn rgb(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
-fn island_radii(width: f32, height: f32, scale: f32, bare: bool) -> (f32, f32) {
+pub(crate) fn island_radii(width: f32, height: f32, scale: f32, bare: bool) -> (f32, f32) {
     let (shoulder, corner) = if bare {
         (0.0, BARE_ISLAND_RADIUS)
     } else {

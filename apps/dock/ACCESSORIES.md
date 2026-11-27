@@ -1,5 +1,31 @@
 # Batería de accesorios en la barra superior
 
+## Dispositivos Bluetooth del fork (F4)
+
+`bluetoothAccessoryBattery` activa el grupo de batería de los WH-1000XM5 y
+DualSense y su detalle al hacer clic. Su valor por defecto es `false`.
+`accessoryBattery` sigue controlando la opción original de Ajustes.
+
+La batería de los Sony viene del nodo Hands-Free AG de la clase System.
+Muelle cruza su Container ID con el del dispositivo emparejado y solo muestra
+el porcentaje si Windows lo marca como conectado. Los AirPods Max emparejados
+aparecen como «Sin conectar» hasta F5.
+
+DualSense (054C:0CE6) usa informes de entrada HID con un handle de lectura
+compartido. Se consulta al revelar la zona de estado si toca renovar la lectura,
+como máximo una vez por minuto para cada interfaz. Por Bluetooth, el informe
+abreviado carece de batería. El detalle indica que el mando está conectado
+hasta que el mando emita el informe completo.
+
+Los offsets y estados del informe DualSense se basan en
+[GamepadHidBatteryProvider.cs](https://github.com/alztrk/opentaskbar/blob/master/Services/Hardware/WirelessBattery/GamepadHidBatteryProvider.cs)
+de OpenTaskbar, copyright © 2026 OpenTaskbar contributors,
+[licencia MIT](https://github.com/alztrk/opentaskbar/blob/master/LICENSE).
+Las longitudes de 64 y 78 bytes coinciden con las del
+[controlador hid-playstation](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c).
+
+## Opción original de Ajustes
+
 La opción **Ajustes → Barra superior → Mostrar batería de accesorios** está
 desactivada por defecto. Al activarla, la detección es automática mientras exista
 la barra superior. Un ratón y unos auriculares conectados muestran su icono y

@@ -6,6 +6,7 @@ import {
   type Appearance,
   type Config,
   type DockPosition,
+  type DockStyle,
   type DockDensity,
   type DockAutoHideSpeed,
   type DockHidingMode,
@@ -16,6 +17,8 @@ import {
   type Language,
   type UpdateInfo,
   type WindowsPreferences,
+  type SettingsPatch,
+  DEFAULT_WEATHER,
   ICON_SIZE,
   MAX_MAGNIFIED_SIZE,
   checkUpdate,
@@ -26,6 +29,7 @@ import {
   installUpdate,
   loadConfig,
   loadWallpaperPreview,
+  mergeSettingsPatches,
   openReleaseNotes,
   openRepository,
   pickClockTarget,
@@ -33,7 +37,7 @@ import {
   saveConfig,
   setAutostart,
 } from "./config";
-import { Card, Row, Segmented, Select, Slider, SubRow, Toggle, VisualChoices } from "./controls";
+import { Card, PreferenceInput, Row, Segmented, Select, Slider, SubRow, Toggle, VisualChoices } from "./controls";
 import { DockDensityPreview, DockPreview, IslandPreview, MascotPreview, SettingIcon, SpeedPreview, ThemePreview } from "./visuals";
 import { type SectionId, SectionIcon } from "./icons";
 import { UpdateBanner } from "./UpdateBanner";
@@ -88,7 +92,7 @@ export function App() {
   }, []);
   /** "Later" hides the banner until Settings is opened again. */
   const [bannerDismissed, setBannerDismissed] = useState(false);
-  const pending = useRef<Partial<Config> | null>(null);
+  const pending = useRef<SettingsPatch | null>(null);
   const writes = useRef(Promise.resolve(true));
   const timer = useRef<number | undefined>(undefined);
   const resetTimer = useRef<number | undefined>(undefined);
@@ -107,7 +111,7 @@ export function App() {
           setFailed(false);
           return true;
         } catch {
-          pending.current = Object.assign({}, latest, pending.current);
+          pending.current = mergeSettingsPatches(latest, pending.current);
           setFailed(true);
           return false;
         }
@@ -191,14 +195,18 @@ export function App() {
 
   // Shows the change at once and saves the latest value shortly after, so a
   // slider drag does not write the file on every pixel.
-  const update = useCallback((patch: Partial<Config>) => {
+  const update = useCallback((patch: SettingsPatch) => {
     setConfig((current) => {
       if (!current) return current;
-      const next = { ...current, ...patch };
+      const next = {
+        ...current,
+        ...patch,
+        weather: patch.weather ? { ...DEFAULT_WEATHER, ...current.weather, ...patch.weather } : current.weather,
+      };
       if (next.magnifiedSize < next.iconSize) next.magnifiedSize = next.iconSize;
       return next;
     });
-    pending.current = { ...pending.current, ...patch };
+    pending.current = mergeSettingsPatches(pending.current, patch);
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => void flushSettings(), SAVE_DELAY_MS);
   }, [flushSettings]);
@@ -257,6 +265,7 @@ export function App() {
   if (!config) return <div className="window" />;
   const language = resolveLanguage(config.language, config.language === "auto" ? navigator.language : "");
   const t = textsFor(language);
+  const weather = { ...DEFAULT_WEATHER, ...config.weather };
   const durationFormat = new Intl.NumberFormat(config.language === "auto" ? navigator.language : config.language);
   const chooseFolder = () => {
     pickFolder(config.shortcutsFolder)
@@ -280,6 +289,8 @@ export function App() {
   // An update the user asked for keeps its banner even after "Later".
   const showBanner =
     waiting !== null && (!bannerDismissed || updateState.kind !== "available");
+  const clockMonitor = config?.desktopClockMonitor ?? "";
+  const clockDisplays = (windowsPreferences?.displays ?? []).map(({ id, name }) => ({ value: id, label: name }));
 
   return (
     <div className="window" lang={language} dir={language === "ar" ? "rtl" : "ltr"}>
@@ -401,11 +412,67 @@ export function App() {
                   />
                 </SubRow>
               </Card>
+              <Card title={t.groupDesktop}>
+                <Row label={t.desktopClock}>
+                  <Toggle label={t.desktopClock} checked={config.desktopClock ?? false}
+                    onChange={(desktopClock) => update({ desktopClock })} />
+                </Row>
+                <SubRow open={config.desktopClock ?? false} label={t.desktopClockDisplay} controlId="desktop-clock-display">
+                  <Select id="desktop-clock-display" label={t.desktopClockDisplay} value={clockMonitor}
+                    options={[
+                      { value: "", label: t.desktopClockDisplayAuto },
+                      ...clockDisplays,
+                      ...(clockMonitor && !clockDisplays.some(({ value }) => value === clockMonitor)
+                        ? [{ value: clockMonitor, label: t.desktopClockDisplayDisconnected }] : []),
+                    ]}
+                    onChange={(value) => update({ desktopClockMonitor: value || null })} />
+                </SubRow>
+                <Row label={t.weatherEnabled}>
+                  <Toggle label={t.weatherEnabled} checked={weather.enabled}
+                    onChange={(enabled) => update({ weather: { enabled } })} />
+                </Row>
+                <Row label={t.weatherAuto} hint={t.weatherAutoHint}>
+                  <Toggle label={t.weatherAuto} checked={weather.auto}
+                    onChange={(auto) => update({ weather: { auto } })} />
+                </Row>
+                {weather.auto ? (
+                  weather.enabled && <p className="card-note row-hint">
+                    <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">
+                      {t.weatherAttribution}
+                    </a>
+                  </p>
+                ) : (
+                  <>
+                    <Row label={t.weatherCity}>
+                      <PreferenceInput label={t.weatherCity} value={weather.city} maxLength={100}
+                        onChange={(city) => update({ weather: { city } })} />
+                    </Row>
+                    {([
+                      ["latitude", t.weatherLatitude, 90],
+                      ["longitude", t.weatherLongitude, 180],
+                    ] as const).map(([key, label, bound]) => (
+                      <Row key={key} label={label}>
+                        <PreferenceInput label={label} value={weather[key]} min={-bound} max={bound}
+                          invalidText={t.weatherCoordinateError.replace("{bound}", String(bound))}
+                          onChange={(value) => update({ weather: { [key]: Number(value) } })} />
+                      </Row>
+                    ))}
+                  </>
+                )}
+              </Card>
               <WallpaperGallery texts={t} onApplied={setWallpaper} />
             </>
           ) : section === "dock" ? (
             <>
               <Card title={t.groupAppearance}>
+                <Row label={t.dockStyle}>
+                  <Select<DockStyle> label={t.dockStyle} value={config.dockStyle ?? "original"}
+                    options={[
+                      { value: "original", label: t.dockStyleOriginal },
+                      { value: "a", label: t.dockStyleGlassA },
+                    ]}
+                    onChange={(dockStyle) => update({ dockStyle })} />
+                </Row>
                 <VisualChoices<DockPosition>
                   label={t.dockPosition}
                   value={config.dockPosition}
@@ -695,6 +762,13 @@ export function App() {
                     label={t.menuBarBare}
                     checked={config.menuBarBare ?? false}
                     onChange={(menuBarBare) => update({ menuBarBare })}
+                  />
+                </SubRow>
+                <SubRow label={t.menuBarAiAlerts} hint={t.menuBarAiAlertsHint} open={config.menuBar}>
+                  <Toggle
+                    label={t.menuBarAiAlerts}
+                    checked={config.menuBarAiAlerts ?? false}
+                    onChange={(menuBarAiAlerts) => update({ menuBarAiAlerts })}
                   />
                 </SubRow>
                 <SubRow label={t.menuBarEssentials} hint={t.menuBarEssentialsHint} open={config.menuBar}>

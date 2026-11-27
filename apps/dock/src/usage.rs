@@ -14,7 +14,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Local, Utc};
+use crate::strings::{self, Strings};
+use chrono::{DateTime, Datelike, Local, Utc};
 use muelle_shell::icons::IconImage;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -102,6 +103,140 @@ impl ProviderUsage {
     pub fn age_minutes(&self) -> Option<u64> {
         Some(self.fetched_at?.elapsed().ok()?.as_secs() / 60)
     }
+
+    /// The window closest to running out: the highest `used_percent`, the
+    /// first one on a tie (the shortest, which providers list first).
+    pub fn worst_window(&self) -> Option<&Window> {
+        self.windows.iter().fold(None, |worst, window| match worst {
+            Some(current) if window.used_percent <= current.used_percent => Some(current),
+            _ => Some(window),
+        })
+    }
+
+    /// Alert level of the worst window. Only a `Ready` reading counts: a
+    /// provider that is loading, signed out or unavailable is `Normal`.
+    pub fn alert_level(&self) -> Level {
+        match (self.state, self.worst_window()) {
+            (State::Ready, Some(window)) => level(window.used_percent),
+            _ => Level::Normal,
+        }
+    }
+}
+
+/// How close a limit is to running out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    Normal,
+    Warn,
+    Critical,
+}
+
+/// `<80` normal, `80..=94` warn, `>=95` critical (Codex can report over 100).
+pub fn level(percent: u8) -> Level {
+    match percent {
+        0..=79 => Level::Normal,
+        80..=94 => Level::Warn,
+        _ => Level::Critical,
+    }
+}
+
+/// When a limit returns, in the current language: "vuelve a las 21:40" (long)
+/// or "vuelve 21:40" (short); tomorrow and later days are named. `None` with no
+/// reset time or one already past, so stale data never says "vuelve a las 00:00".
+pub fn back_phrase(
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+    long: bool,
+) -> Option<String> {
+    back_phrase_with(strings::text(), resets_at, now, long)
+}
+
+/// `back_phrase` with an explicit catalog.
+pub fn back_phrase_with(
+    text: &Strings,
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+    long: bool,
+) -> Option<String> {
+    if long {
+        return back_wording(text, resets_at, now, true);
+    }
+    let (prefix, time) = short_back_phrase_with(text, resets_at, now)?;
+    Some(format!("{prefix} {time}"))
+}
+
+pub fn short_back_phrase(
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+) -> Option<(&'static str, String)> {
+    short_back_phrase_with(strings::text(), resets_at, now)
+}
+
+fn short_back_phrase_with(
+    text: &Strings,
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+) -> Option<(&'static str, String)> {
+    Some((text.usage_back, back_wording(text, resets_at, now, false)?))
+}
+
+fn back_wording(
+    text: &Strings,
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Local>,
+    long: bool,
+) -> Option<String> {
+    let resets = resets_at?.with_timezone(&Local);
+    if resets <= now {
+        return None;
+    }
+    let (resets_day, today) = (resets.date_naive(), now.date_naive());
+    let template = if resets_day == today {
+        if long {
+            text.usage_back_today_long
+        } else {
+            text.usage_back_today
+        }
+    } else if today.succ_opt() == Some(resets_day) {
+        if long {
+            text.usage_back_tomorrow_long
+        } else {
+            text.usage_back_tomorrow
+        }
+    } else if long {
+        text.usage_back_day_long
+    } else {
+        text.usage_back_day
+    };
+    let day = text.weekdays_short[resets.weekday().num_days_from_monday() as usize];
+    Some(
+        template
+            .replace("{time}", &resets.format("%H:%M").to_string())
+            .replace("{day}", day),
+    )
+}
+
+/// The long alert: "Claude casi agotado, vuelve a las 21:40", or just
+/// "Claude casi agotado" when the reset time is unknown or past.
+pub fn alert_text(provider: Provider, usage: &ProviderUsage, now: DateTime<Local>) -> String {
+    alert_text_with(strings::text(), provider, usage, now)
+}
+
+/// `alert_text` with an explicit catalog.
+pub fn alert_text_with(
+    text: &Strings,
+    provider: Provider,
+    usage: &ProviderUsage,
+    now: DateTime<Local>,
+) -> String {
+    let almost_out = text.usage_almost_out.replace("{name}", provider.name());
+    let back = usage
+        .worst_window()
+        .and_then(|window| back_phrase_with(text, window.resets_at, now, true));
+    match back {
+        Some(back) => format!("{almost_out}, {back}"),
+        None => almost_out,
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +258,7 @@ impl Snapshot {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub enum Provider {
     Claude,
@@ -1933,5 +2068,198 @@ mod tests {
         })();
         fs::remove_dir_all(&root)?;
         result
+    }
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use chrono::TimeZone;
+    use muelle_config::Language;
+
+    use super::*;
+
+    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 11, day, hour, minute, 0)
+            .earliest()
+            .unwrap_or_else(Local::now)
+    }
+
+    fn window(minutes: i64, used_percent: u8, resets_at: Option<DateTime<Local>>) -> Window {
+        Window {
+            label: None,
+            minutes,
+            used_percent,
+            resets_at: resets_at.map(|time| time.with_timezone(&Utc)),
+        }
+    }
+
+    fn usage(state: State, windows: Vec<Window>) -> ProviderUsage {
+        ProviderUsage {
+            state,
+            windows,
+            fetched_at: None,
+        }
+    }
+
+    #[test]
+    fn levels_split_at_eighty_and_ninety_five() {
+        assert_eq!(level(0), Level::Normal);
+        assert_eq!(level(79), Level::Normal);
+        assert_eq!(level(80), Level::Warn);
+        assert_eq!(level(94), Level::Warn);
+        assert_eq!(level(95), Level::Critical);
+        assert_eq!(level(130), Level::Critical);
+    }
+
+    #[test]
+    fn the_worst_window_is_the_highest_and_ties_keep_the_first() {
+        let mixed = usage(
+            State::Ready,
+            vec![window(300, 30, None), window(10_080, 96, None)],
+        );
+        assert_eq!(mixed.worst_window().map(|w| w.minutes), Some(10_080));
+        let tied = usage(
+            State::Ready,
+            vec![window(300, 50, None), window(10_080, 50, None)],
+        );
+        assert_eq!(tied.worst_window().map(|w| w.minutes), Some(300));
+        assert!(usage(State::Ready, Vec::new()).worst_window().is_none());
+    }
+
+    #[test]
+    fn only_a_ready_provider_with_a_window_raises_an_alert() {
+        let windows = vec![window(300, 99, None)];
+        assert_eq!(
+            usage(State::Ready, windows.clone()).alert_level(),
+            Level::Critical
+        );
+        for state in [State::Unavailable, State::SignIn, State::Loading] {
+            assert_eq!(usage(state, windows.clone()).alert_level(), Level::Normal);
+        }
+        assert_eq!(usage(State::Ready, Vec::new()).alert_level(), Level::Normal);
+        let warn = usage(State::Ready, vec![window(300, 82, None)]);
+        assert_eq!(warn.alert_level(), Level::Warn);
+    }
+
+    fn phrase(
+        language: Language,
+        resets: Option<DateTime<Local>>,
+        now: DateTime<Local>,
+        long: bool,
+    ) -> Option<String> {
+        back_phrase_with(
+            strings::text_in(language),
+            resets.map(|time| time.with_timezone(&Utc)),
+            now,
+            long,
+        )
+    }
+
+    #[test]
+    fn back_phrases_in_spanish_cover_today_tomorrow_and_later() {
+        let now = at(25, 21, 0);
+        let es = Language::Es;
+        let cases = [
+            (at(25, 21, 40), "vuelve a las 21:40", "vuelve 21:40"),
+            (
+                at(26, 4, 0),
+                "vuelve mañana a las 04:00",
+                "vuelve mañana 04:00",
+            ),
+            (
+                at(28, 4, 0),
+                "vuelve el sáb. a las 04:00",
+                "vuelve sáb. 04:00",
+            ),
+        ];
+        for (resets, long, short) in &cases {
+            assert_eq!(phrase(es, Some(*resets), now, true).as_deref(), Some(*long));
+            assert_eq!(
+                phrase(es, Some(*resets), now, false).as_deref(),
+                Some(*short)
+            );
+        }
+    }
+
+    #[test]
+    fn back_phrases_in_english_use_the_english_templates() {
+        let now = at(25, 21, 0);
+        let en = Language::En;
+        assert_eq!(
+            phrase(en, Some(at(25, 21, 40)), now, true).as_deref(),
+            Some("back at 21:40")
+        );
+        assert_eq!(
+            phrase(en, Some(at(26, 4, 0)), now, false).as_deref(),
+            Some("back tomorrow 04:00")
+        );
+        assert_eq!(
+            phrase(en, Some(at(28, 4, 0)), now, true).as_deref(),
+            Some("back Sat at 04:00")
+        );
+    }
+
+    #[test]
+    fn compact_return_labels_keep_the_localized_day_with_the_time() {
+        let now = at(25, 21, 0);
+        let resets = Some(at(28, 4, 0).with_timezone(&Utc));
+        for (language, prefix, time) in [
+            (Language::Es, "vuelve", "sáb. 04:00"),
+            (Language::En, "back", "Sat 04:00"),
+            (Language::Fr, "back", "Sat 04:00"),
+        ] {
+            assert_eq!(
+                short_back_phrase_with(strings::text_in(language), resets, now),
+                Some((prefix, time.to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_just_after_midnight_is_tomorrow_and_a_week_away_names_the_day() {
+        let es = Language::Es;
+        assert_eq!(
+            phrase(es, Some(at(26, 0, 30)), at(25, 23, 50), true).as_deref(),
+            Some("vuelve mañana a las 00:30")
+        );
+        // Six days out: Tuesday 2026-12-01 is not today or tomorrow.
+        let next = Local
+            .with_ymd_and_hms(2026, 12, 1, 8, 15, 0)
+            .earliest()
+            .unwrap_or_else(Local::now);
+        assert_eq!(
+            phrase(es, Some(next), at(25, 21, 0), false).as_deref(),
+            Some("vuelve mar. 08:15")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_past_reset_gives_no_phrase() {
+        let now = at(25, 21, 0);
+        assert_eq!(phrase(Language::Es, None, now, true), None);
+        assert_eq!(phrase(Language::Es, Some(at(25, 20, 59)), now, true), None);
+        assert_eq!(phrase(Language::Es, Some(now), now, false), None);
+    }
+
+    #[test]
+    fn the_long_alert_names_the_provider_and_the_time_when_known() {
+        let now = at(25, 21, 0);
+        let text = strings::text_in(Language::Es);
+        let known = usage(State::Ready, vec![window(300, 97, Some(at(25, 21, 40)))]);
+        assert_eq!(
+            alert_text_with(text, Provider::Claude, &known, now),
+            "Claude casi agotado, vuelve a las 21:40"
+        );
+        let unknown = usage(State::Ready, vec![window(300, 97, None)]);
+        assert_eq!(
+            alert_text_with(text, Provider::Claude, &unknown, now),
+            "Claude casi agotado"
+        );
+        let stale = usage(State::Ready, vec![window(300, 97, Some(at(25, 20, 0)))]);
+        assert_eq!(
+            alert_text_with(text, Provider::Codex, &stale, now),
+            "Codex casi agotado"
+        );
     }
 }

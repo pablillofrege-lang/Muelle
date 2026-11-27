@@ -79,7 +79,7 @@ function fixture(section = "menubar", config = {}, save = async () => {}, galler
       switch (command) {
         case "get_config": return { ...loaded };
         case "get_autostart": return false;
-        case "windows_preferences": return { animations: true };
+        case "windows_preferences": return { animations: true, displays: galleryNative.displays ?? [] };
         case "wallpaper_preview": return null;
         case "wallpaper_selection": return typeof galleryNative.selection === "function" ? galleryNative.selection() : galleryNative.selection ?? null;
         case "apply_wallpaper": wallpaperCalls.push({ ...args }); return galleryNative.apply?.(args.id);
@@ -144,6 +144,61 @@ test("each section renders only its own controls, in every language and visibili
 });
 
 const wallpaperButtons = (view) => [...elements(view.body())].filter((node) => node.type === "button" && "data-wallpaper-id" in node.props);
+
+test("desktop clock and manual weather preferences save together and auto hides location fields", async () => {
+  const view = fixture("appearance");
+  const markup = () => renderToStaticMarkup(view.body());
+  assert.match(markup(), /aria-label="Desktop clock"/);
+  const latitude = markup().match(/<input [^>]*aria-label="Latitude"[^>]*>/)?.[0] ?? "";
+  assert.match(latitude, /min="-90" max="90"/);
+  view.change("Desktop clock", true);
+  view.change("City", "Málaga");
+  view.change("Latitude", "36.72");
+  view.change("Longitude", "-4.42");
+  view.change("Show weather", false);
+  view.change("Use my location", true);
+  assert.doesNotMatch(markup(), /aria-label="(City|Latitude|Longitude)"/);
+  view.fire(60);
+  await settle();
+  assert.deepEqual(view.calls, [{
+    desktopClock: true,
+    weather: { city: "Málaga", latitude: 36.72, longitude: -4.42, enabled: false, auto: true },
+  }]);
+  view.change("Use my location", false);
+  assert.match(markup(), /value="Málaga"/);
+});
+
+test("Cristal A is a dock style independent of appearance", async () => {
+  const view = fixture("dock", { language: "es", appearance: "frosted" });
+  assert.match(renderToStaticMarkup(view.body()), /<option value="a" dir="auto">Cristal A<\/option>/);
+  view.change("Estilo del dock", "a");
+  view.fire(60);
+  await settle();
+  assert.deepEqual(view.calls, [{ dockStyle: "a" }]);
+});
+
+test("desktop clock keeps the disconnected display selected until another is chosen", async () => {
+  const view = fixture("appearance", { desktopClock: true, desktopClockMonitor: "old-id" }, undefined, {
+    displays: [{ id: "connected-id", name: "LG FULL HD" }],
+  });
+  const unmount = await view.mount();
+  try {
+    const html = renderToStaticMarkup(view.body());
+    assert.match(html, /<label[^>]+for="desktop-clock-display">Display/);
+    assert.match(html, /<option value="old-id" dir="auto" selected="">Disconnected/);
+    assert.match(html, /<option value="connected-id" dir="auto">LG FULL HD/);
+    assert.deepEqual(view.calls, []);
+    view.change("Display", "connected-id");
+    view.fire(60);
+    await settle();
+    view.change("Display", "");
+    view.fire(60);
+    await settle();
+    assert.deepEqual(view.calls, [{ desktopClockMonitor: "connected-id" }, { desktopClockMonitor: null }]);
+  } finally {
+    unmount();
+  }
+});
 
 test("the gallery bundles only offline previews and appears only inside Appearance", () => {
   for (const language of Object.keys(texts)) {
@@ -232,7 +287,7 @@ test("retired Windows status-item overrides expose no controls and create no sav
         texts[language].menuBarMusic, texts[language].aiUsage,
         texts[language].accessoryBattery, texts[language].menuBarSystemMonitor,
         texts[language].menuBarNotifications, texts[language].menuBarBare,
-        texts[language].menuBarEssentials]);
+        texts[language].menuBarAiAlerts, texts[language].menuBarEssentials]);
       view.fire(60);
       await settle();
       assert.deepEqual(view.calls, []);
@@ -401,10 +456,11 @@ test("ghost mode is a fourth visibility choice and both new switches save", asyn
     view.change(texts.en.menuBarHidingMode, "ghost");
     view.change(texts.en.menuBarBare, true);
     view.change(texts.en.menuBarEssentials, true);
+    view.change(texts.en.menuBarAiAlerts, true);
     view.fire(60);
     await settle();
     assert.deepEqual(view.calls, [{ menuBarAutoHide: false, menuBarSmartHide: false,
-      menuBarGhost: true, menuBarBare: true, menuBarEssentials: true }]);
+      menuBarGhost: true, menuBarBare: true, menuBarEssentials: true, menuBarAiAlerts: true }]);
     assert.equal(texts.es.menuBarHidingGhost, "Fantasma (solo la isla)");
   } finally { unmount(); }
 });

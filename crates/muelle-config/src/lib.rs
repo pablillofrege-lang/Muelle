@@ -64,6 +64,7 @@ pub struct Config {
     /// The screen edge the dock sits on. Bottom by default, as on macOS;
     /// never the top, which belongs to the menu bar.
     pub dock_position: DockPosition,
+    pub dock_style: DockStyle,
     pub dock_density: DockDensity,
     pub dock_auto_hide_speed: DockAutoHideSpeed,
     pub show_start: bool,
@@ -110,7 +111,11 @@ pub struct Config {
     /// (e.g. the Clock app or a calendar). `None` keeps the notification
     /// center and calendar, as on the Windows taskbar.
     pub menu_bar_clock_target: Option<String>,
-    /// Weather shown in the left capsule of the zoned ghost bar.
+    /// Show the date, time and forecast on the desktop.
+    pub desktop_clock: bool,
+    /// Windows monitor device path. None follows the primary display.
+    pub desktop_clock_monitor: Option<String>,
+    /// Forecast shown by the desktop clock and in the left capsule of the zoned ghost bar.
     pub weather: Weather,
     /// CPU, memory and network speed in the menu bar (issue #64). Off by
     /// default: off, nothing is sampled; on, every 2 s only while the bar
@@ -129,8 +134,13 @@ pub struct Config {
     /// widgets, hidden-icons arrow or notifications bell. Off by default: off,
     /// every chosen item shows.
     pub menu_bar_essentials: bool,
+    /// AI limit alerts in the island: amber from 80 %, red from 95 % with the
+    /// time the limit returns. Off by default: off, the island shows the main
+    /// window's usage as always.
+    pub menu_bar_ai_alerts: bool,
     /// Opt-in peripheral monitoring. Off means no accessory reader or queries.
     pub accessory_battery: bool,
+    pub bluetooth_accessory_battery: bool,
     /// The dot under apps that have windows open.
     pub show_indicators: bool,
     /// The section of recently used apps that are not pinned.
@@ -169,11 +179,14 @@ pub struct Config {
     // button.
 }
 
-/// Forecast coordinates and display preference for the zoned bar.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Forecast location and display preferences.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Weather {
     pub enabled: bool,
+    /// Ask Windows for the current location. Manual coordinates are the fallback.
+    pub auto: bool,
+    pub city: String,
     pub latitude: f64,
     pub longitude: f64,
 }
@@ -182,6 +195,8 @@ impl Default for Weather {
     fn default() -> Self {
         Self {
             enabled: true,
+            auto: false,
+            city: "Jaén".into(),
             latitude: 37.7796,
             longitude: -3.7849,
         }
@@ -219,6 +234,16 @@ pub enum DockPosition {
     #[default]
     #[serde(other)]
     Bottom,
+}
+
+/// The dock background and accents. Independent of the menu bar appearance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockStyle {
+    A,
+    #[default]
+    #[serde(other)]
+    Original,
 }
 
 /// Which mascot comes out for the moments worth it.
@@ -380,6 +405,10 @@ impl Config {
             .menu_bar_clock_target
             .map(|target| target.trim().to_owned())
             .filter(|target| !target.is_empty());
+        self.desktop_clock_monitor = self
+            .desktop_clock_monitor
+            .map(|monitor| monitor.trim().to_owned())
+            .filter(|monitor| !monitor.is_empty());
         self
     }
 
@@ -407,6 +436,7 @@ impl Default for Config {
             icon_size: 48,
             magnification: true,
             dock_position: DockPosition::Bottom,
+            dock_style: DockStyle::Original,
             dock_density: DockDensity::Normal,
             dock_auto_hide_speed: DockAutoHideSpeed::Normal,
             show_start: true,
@@ -429,10 +459,14 @@ impl Default for Config {
             menu_bar_system_monitor: false,
             menu_bar_ghost: false,
             menu_bar_bare: false,
+            menu_bar_ai_alerts: false,
             menu_bar_essentials: false,
             menu_bar_clock_target: None,
+            desktop_clock: false,
+            desktop_clock_monitor: None,
             weather: Weather::default(),
             accessory_battery: false,
+            bluetooth_accessory_battery: false,
             show_indicators: true,
             show_recents: true,
             bounce_on_open: true,
@@ -519,7 +553,16 @@ pub fn update_preferences(
                         "version" | "pinned" | "groups" | "recent" | "taskbarPins"
                     )
                 {
-                    fields.insert(key, value);
+                    if key == "weather"
+                        && let Some(current) = fields
+                            .get_mut(&key)
+                            .and_then(serde_json::Value::as_object_mut)
+                        && let serde_json::Value::Object(changes) = value
+                    {
+                        current.extend(changes);
+                    } else {
+                        fields.insert(key, value);
+                    }
                 }
             }
         }
@@ -577,6 +620,19 @@ fn write_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bluetooth_accessory_battery_is_independently_opted_in() -> serde_json::Result<()> {
+        let default = serde_json::to_value(super::Config::default())?;
+        assert_eq!(default["bluetoothAccessoryBattery"], false);
+        let config: super::Config =
+            serde_json::from_value(serde_json::json!({"bluetoothAccessoryBattery": true}))?;
+        assert_eq!(
+            serde_json::to_value(&config)?["bluetoothAccessoryBattery"],
+            true
+        );
+        assert!(!config.accessory_battery);
+        Ok(())
+    }
     use super::*;
 
     #[test]
@@ -1030,8 +1086,12 @@ mod tests {
     fn the_fork_menu_bar_options_are_off_unless_chosen() -> Result<(), serde_json::Error> {
         let fresh = Config::default();
         assert!(!fresh.menu_bar_ghost && !fresh.menu_bar_bare && !fresh.menu_bar_essentials);
+        assert!(!fresh.menu_bar_ai_alerts);
         let older: Config = serde_json::from_str("{}")?;
         assert!(!older.menu_bar_ghost && !older.menu_bar_bare && !older.menu_bar_essentials);
+        assert!(!older.menu_bar_ai_alerts);
+        let alerts: Config = serde_json::from_str(r#"{"menuBarAiAlerts":true}"#)?;
+        assert!(alerts.menu_bar_ai_alerts);
         let chosen: Config = serde_json::from_str(
             r#"{"menuBarGhost":true,"menuBarBare":true,"menuBarEssentials":true}"#,
         )?;
@@ -1069,11 +1129,63 @@ mod tests {
     }
 
     #[test]
+    fn desktop_clock_and_glass_a_are_opt_in() -> Result<(), serde_json::Error> {
+        let legacy: Config = serde_json::from_str(r#"{"weather":{"enabled":false}}"#)?;
+        assert!(!legacy.desktop_clock);
+        assert_eq!(legacy.desktop_clock_monitor, None);
+        assert_eq!(legacy.dock_style, DockStyle::Original);
+        assert!(!legacy.weather.auto);
+        assert_eq!(legacy.weather.city, "Jaén");
+        let selected: Config = serde_json::from_str(
+            r#"{"desktopClock":true,"desktopClockMonitor":"monitor-path","dockStyle":"a","weather":{"auto":true,"city":"Málaga"}}"#,
+        )?;
+        assert!(selected.desktop_clock && selected.weather.auto);
+        assert_eq!(
+            selected.desktop_clock_monitor.as_deref(),
+            Some("monitor-path")
+        );
+        assert_eq!(selected.dock_style, DockStyle::A);
+        assert_eq!(selected.weather.city, "Málaga");
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&selected)?)?,
+            selected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn updating_one_weather_field_preserves_the_saved_location() -> Result<(), ConfigError> {
+        let path = scratch("weather-patch");
+        let config = Config {
+            weather: Weather {
+                city: "Málaga".into(),
+                latitude: 36.72,
+                longitude: -4.42,
+                ..Weather::default()
+            },
+            ..Config::default()
+        };
+        save(&path, &config)?;
+        let updated = update_preferences(
+            &path,
+            serde_json::Map::from_iter([("weather".into(), serde_json::json!({"auto": true}))]),
+        )?;
+        assert_eq!(
+            updated.weather,
+            Weather {
+                auto: true,
+                ..config.weather
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn weather_coordinates_out_of_range_are_flagged() {
         let at = |latitude, longitude| Weather {
-            enabled: true,
             latitude,
             longitude,
+            ..Weather::default()
         };
         assert!(at(90.0, -180.0).has_valid_coordinates());
         assert!(at(-90.0, 180.0).has_valid_coordinates());

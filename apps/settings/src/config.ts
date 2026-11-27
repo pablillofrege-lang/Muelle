@@ -5,6 +5,7 @@ export type IslandStyle = "notch" | "bubble";
 export type GenieSpeed = "normal" | "fast" | "faster";
 export type MascotCharacter = "crab" | "cat" | "fox" | "capybara" | "mochi" | "girl";
 export type DockPosition = "left" | "bottom" | "right";
+export type DockStyle = "original" | "a";
 export type DockDensity = "compact" | "normal" | "spacious";
 export type DockAutoHideSpeed = "smooth" | "normal" | "fast";
 /** View of the existing two settings; saved atomically as a mutually exclusive pair. */
@@ -13,6 +14,14 @@ export type DockHidingMode = "visible" | "automatic" | "intelligent";
 export type MenuBarHidingMode = DockHidingMode | "ghost";
 /** `auto` follows Windows' light or dark mode. */
 export type Appearance = "auto" | "light" | "dark" | "frosted" | "clear" | "liquidGlass";
+
+export interface Weather {
+  enabled: boolean;
+  auto: boolean;
+  city: string;
+  latitude: number;
+  longitude: number;
+}
 
 /** Mirrors `muelle_config::Config`. */
 export interface Config {
@@ -25,6 +34,7 @@ export interface Config {
   magnification: boolean;
   magnifiedSize: number;
   dockPosition: DockPosition;
+  dockStyle: DockStyle;
   dockDensity: DockDensity;
   dockAutoHideSpeed: DockAutoHideSpeed;
   showStart: boolean;
@@ -46,12 +56,17 @@ export interface Config {
   menuBarNotifications: boolean;
   /** What the clock opens (an app, shortcut or URI); null for the notification center. */
   menuBarClockTarget: string | null;
+  desktopClock: boolean;
+  desktopClockMonitor: string | null;
+  weather: Weather;
   accessoryBattery: boolean;
   menuBarSystemMonitor?: boolean;
   /** At rest only the island shows; the top edge reveals the rest. */
   menuBarGhost?: boolean;
   /** No strip behind the bar: white text and icons with a dark halo. */
   menuBarBare?: boolean;
+  /** Amber from 80 %, red from 95 % with the time the AI limit returns. */
+  menuBarAiAlerts?: boolean;
   /** Hides network speed and the Windows shell buttons. */
   menuBarEssentials?: boolean;
   showIndicators: boolean;
@@ -72,14 +87,26 @@ export interface Config {
 
 export const ICON_SIZE = { min: 32, max: 96 } as const;
 export const MAX_MAGNIFIED_SIZE = 160;
+export const DEFAULT_WEATHER: Weather = {
+  enabled: true, auto: false, city: "Jaén", latitude: 37.7796, longitude: -3.7849,
+};
+
+export type SettingsPatch = Omit<Partial<Config>, "weather"> & { weather?: Partial<Weather> };
+
+export function mergeSettingsPatches(older: SettingsPatch | null, newer: SettingsPatch | null): SettingsPatch {
+  const merged = { ...older, ...newer };
+  if (older?.weather && newer?.weather) merged.weather = { ...older.weather, ...newer.weather };
+  return merged;
+}
 
 export const loadConfig = () => invoke<Config>("get_config");
 export const defaultConfig = () => invoke<Config>("default_config");
-export const saveConfig = (patch: Partial<Config>) => invoke<Config>("set_config", { patch });
+export const saveConfig = (patch: SettingsPatch) => invoke<Config>("set_config", { patch });
 export const getAutostart = () => invoke<boolean>("get_autostart");
 /** Current Windows values for display only; never merge these into Config. */
 export interface WindowsPreferences {
   animations: boolean;
+  displays: { id: string; name: string }[];
 }
 
 let windowsPreferencesRequest: Promise<WindowsPreferences> | undefined;

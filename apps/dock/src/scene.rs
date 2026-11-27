@@ -8,6 +8,7 @@ mod material_tests;
 use std::{cell::Cell, rc::Rc};
 
 use anyhow::Result;
+use muelle_config::DockStyle;
 use muelle_core::{
     frame::{DockEdge, Frame as DockFrame},
     layout::{ItemKind, Layout, Rect},
@@ -35,6 +36,7 @@ use muelle_shell::icons::IconImage;
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub light: bool,
+    crystal_a: bool,
     /// Blur what is behind the dock; without it the tint is drawn opaque.
     glass: bool,
     tint: Color,
@@ -105,6 +107,7 @@ impl Theme {
         };
         Self {
             light,
+            crystal_a: false,
             glass,
             tint,
             lens: material == Material::LiquidGlass && glass,
@@ -126,6 +129,71 @@ impl Theme {
             } else {
                 rgba(255, 255, 255, 215)
             },
+        }
+    }
+
+    pub(crate) fn for_dock(look: Look, style: DockStyle) -> Self {
+        if style == DockStyle::Original {
+            return Self::new(look);
+        }
+        Self {
+            crystal_a: true,
+            tint: if look.glass {
+                rgba(22, 36, 35, 87)
+            } else {
+                rgba(30, 40, 40, 255)
+            },
+            sheen: 0,
+            rim: [41; 4],
+            separator: rgba(255, 255, 255, 71),
+            shadow: rgba(0, 0, 0, 255),
+            indicator: rgba(255, 255, 255, 230),
+            ..Self::new(Look {
+                light: false,
+                material: Material::Standard,
+                ..look
+            })
+        }
+    }
+
+    fn dock_radius(self, height: f32) -> f32 {
+        if self.crystal_a {
+            height * 23.0 / 68.0
+        } else {
+            height * 0.36
+        }
+    }
+
+    fn dock_shadow(self) -> (f32, f32, f32) {
+        if self.crystal_a {
+            (40.0, 14.0, 0.28)
+        } else {
+            (22.0, 8.0, 1.0)
+        }
+    }
+
+    fn dock_indicator_y(self, layout: &Layout, scale: f32, size: f32) -> f32 {
+        if self.crystal_a
+            && let Some(slot) = layout.slots.iter().find(|slot| slot.kind == ItemKind::Icon)
+        {
+            // In the reference, the bottom of the four-pixel dot sits six
+            // pixels past the icon edge. Magnification keeps that edge fixed.
+            return (slot.rect.y + slot.rect.height + (6.0 * scale).round()).min(layout.height)
+                - size;
+        }
+        layout.height - size - (2.0 * scale).round()
+    }
+
+    pub(crate) fn adjust_dock_layout(self, layout: &mut Layout, scale: f32) {
+        if self.crystal_a {
+            let height = (38.0 * scale).round().min(layout.height);
+            let y = (layout.height - height - (16.0 * scale).round()).max(0.0);
+            for slot in &mut layout.slots {
+                if slot.kind == ItemKind::Separator {
+                    slot.rect.y = y;
+                    slot.rect.height = height;
+                }
+            }
         }
     }
 
@@ -247,21 +315,23 @@ impl GlassSurface {
         outline.SetCornerRadius(v2(radius, radius))?;
         glass.SetClip(&c.CreateGeometricClipWithGeometry(&outline)?)?;
 
-        let sheen = c.CreateLinearGradientBrush()?;
-        let (start, end) = reflection_axis(if theme.lens { edge } else { DockEdge::Bottom });
-        sheen.SetStartPoint(start)?;
-        sheen.SetEndPoint(end)?;
-        let stops = sheen.ColorStops()?;
-        stops.Append(
-            &c.CreateColorGradientStopWithOffsetAndColor(0.0, rgba(255, 255, 255, theme.sheen))?,
-        )?;
-        let falloff = if theme.lens { 0.22 } else { 0.55 };
-        stops.Append(
-            &c.CreateColorGradientStopWithOffsetAndColor(falloff, rgba(255, 255, 255, 0))?,
-        )?;
-
         let mut fills = theme.fills_on(gfx, edge)?;
-        fills.push(sheen.cast()?);
+        if theme.sheen != 0 {
+            let sheen = c.CreateLinearGradientBrush()?;
+            let (start, end) = reflection_axis(if theme.lens { edge } else { DockEdge::Bottom });
+            sheen.SetStartPoint(start)?;
+            sheen.SetEndPoint(end)?;
+            let stops = sheen.ColorStops()?;
+            stops.Append(&c.CreateColorGradientStopWithOffsetAndColor(
+                0.0,
+                rgba(255, 255, 255, theme.sheen),
+            )?)?;
+            let falloff = if theme.lens { 0.22 } else { 0.55 };
+            stops.Append(
+                &c.CreateColorGradientStopWithOffsetAndColor(falloff, rgba(255, 255, 255, 0))?,
+            )?;
+            fills.push(sheen.cast()?);
+        }
         for brush in &fills {
             let fill = c.CreateSpriteVisual()?;
             fill.SetRelativeSizeAdjustment(v2(1.0, 1.0))?;
@@ -746,7 +816,7 @@ impl Scene {
             frame,
             ..
         } = *input;
-        let radius = layout.height * 0.36;
+        let radius = theme.dock_radius(layout.height);
 
         let root = c.CreateContainerVisual()?;
         root.SetRelativeSizeAdjustment(v2(1.0, 1.0))?;
@@ -757,9 +827,11 @@ impl Scene {
         mask.SetSource(&gfx.rounded_mask(radius)?)?;
         mask.SetInsets(radius.ceil() + 1.0)?;
         shadow.SetMask(&mask)?;
-        shadow.SetBlurRadius(22.0 * scale)?;
-        shadow.SetOffset(v3(0.0, 8.0 * scale))?;
+        let (blur, offset, opacity) = theme.dock_shadow();
+        shadow.SetBlurRadius(blur * scale)?;
+        shadow.SetOffset(v3(0.0, offset * scale))?;
         shadow.SetColor(theme.shadow)?;
+        shadow.SetOpacity(opacity)?;
         let shadow_host = c.CreateSpriteVisual()?;
         shadow_host.SetShadow(&shadow)?;
         layers.InsertAtTop(&shadow_host)?;
@@ -852,7 +924,7 @@ impl Scene {
             stroke,
             label_gap: 8.0 * scale,
             indicator_size,
-            indicator_y: layout.height - indicator_size - (2.0 * scale).round(),
+            indicator_y: theme.dock_indicator_y(layout, scale, indicator_size),
             frames: [shadow_host.cast()?, glass.cast()?, rim.cast()?],
             outline,
             rim_geometry,

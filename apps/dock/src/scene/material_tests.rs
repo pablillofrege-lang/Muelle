@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn glass_a_uses_its_own_dark_tint_rim_and_geometry() {
+    let look = Look {
+        material: Material::Frosted,
+        light: true,
+        glass: true,
+    };
+    let theme = Theme::for_dock(look, muelle_config::DockStyle::A);
+    assert!(!theme.light && !theme.lens);
+    assert_eq!(theme.tint, rgba(22, 36, 35, 87));
+    assert_eq!(theme.rim, [41; 4]);
+    assert_eq!(theme.separator, rgba(255, 255, 255, 71));
+    assert_eq!(theme.indicator, rgba(255, 255, 255, 230));
+    assert_eq!(theme.dock_radius(68.0), 23.0);
+    assert_eq!(theme.dock_shadow(), (40.0, 14.0, 0.28));
+    let solid = Theme::for_dock(
+        Look {
+            glass: false,
+            ..look
+        },
+        muelle_config::DockStyle::A,
+    );
+    assert_eq!(solid.tint, rgba(30, 40, 40, 255));
+    assert_eq!(
+        Theme::for_dock(look, muelle_config::DockStyle::Original).tint,
+        Theme::new(look).tint
+    );
+}
+
+#[test]
 fn frosted_keeps_the_backdrop_visible_and_its_text_panels_denser() {
     for light in [false, true] {
         let look = Look {

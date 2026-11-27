@@ -48,6 +48,20 @@ pub struct Strings {
     pub usage_resets: &'static str,
     pub usage_updated: &'static str,
     pub usage_used: &'static str,
+    /// `{name}` is the provider.
+    pub usage_almost_out: &'static str,
+    /// The alert's long phrases: `{time}` is HH:MM, `{day}` a short weekday.
+    pub usage_back_today_long: &'static str,
+    pub usage_back_tomorrow_long: &'static str,
+    pub usage_back_day_long: &'static str,
+    /// The short return phrase, drawn as a prefix and a date/time.
+    pub usage_back: &'static str,
+    pub usage_back_today: &'static str,
+    pub usage_back_tomorrow: &'static str,
+    pub usage_back_day: &'static str,
+    pub usage_weekly: &'static str,
+    /// Monday first.
+    pub weekdays_short: [&'static str; 7],
     pub media_title: &'static str,
     pub media_no_output: &'static str,
     pub media_no_progress: &'static str,
@@ -62,6 +76,41 @@ pub struct Strings {
     pub jump_frequent: &'static str,
     pub jump_recent: &'static str,
     pub jump_tasks: &'static str,
+}
+
+pub fn bluetooth_devices(
+    language: Language,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match language {
+        Language::Es => (
+            "Dispositivos Bluetooth",
+            "Sin conectar",
+            "Conectado",
+            "Mando DualSense",
+        ),
+        Language::Fr => (
+            "Appareils Bluetooth",
+            "Non connecté",
+            "Connecté",
+            "Manette DualSense",
+        ),
+        Language::Pt => (
+            "Dispositivos Bluetooth",
+            "Desconectado",
+            "Conectado",
+            "Comando DualSense",
+        ),
+        Language::Zh => ("蓝牙设备", "未连接", "已连接", "DualSense 手柄"),
+        Language::Hi => ("ब्लूटूथ डिवाइस", "कनेक्ट नहीं है", "कनेक्ट है", "DualSense कंट्रोलर"),
+        Language::Ar => ("أجهزة Bluetooth", "غير متصل", "متصل", "وحدة تحكم DualSense"),
+        Language::Bn => ("ব্লুটুথ ডিভাইস", "সংযুক্ত নয়", "সংযুক্ত", "DualSense কন্ট্রোলার"),
+        Language::Auto | Language::En => (
+            "Bluetooth devices",
+            "Disconnected",
+            "Connected",
+            "DualSense controller",
+        ),
+    }
 }
 
 /// 0 = not chosen yet (follow Windows). Nonzero values identify static catalogs.
@@ -112,6 +161,29 @@ pub fn text() -> &'static Strings {
         7 => &bn::TEXT,
         8 => &pt::TEXT,
         _ => &en::TEXT,
+    }
+}
+
+/// The catalog for one language, so tests do not depend on the global choice.
+#[cfg(test)]
+pub(crate) fn text_in(language: Language) -> &'static Strings {
+    match language {
+        Language::Es => &es::TEXT,
+        _ => &en::TEXT,
+    }
+}
+
+pub(crate) struct WeatherText {
+    pub conditions: [&'static str; 6],
+    pub high: &'static str,
+    pub low: &'static str,
+}
+
+pub(crate) fn weather(language: Language) -> &'static WeatherText {
+    if language == Language::Es {
+        &es::WEATHER
+    } else {
+        &en::WEATHER
     }
 }
 

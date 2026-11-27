@@ -29,6 +29,7 @@ windows-future = "0.3"
 windows-numerics.workspace = true
 windows = { workspace = true, features = [
     "Devices_Enumeration",
+    "Devices_Geolocation",
     "Devices_Radios",
     "Devices_HumanInterfaceDevice",
     "Foundation",

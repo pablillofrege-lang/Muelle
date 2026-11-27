@@ -48,18 +48,19 @@ async fn set_config(patch: serde_json::Map<String, serde_json::Value>) -> Result
     .map_err(|error| error.to_string())?
 }
 
-/// Read-only animation preference for the Settings view. Windows remains
-/// the source of truth; the dock owns status-item preference notifications.
+/// Read-only system values for the Settings view.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WindowsPreferences {
     animations: bool,
+    displays: Vec<muelle_shell::system::DesktopDisplay>,
 }
 
 #[tauri::command]
 fn windows_preferences() -> WindowsPreferences {
     WindowsPreferences {
         animations: muelle_shell::system::animations_enabled(),
+        displays: muelle_shell::system::desktop_displays(),
     }
 }
 

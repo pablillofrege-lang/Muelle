@@ -31,6 +31,7 @@ mod visibility;
 use std::{
     cell::RefCell,
     collections::HashMap,
+    rc::Rc,
     sync::{
         OnceLock,
         atomic::{AtomicIsize, AtomicU8, Ordering},
@@ -40,7 +41,7 @@ use std::{
 };
 
 use anyhow::Result;
-use muelle_config::{Config, DockDensity};
+use muelle_config::{Config, DockDensity, DockStyle};
 use muelle_core::{
     attention::Attention,
     frame::{DockEdge, Frame as DockFrame},
@@ -72,6 +73,7 @@ use windows::{
 
 use crate::{
     assets::Visuals,
+    desktop_clock,
     edge_watch::EdgeWatch,
     flight::{Flight, Snapshot},
     gfx::{Gfx, LabelBrush},
@@ -82,6 +84,7 @@ use crate::{
     multi_window_view::MultiWindowView,
     scene::Scene,
     thumbnails::Thumbnails,
+    weather,
 };
 
 use menus::run_outside;
@@ -89,13 +92,14 @@ use menus::run_outside;
 pub use events::{
     drag_enter, drag_leave, drag_over, drop_files, group_view_menu, group_view_moved,
     group_view_press, group_view_press_lost, group_view_release, group_view_tick,
-    menu_bar_accessories_changed, menu_bar_accessories_reset, menu_bar_audio_changed,
-    menu_bar_bluetooth_changed, menu_bar_check_pointer, menu_bar_clicked, menu_bar_dismiss_island,
-    menu_bar_finish_hide, menu_bar_media_changed, menu_bar_monitor_tick, menu_bar_pointer_moved,
-    menu_bar_progress_tick, menu_bar_registry_changed, menu_bar_scrolled, menu_bar_tick,
-    menu_bar_volume_flush, menu_bar_volume_press, menu_bar_volume_release,
-    multi_window_view_dismiss, multi_window_view_middle_click, multi_window_view_press,
-    multi_window_view_release, multi_window_view_scroll, multi_window_view_tick,
+    menu_bar_accessories_changed, menu_bar_accessories_reset, menu_bar_alert_done,
+    menu_bar_audio_changed, menu_bar_bluetooth_changed, menu_bar_check_pointer, menu_bar_clicked,
+    menu_bar_dismiss_island, menu_bar_finish_hide, menu_bar_media_changed, menu_bar_monitor_tick,
+    menu_bar_pointer_moved, menu_bar_progress_tick, menu_bar_registry_changed, menu_bar_scrolled,
+    menu_bar_tick, menu_bar_usage_hover, menu_bar_volume_flush, menu_bar_volume_press,
+    menu_bar_volume_release, multi_window_view_dismiss, multi_window_view_middle_click,
+    multi_window_view_press, multi_window_view_release, multi_window_view_scroll,
+    multi_window_view_tick,
 };
 pub(crate) use input::primary_button_down;
 pub use lifecycle::{request_quit, run};
@@ -541,6 +545,7 @@ struct StageKey {
     /// backdrop brush made while Windows had transparency off stays black
     /// after it comes back, so its `glass` rebuilds the dock both ways.
     look: crate::appearance::Look,
+    dock_style: DockStyle,
     bin_full: bool,
     auto_hide: bool,
     smart_hide: bool,
@@ -698,6 +703,8 @@ pub(crate) struct App {
     placeholder: Option<CompositionSurfaceBrush>,
     remove_label: Option<LabelBrush>,
     config: Config,
+    weather: Rc<RefCell<weather::Cache>>,
+    desktop_clock: Option<desktop_clock::Clock>,
     /// 0 = shown, 1 = hidden (auto-hide).
     slide: Spring,
     press: Option<Press>,

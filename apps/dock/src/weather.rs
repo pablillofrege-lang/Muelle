@@ -1,4 +1,6 @@
-//! One-shot forecasts for the zoned menu bar.
+//! One-shot forecasts shared by the desktop clock and the zoned menu bar.
+
+mod location;
 
 use std::{
     env,
@@ -15,11 +17,13 @@ use muelle_config::Weather;
 use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use windows::Win32::{
-    Foundation::{HANDLE, WAIT_OBJECT_0},
+    Foundation::{HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM},
     System::Threading::WaitForSingleObject,
+    UI::WindowsAndMessaging::{PostMessageW, WM_APP},
 };
 
 pub const WORKER_FLAG: &str = "--weather-worker";
+pub const READY: u32 = WM_APP + 13;
 const VALID_FOR: Duration = Duration::from_secs(30 * 60);
 /// After a failed query, the next reveal may ask again this soon.
 const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
@@ -31,7 +35,7 @@ const MAX_ERROR_BYTES: usize = 1024;
 const WORKER_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum Condition {
+pub(crate) enum Condition {
     Clear,
     Cloudy,
     Fog,
@@ -62,6 +66,10 @@ pub struct Reading {
 }
 
 impl Reading {
+    pub fn condition(self) -> Option<Condition> {
+        self.condition
+    }
+
     pub fn glyph(self) -> Option<char> {
         Some(match self.condition? {
             Condition::Clear => '\u{2600}',
@@ -112,7 +120,7 @@ fn parse_forecast(body: &[u8]) -> Option<Reading> {
     })
 }
 
-/// How long to wait after an attempt before the next one, on reveal only.
+/// How long to wait after an attempt before the next visible request.
 fn due(last_attempt: Option<Instant>, failed: bool, now: Instant) -> bool {
     let wait = if failed { RETRY_AFTER } else { VALID_FOR };
     last_attempt.is_none_or(|last| now.saturating_duration_since(last) >= wait)
@@ -120,35 +128,84 @@ fn due(last_attempt: Option<Instant>, failed: bool, now: Instant) -> bool {
 
 #[derive(Default)]
 pub struct Cache {
+    notify: isize,
     settings: Weather,
     last_attempt: Option<Instant>,
     /// The last attempt brought nothing: the next reveal retries sooner.
     failed: bool,
     /// The last good reading and when it arrived.
-    reading: Option<(Reading, Instant)>,
-    pending: Option<Receiver<Option<Reading>>>,
+    reading: Option<(Forecast, Instant)>,
+    pending: Option<Receiver<Option<WorkerResult>>>,
+    discard_pending: bool,
+    location: Option<location::Stored>,
+    logged_fallback: [bool; 2],
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkerQuery {
+    settings: Weather,
+    previous: Option<location::Stored>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkerResult {
+    forecast: Option<Forecast>,
+    error: Option<String>,
+    location: Option<location::Stored>,
+    fallback: Option<location::Unavailable>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Forecast {
+    reading: Reading,
+    city: Option<String>,
 }
 
 impl Cache {
-    pub fn configure(&mut self, settings: Weather) -> bool {
-        if self.settings == settings {
+    pub fn new(notify: HWND) -> Self {
+        Self {
+            notify: notify.0 as isize,
+            ..Self::default()
+        }
+    }
+
+    pub fn configure(&mut self, settings: &Weather) -> bool {
+        if &self.settings == settings {
             return false;
         }
-        // New coordinates, or the weather turned on: ask on the next reveal.
-        *self = Self {
-            settings,
-            ..Self::default()
-        };
+        if settings.enabled && settings.auto && self.location.is_none() {
+            self.location = location::Stored::load();
+        }
+        self.settings = settings.clone();
+        self.last_attempt = None;
+        self.failed = false;
+        self.reading = None;
+        // Allow the child to exit before launching another one. Its result
+        // belongs to the old settings even if they are later selected again.
+        self.discard_pending = self.pending.is_some();
         true
     }
 
     pub fn reveal(&mut self) {
-        self.reveal_at(Instant::now(), |latitude, longitude| {
+        let notify = self.notify;
+        self.reveal_at(Instant::now(), |settings, previous| {
+            let mut settings = settings.clone();
+            settings.city = location::city_label(&settings.city).unwrap_or_default();
+            let query = WorkerQuery {
+                previous: previous.filter(|_| settings.auto).cloned(),
+                settings,
+            };
             let (send, receive) = mpsc::channel();
             thread::Builder::new()
                 .name("muelle-weather".into())
                 .spawn(move || {
-                    let _ = send.send(fetch_in_child(latitude, longitude));
+                    let result = fetch_in_child(&query);
+                    if send.send(result).is_ok() {
+                        // SAFETY: No borrowed payload crosses the thread boundary.
+                        let _ = unsafe {
+                            PostMessageW(Some(HWND(notify as _)), READY, WPARAM(0), LPARAM(0))
+                        };
+                    }
                 })
                 .ok()
                 .map(|_| receive)
@@ -158,11 +215,14 @@ impl Cache {
     fn reveal_at(
         &mut self,
         now: Instant,
-        start: impl FnOnce(f64, f64) -> Option<Receiver<Option<Reading>>>,
+        start: impl FnOnce(
+            &Weather,
+            Option<&location::Stored>,
+        ) -> Option<Receiver<Option<WorkerResult>>>,
     ) {
-        let settings = self.settings;
+        let settings = &self.settings;
         if !settings.enabled
-            || !settings.has_valid_coordinates()
+            || (!settings.auto && !settings.has_valid_coordinates())
             || self.pending.is_some()
             || !due(self.last_attempt, self.failed, now)
         {
@@ -170,11 +230,11 @@ impl Cache {
         }
         // The previous reading stays on screen until the new one arrives.
         self.last_attempt = Some(now);
-        self.pending = start(settings.latitude, settings.longitude);
+        self.pending = start(settings, self.location.as_ref());
+        self.failed = self.pending.is_none();
     }
 
-    /// Checked by the existing pointer timer, which runs during reveal.
-    /// True when what the capsule shows changed.
+    /// Consumes the worker result on the dock's UI thread.
     pub fn poll(&mut self) -> bool {
         self.poll_at(Instant::now())
     }
@@ -189,15 +249,19 @@ impl Cache {
             Err(TryRecvError::Disconnected) => None,
         };
         self.pending = None;
-        self.failed = fetched.is_none();
-        match fetched {
-            Some(reading) => {
-                self.reading = Some((reading, now));
+        if std::mem::take(&mut self.discard_pending) {
+            return false;
+        }
+        let forecast = fetched.and_then(|result| self.accept_result(result));
+        self.failed = forecast.is_none();
+        match forecast {
+            Some(forecast) => {
+                self.reading = Some((forecast, now));
                 true
             }
             // A failed query keeps a recent reading; an old one goes.
             None => {
-                let stale = self.reading.is_some() && self.reading_at(now).is_none();
+                let stale = self.reading.is_some() && self.forecast_at(now).is_none();
                 if stale {
                     self.reading = None;
                 }
@@ -206,33 +270,75 @@ impl Cache {
         }
     }
 
-    pub fn reading(&self) -> Option<Reading> {
-        self.reading_at(Instant::now())
+    fn accept_result(&mut self, result: WorkerResult) -> Option<Forecast> {
+        if let Some(reason) = result.fallback
+            && !std::mem::replace(&mut self.logged_fallback[reason as usize], true)
+        {
+            let source = if self.location.is_some() {
+                "última posición"
+            } else {
+                "ubicación configurada"
+            };
+            muelle_shell::log::line(&format!("tiempo: {}; se usa {source}", reason.text()));
+        }
+        if let Some(stored) = result.location
+            && Some(&stored) != self.location.as_ref()
+        {
+            if let Err(error) = stored.save() {
+                muelle_shell::log::line(&format!("tiempo: no se guardó la ubicación: {error:#}"));
+            }
+            self.location = Some(stored);
+        }
+        if let Some(error) = result.error {
+            muelle_shell::log::line(&format!("tiempo: {error}"));
+        }
+        result.forecast
     }
 
-    fn reading_at(&self, now: Instant) -> Option<Reading> {
+    pub fn reading(&self) -> Option<Reading> {
+        self.forecast().map(|(reading, _)| reading)
+    }
+
+    pub fn forecast(&self) -> Option<(Reading, Option<&str>)> {
+        self.forecast_at(Instant::now())
+            .map(|forecast| (forecast.reading, forecast.city.as_deref()))
+    }
+
+    fn forecast_at(&self, now: Instant) -> Option<&Forecast> {
         self.reading
+            .as_ref()
             .filter(|(_, at)| now.saturating_duration_since(*at) < KEEP_FOR)
-            .map(|(reading, _)| reading)
+            .map(|(forecast, _)| forecast)
     }
 }
 
-fn fetch_in_child(latitude: f64, longitude: f64) -> Option<Reading> {
-    run_child(latitude, longitude)
+fn fetch_in_child(query: &WorkerQuery) -> Option<WorkerResult> {
+    run_child(query)
         .inspect_err(|error| muelle_shell::log::line(&format!("tiempo: {error:#}")))
         .ok()
 }
 
-fn run_child(latitude: f64, longitude: f64) -> Result<Reading> {
+fn run_child(query: &WorkerQuery) -> Result<WorkerResult> {
     // Like the usage worker, release the HTTP runtime and TLS heap on exit.
     let mut child = Command::new(env::current_exe()?)
-        .args([WORKER_FLAG, &latitude.to_string(), &longitude.to_string()])
+        .arg(WORKER_FLAG)
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("no se pudo iniciar la consulta")?;
+    let request = child
+        .stdin
+        .take()
+        .context("no se pudo preparar la consulta")
+        .and_then(|input| Ok(serde_json::to_writer(input, query)?));
+    if let Err(error) = request {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    muelle_shell::log::line("tiempo: consulta iniciada");
     // Both outputs are a few hundred bytes, well within the pipe buffers,
     // so the child never blocks on them before it exits.
     // SAFETY: The handle belongs to the live child until `wait` below.
@@ -278,21 +384,48 @@ fn error_summary(stderr: &[u8]) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn worker_main(latitude: &str, longitude: &str) -> Result<()> {
-    let latitude: f64 = latitude.parse()?;
-    let longitude: f64 = longitude.parse()?;
-    ensure!((-90.0..=90.0).contains(&latitude), "latitud fuera de rango");
-    ensure!(
-        (-180.0..=180.0).contains(&longitude),
-        "longitud fuera de rango"
-    );
+pub fn worker_main() -> Result<()> {
+    let query: WorkerQuery = serde_json::from_reader(std::io::stdin().lock().take(4096))
+        .context("consulta no válida")?;
     let client = Client::builder()
         .timeout(Duration::from_secs(6))
         .redirect(Policy::none())
         .build()
         .map_err(reqwest::Error::without_url)?;
+    let selection = location::select(&client, &query.settings, query.previous);
+    let result = selection
+        .position
+        .context("coordenadas del pronóstico fuera de rango")
+        .and_then(|position| fetch_forecast(&client, position));
+    let (forecast, error) = match result {
+        Ok(reading) => (
+            Some(Forecast {
+                reading,
+                city: selection.city,
+            }),
+            None,
+        ),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    serde_json::to_writer(
+        std::io::stdout().lock(),
+        &WorkerResult {
+            forecast,
+            error,
+            location: selection.stored,
+            fallback: selection.fallback,
+        },
+    )?;
+    Ok(())
+}
+
+fn fetch_forecast(client: &Client, position: location::Coordinates) -> Result<Reading> {
+    let location::Coordinates {
+        latitude,
+        longitude,
+    } = position;
     let url = format!(
-        "https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}\
+        "https://api.open-meteo.com/v1/forecast?latitude={latitude:.2}&longitude={longitude:.2}\
          &current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min\
          &temperature_unit=celsius&timezone=auto&forecast_days=1"
     );
@@ -309,9 +442,7 @@ pub fn worker_main(latitude: &str, longitude: &str) -> Result<()> {
         body.len() <= MAX_RESPONSE_BYTES,
         "pronóstico demasiado grande"
     );
-    let reading = parse_forecast(&body).context("pronóstico no válido")?;
-    serde_json::to_writer(std::io::stdout().lock(), &reading)?;
-    Ok(())
+    parse_forecast(&body).context("pronóstico no válido")
 }
 
 #[cfg(test)]
@@ -336,6 +467,25 @@ mod tests {
         ] {
             assert_eq!(Condition::from_code(code), expected, "WMO {code}");
         }
+    }
+
+    #[test]
+    fn conditions_and_ranges_have_english_and_spanish_labels() {
+        use muelle_config::Language;
+
+        let cloudy = Reading {
+            condition: Some(Condition::Cloudy),
+            ..SUNNY
+        };
+        let es = crate::strings::weather(Language::Es);
+        let en = crate::strings::weather(Language::En);
+        let index = cloudy
+            .condition()
+            .map_or(usize::MAX, |condition| condition as usize);
+        assert_eq!(es.conditions.get(index), Some(&"Nublado"));
+        assert_eq!(en.conditions.get(index), Some(&"Cloudy"));
+        assert_eq!((es.high, es.low), ("máx.", "mín."));
+        assert_eq!((en.high, en.low), ("high", "low"));
     }
 
     #[test]
@@ -402,7 +552,7 @@ mod tests {
     /// A cache with coordinates other than the default ones.
     fn cache() -> Cache {
         let mut cache = Cache::default();
-        cache.configure(Weather {
+        cache.configure(&Weather {
             latitude: 40.0,
             ..Weather::default()
         });
@@ -413,7 +563,7 @@ mod tests {
     #[derive(Default)]
     struct Queries {
         started: u32,
-        waiting: Vec<mpsc::Sender<Option<Reading>>>,
+        waiting: Vec<mpsc::Sender<Option<WorkerResult>>>,
     }
 
     impl Queries {
@@ -431,14 +581,29 @@ mod tests {
 
         /// Answers the latest query, as the worker thread would.
         fn answer(&mut self, reading: Option<Reading>) -> bool {
-            self.waiting
-                .pop()
-                .is_some_and(|send| send.send(reading).is_ok())
+            self.waiting.pop().is_some_and(|send| {
+                send.send(reading.map(|reading| WorkerResult {
+                    forecast: Some(Forecast {
+                        reading,
+                        city: None,
+                    }),
+                    error: None,
+                    location: None,
+                    fallback: None,
+                }))
+                .is_ok()
+            })
         }
 
         /// Reveals and answers at once.
         fn fetch(&mut self, cache: &mut Cache, now: Instant, reading: Option<Reading>) -> bool {
             self.reveal(cache, now) && self.answer(reading)
+        }
+    }
+
+    impl Cache {
+        fn reading_at(&self, now: Instant) -> Option<Reading> {
+            self.forecast_at(now).map(|forecast| forecast.reading)
         }
     }
 
@@ -505,11 +670,11 @@ mod tests {
         let mut queries = Queries::default();
         assert!(queries.fetch(&mut cache, t0, Some(SUNNY)));
         assert!(cache.poll_at(t0));
-        let settings = cache.settings;
-        assert!(!cache.configure(settings), "unchanged");
+        let settings = cache.settings.clone();
+        assert!(!cache.configure(&settings), "unchanged");
         assert_eq!(cache.reading_at(t0), Some(SUNNY));
 
-        assert!(cache.configure(Weather {
+        assert!(cache.configure(&Weather {
             longitude: -3.0,
             ..settings
         }));
@@ -520,22 +685,42 @@ mod tests {
         // Off, nothing is asked; turned back on, the next reveal asks.
         let off = Weather {
             enabled: false,
-            ..cache.settings
+            ..cache.settings.clone()
         };
-        assert!(cache.configure(off));
+        assert!(cache.configure(&off));
         assert!(!queries.reveal(&mut cache, moved));
-        assert!(cache.configure(Weather {
+        assert!(cache.configure(&Weather {
             enabled: true,
             ..off
         }));
+        assert!(!queries.reveal(&mut cache, moved));
+        assert!(queries.answer(Some(SUNNY)));
+        assert!(!cache.poll_at(moved));
         assert!(queries.reveal(&mut cache, moved));
         assert_eq!(queries.started, 3);
     }
 
     #[test]
+    fn changing_settings_does_not_overlap_workers_or_publish_stale_weather() {
+        let t0 = Instant::now();
+        let mut cache = cache();
+        let mut queries = Queries::default();
+        assert!(queries.reveal(&mut cache, t0));
+        assert!(cache.configure(&Weather {
+            longitude: -3.0,
+            ..Weather::default()
+        }));
+        assert!(!queries.reveal(&mut cache, t0));
+        assert!(queries.answer(Some(SUNNY)));
+        assert!(!cache.poll_at(t0));
+        assert_eq!(cache.reading_at(t0), None);
+        assert!(queries.reveal(&mut cache, t0));
+    }
+
+    #[test]
     fn coordinates_out_of_range_never_start_a_query() {
         let mut cache = Cache::default();
-        cache.configure(Weather {
+        cache.configure(&Weather {
             latitude: 91.0,
             ..Weather::default()
         });

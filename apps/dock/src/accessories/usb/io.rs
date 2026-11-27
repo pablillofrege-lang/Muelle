@@ -79,13 +79,18 @@ impl Hid {
                 profile.accepts_collection(caps.UsagePage, caps.Usage, input, output),
                 "unsupported HID collection or report sizes"
             );
-            ensure!(
-                output_report_present(data.0, &caps, profile.output_report(output))?,
-                "HID output report unavailable"
-            );
+            let access = if profile.model == Model::DualSense {
+                GENERIC_READ.0
+            } else {
+                ensure!(
+                    output_report_present(data.0, &caps, profile.output_report(output))?,
+                    "HID output report unavailable"
+                );
+                GENERIC_READ.0 | GENERIC_WRITE.0
+            };
             let handle = Owned::new(CreateFileW(
                 &path,
-                GENERIC_READ.0 | GENERIC_WRITE.0,
+                access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -338,6 +343,27 @@ impl Wire for LogitechWire {
     }
 }
 
+fn read_dualsense(hid: &Hid, bluetooth: bool) -> Result<Option<u8>> {
+    let end = Instant::now() + Duration::from_millis(120);
+    let mut read = PendingRead::new(hid)?;
+    for _ in 0..16 {
+        let wait = end.saturating_duration_since(Instant::now()).as_millis() as u32;
+        if wait == 0 {
+            break;
+        }
+        read.start()?;
+        // SAFETY: PendingRead owns the event and keeps the buffers alive.
+        if unsafe { WaitForSingleObject(*read.event, wait) } != WAIT_OBJECT_0 {
+            break;
+        }
+        let count = read.complete()?;
+        if let Some(percent) = protocol::dualsense_percent(&read.buffer[..count], bluetooth) {
+            return Ok(Some(percent));
+        }
+    }
+    Ok(None)
+}
+
 pub fn query(paths: &[String]) -> Result<Vec<Reading>> {
     ensure!(
         (1..=2).contains(&paths.len()),
@@ -355,6 +381,14 @@ pub fn query(paths: &[String]) -> Result<Vec<Reading>> {
         .map(|path| Hid::open(path, profile))
         .collect::<Result<Vec<_>>>()?;
     match profile.model {
+        Model::DualSense => {
+            let bluetooth = protocol::dualsense_bluetooth_path(&paths[0].to_ascii_lowercase());
+            Ok(vec![Reading {
+                slot: 0,
+                kind: muelle_shell::accessories::Kind::Gamepad,
+                percent: read_dualsense(&collections[0], bluetooth)?,
+            }])
+        }
         Model::Logitech | Model::LogitechHeadset => {
             ensure!(
                 collections.len() == 1 || collections[0].input != collections[1].input,

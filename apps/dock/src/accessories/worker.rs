@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::{Result, bail, ensure};
-use muelle_shell::accessories::{Endpoint, Kind, Snapshot, State, assemble};
+use muelle_shell::accessories::{
+    BluetoothDevices, BluetoothModel, Endpoint, Kind, Snapshot, State, assemble,
+};
 use windows::{
     Devices::Enumeration::{
         DeviceInformation, DeviceInformationKind, DeviceInformationUpdate, DeviceWatcher,
@@ -32,12 +34,26 @@ const CONNECTED: &str = "System.Devices.Aep.IsConnected";
 const CATEGORY: &str = "System.Devices.Aep.Category";
 const AEP: &str = "(System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\" OR System.Devices.Aep.ProtocolId:=\"{bb7bb05e-5972-42b5-94fc-76eaa7084d49}\") AND System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True";
 const NODES: &str = "System.Devices.ClassGuid:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\" OR System.Devices.ClassGuid:=\"{745a17a0-74d3-11d0-b6fe-00a0c90f57da}\" OR System.Devices.ClassGuid:=\"{4d36e96c-e325-11ce-bfc1-08002be10318}\"";
+const SYSTEM_NODES: &str = "System.Devices.ClassGuid:=\"{4d36e97d-e325-11ce-bfc1-08002be10318}\"";
+const HANDS_FREE_PREFIX: &str = r"BTHENUM\{0000111e-0000-1000-8000-00805f9b34fb}";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Source {
     Endpoint,
     Node,
     Usb,
+    HandsFree,
+}
+
+fn hands_free_id(id: &str) -> bool {
+    id.get(..HANDS_FREE_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(HANDS_FREE_PREFIX))
+}
+
+impl Source {
+    fn accepts(self, id: impl FnOnce() -> windows::core::Result<HSTRING>) -> bool {
+        self != Self::HandsFree || id().is_ok_and(|id| hands_free_id(&id.to_string()))
+    }
 }
 pub(super) enum Event {
     Add(Source, DeviceInformation),
@@ -80,10 +96,16 @@ fn send(tx: &SyncSender<Event>, full: &AtomicBool, event: Event) {
     }
 }
 
-fn watch(source: Source, tx: SyncSender<Event>, full: Arc<AtomicBool>) -> Result<Watch> {
+fn watch(
+    source: Source,
+    tx: SyncSender<Event>,
+    full: Arc<AtomicBool>,
+    legacy: bool,
+    bluetooth: bool,
+) -> Result<Watch> {
     let props: IIterable<HSTRING> = match source {
         Source::Endpoint => vec![AEP_CONTAINER, CONNECTED, CATEGORY],
-        Source::Node => vec![CONTAINER, BATTERY],
+        Source::Node | Source::HandsFree => vec![CONTAINER, BATTERY],
         Source::Usb => vec![CONTAINER],
     }
     .into_iter()
@@ -94,12 +116,13 @@ fn watch(source: Source, tx: SyncSender<Event>, full: Arc<AtomicBool>) -> Result
         &HSTRING::from(match source {
             Source::Endpoint => AEP.into(),
             Source::Node => NODES.into(),
-            Source::Usb => usb::selector()?,
+            Source::HandsFree => SYSTEM_NODES.into(),
+            Source::Usb => usb::selector(legacy, bluetooth)?,
         }),
         &props,
         match source {
             Source::Endpoint => DeviceInformationKind::AssociationEndpoint,
-            Source::Node => DeviceInformationKind::Device,
+            Source::Node | Source::HandsFree => DeviceInformationKind::Device,
             Source::Usb => DeviceInformationKind::DeviceInterface,
         },
     )?;
@@ -110,7 +133,9 @@ fn watch(source: Source, tx: SyncSender<Event>, full: Arc<AtomicBool>) -> Result
     let (sender, overflow) = (tx.clone(), full.clone());
     watch.tokens.push(Subscription::Add(watch.watcher.Added(
         &TypedEventHandler::new(move |_, arg: windows::core::Ref<DeviceInformation>| {
-            if let Some(info) = arg.as_ref() {
+            if let Some(info) = arg.as_ref()
+                && source.accepts(|| info.Id())
+            {
                 send(&sender, &overflow, Event::Add(source, info.clone()));
             }
             Ok(())
@@ -121,7 +146,9 @@ fn watch(source: Source, tx: SyncSender<Event>, full: Arc<AtomicBool>) -> Result
         .tokens
         .push(Subscription::Update(watch.watcher.Updated(
             &TypedEventHandler::new(move |_, arg: windows::core::Ref<DeviceInformationUpdate>| {
-                if let Some(info) = arg.as_ref() {
+                if let Some(info) = arg.as_ref()
+                    && source.accepts(|| info.Id())
+                {
                     send(&sender, &overflow, Event::Update(source, info.clone()));
                 }
                 Ok(())
@@ -132,7 +159,9 @@ fn watch(source: Source, tx: SyncSender<Event>, full: Arc<AtomicBool>) -> Result
         .tokens
         .push(Subscription::Remove(watch.watcher.Removed(
             &TypedEventHandler::new(move |_, arg: windows::core::Ref<DeviceInformationUpdate>| {
-                if let Some(info) = arg.as_ref() {
+                if let Some(info) = arg.as_ref()
+                    && source.accepts(|| info.Id())
+                {
                     send(&sender, &overflow, Event::Remove(source, info.clone()));
                 }
                 Ok(())
@@ -174,32 +203,29 @@ fn snapshot(
     endpoints: &BTreeMap<String, DeviceInformation>,
     nodes: &BTreeMap<String, DeviceInformation>,
     usb: &usb::Sources,
+    legacy: bool,
+    bluetooth: bool,
 ) -> Result<Snapshot> {
     let mut levels: BTreeMap<String, BTreeSet<u8>> = BTreeMap::new();
-    for node in nodes.values() {
+    let mut hands_free: BTreeMap<String, BTreeSet<u8>> = BTreeMap::new();
+    for (path, node) in nodes {
         if let (Some(id), Some(percent)) = (
             container(node, CONTAINER),
             property(node, BATTERY)
                 .and_then(|value| value.GetUInt8().ok())
                 .filter(|value| *value <= 100),
         ) {
-            levels.entry(id).or_default().insert(percent);
+            let readings = if bluetooth && hands_free_id(path) {
+                &mut hands_free
+            } else {
+                &mut levels
+            };
+            readings.entry(id).or_default().insert(percent);
         }
     }
     let mut found = Vec::new();
+    let mut bluetooth_devices = BluetoothDevices::default();
     for info in endpoints.values() {
-        let mut categories = Array::<HSTRING>::new();
-        if let Some(value) = property(info, CATEGORY) {
-            let _ = value.GetStringArray(&mut categories);
-        }
-        let Some(kind) = Kind::from_categories(
-            &categories
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-        ) else {
-            continue;
-        };
         let id = container(info, AEP_CONTAINER)
             .unwrap_or_else(|| info.Id().map(|id| id.to_string()).unwrap_or_default());
         let name: String = info
@@ -212,15 +238,51 @@ fn snapshot(
         if id.is_empty() || id.len() > 512 || name.is_empty() {
             continue;
         }
+        let connected = property(info, CONNECTED).and_then(|value| value.GetBoolean().ok());
+        if bluetooth && let Some(model) = BluetoothModel::from_name(&name) {
+            let percent = if model == BluetoothModel::Sony {
+                hands_free
+                    .get(&id)
+                    .or_else(|| levels.get(&id))
+                    .filter(|values| values.len() == 1)
+                    .and_then(|values| values.first().copied())
+            } else {
+                None
+            };
+            bluetooth_devices.observe(model, connected == Some(true), percent);
+            continue;
+        }
+        if !legacy {
+            continue;
+        }
+        let mut categories = Array::<HSTRING>::new();
+        if let Some(value) = property(info, CATEGORY) {
+            let _ = value.GetStringArray(&mut categories);
+        }
+        let Some(kind) = Kind::from_categories(
+            &categories
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        ) else {
+            continue;
+        };
         found.push(Endpoint {
             id,
             name,
             kind,
-            connected: property(info, CONNECTED).and_then(|value| value.GetBoolean().ok()),
+            connected,
         });
+    }
+    if bluetooth && usb.dualsense_connected() {
+        bluetooth_devices.observe(BluetoothModel::DualSense, true, None);
     }
     let mut devices = assemble(found, levels);
     for reading in usb.devices() {
+        if reading.kind == Kind::Gamepad {
+            bluetooth_devices.observe(BluetoothModel::DualSense, true, reading.percent);
+            continue;
+        }
         if let Some(existing) = devices.iter_mut().find(|device| device.id == reading.id) {
             if existing.percent.is_none() && !existing.conflicting {
                 existing.percent = reading.percent;
@@ -244,6 +306,7 @@ fn snapshot(
     Ok(Snapshot {
         state: State::Ready,
         devices,
+        bluetooth: bluetooth_devices,
         received_at: Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
     })
 }
@@ -266,7 +329,7 @@ impl Drop for Apartment {
     }
 }
 
-pub fn run(visibility: Option<&str>) -> Result<()> {
+pub fn run(visibility: Option<&str>, legacy: bool, bluetooth: bool) -> Result<()> {
     emit(&Frame::Busy)?;
     // SAFETY: This worker owns its MTA and exits independently of the UI.
     unsafe { RoInitialize(RO_INIT_MULTITHREADED) }?;
@@ -276,14 +339,21 @@ pub fn run(visibility: Option<&str>) -> Result<()> {
     let visibility = visibility
         .map(|name| visibility::Watch::new(name, tx.clone(), full.clone()))
         .transpose()?;
-    let _aep = watch(Source::Endpoint, tx.clone(), full.clone())?;
-    let _nodes = watch(Source::Node, tx.clone(), full.clone())?;
-    let _usb = watch(Source::Usb, tx.clone(), full.clone())
+    let start = |source| watch(source, tx.clone(), full.clone(), legacy, bluetooth);
+    let _aep = start(Source::Endpoint)?;
+    let _nodes = legacy.then(|| start(Source::Node)).transpose()?;
+    let _hands_free = bluetooth
+        .then(|| start(Source::HandsFree))
+        .transpose()
+        .inspect_err(|_| eprintln!("muelle: Bluetooth Hands-Free battery unavailable"))
+        .ok()
+        .flatten();
+    let _usb = start(Source::Usb)
         .inspect_err(|_| eprintln!("muelle: USB accessory discovery unavailable"))
         .ok();
     let mut usb = usb::Sources::default();
     let (mut endpoints, mut nodes) = (BTreeMap::new(), BTreeMap::new());
-    let mut complete = [false; 3];
+    let mut complete = [false; 2];
     let mut deadline = Some(Instant::now() + Duration::from_millis(120));
     let mut busy = true;
     let mut last: Option<Snapshot> = None;
@@ -314,11 +384,14 @@ pub fn run(visibility: Option<&str>) -> Result<()> {
                 continue;
             }
             deadline = None;
-            // Optional USB discovery must not delay the established Bluetooth source.
-            if complete[..2].iter().all(|done| *done) {
-                let mut current = snapshot(&endpoints, &nodes, &usb)?;
+            // AEP can deliver paired endpoints without ever completing enumeration.
+            // F4 publishes the known connections and lets subsequent events fill in
+            // the levels. Keep the original reader's startup behavior when F4 is off.
+            if bluetooth || complete.into_iter().all(|done| done) {
+                let mut current = snapshot(&endpoints, &nodes, &usb, legacy, bluetooth)?;
                 if let Some(previous) = &last
                     && current.devices == previous.devices
+                    && current.bluetooth == previous.bluetooth
                 {
                     current.received_at = previous.received_at;
                 }
@@ -376,8 +449,14 @@ pub fn run(visibility: Option<&str>) -> Result<()> {
                 })
                 .remove(&update.Id()?.to_string());
             }
-            Event::Complete(source) => complete[source as usize] = true,
+            Event::Complete(source @ (Source::Endpoint | Source::Node)) => {
+                complete[source as usize] = true;
+            }
+            Event::Complete(_) => {}
             Event::Stopped(Source::Usb) => usb = usb::Sources::default(),
+            Event::Stopped(Source::HandsFree) => {
+                nodes.retain(|path, _| !hands_free_id(path));
+            }
             Event::Stopped(_) => bail!("accessory watcher stopped"),
         }
     }
@@ -397,7 +476,7 @@ mod tests {
         let _apartment = Apartment;
         let (tx, rx) = mpsc::sync_channel(256);
         let full = Arc::new(AtomicBool::new(false));
-        let _watch = watch(Source::Usb, tx, full.clone())?;
+        let _watch = watch(Source::Usb, tx, full.clone(), true, false)?;
         let end = Instant::now() + Duration::from_secs(5);
         loop {
             match rx.recv_timeout(end.saturating_duration_since(Instant::now()))? {
