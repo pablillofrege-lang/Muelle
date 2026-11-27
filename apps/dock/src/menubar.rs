@@ -8116,14 +8116,14 @@ mod island_tests {
         });
         for style in [IslandStyle::Notch, IslandStyle::Bubble] {
             look.widgets.island_style = style;
-            for scale in [1.0, 1.5, 2.0] {
+            for scale in [0.9, 1.0, 1.5, 2.0] {
                 look.scale = scale;
                 for light in [false, true] {
                     look.light = light;
                     bar.usage_scroll = 0.0;
                     bar.build(&gfx, &look)?;
                     assert!(bar.visual_height <= 769, "popup must fit a 768 px display");
-                    if scale == 1.0 {
+                    if look.panel_content_height() <= look.panel_height() {
                         assert!(bar.usage_viewport.is_none());
                         continue;
                     }
