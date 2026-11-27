@@ -6162,6 +6162,7 @@ fn island_providers(look: &Look) -> Vec<IslandProvider<'_>> {
                 Provider::Codex => rgba(135, 190, 245, 255),
                 Provider::OpenCode => rgba(132, 196, 166, 255),
                 Provider::Gemini => rgba(111, 146, 255, 255),
+                Provider::Antigravity => rgba(143, 167, 255, 255),
                 Provider::Zai => rgba(79, 110, 247, 255),
             };
             (provider, look.usage.get(provider), accent)

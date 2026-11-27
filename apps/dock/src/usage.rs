@@ -266,16 +266,18 @@ pub enum Provider {
     OpenCode,
     Gemini,
     Zai,
+    Antigravity,
 }
 
 impl Provider {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Claude,
         Self::Codex,
         Self::OpenCode,
         Self::Gemini,
         Self::Zai,
+        Self::Antigravity,
     ];
 
     pub fn name(self) -> &'static str {
@@ -285,6 +287,7 @@ impl Provider {
             Self::OpenCode => "OpenCode Go",
             Self::Gemini => "Gemini",
             Self::Zai => "Z.ai GLM",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
@@ -309,15 +312,20 @@ impl ActiveProviders {
 /// Only show a provider while its local client is running. A stored login by
 /// itself does not imply the client is in use.
 pub fn active_providers() -> ActiveProviders {
+    active_clients().0
+}
+
+fn active_clients() -> (ActiveProviders, bool) {
     // SAFETY: The snapshot handle is closed before this function returns.
     let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return ActiveProviders::default();
+        return (ActiveProviders::default(), false);
     };
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
     let mut active = ActiveProviders::default();
+    let mut antigravity_desktop = false;
     // SAFETY: `entry` has the documented size and belongs to this snapshot.
     if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
         loop {
@@ -340,12 +348,9 @@ pub fn active_providers() -> ActiveProviders {
                     active.0[Provider::Zai as usize] = true;
                 }
                 "zai.exe" => active.0[Provider::Zai as usize] = true,
-                "gemini.exe" | "antigravity.exe" | "agy.exe" => {
-                    active.0[Provider::Gemini as usize] = true;
-                }
-                _ => {}
+                executable => antigravity_desktop |= active.observe_google_client(executable),
             }
-            if active.count() == Provider::COUNT {
+            if active.count() == Provider::COUNT && antigravity_desktop {
                 break;
             }
             // SAFETY: The snapshot and entry remain valid for this iteration.
@@ -358,7 +363,20 @@ pub fn active_providers() -> ActiveProviders {
     unsafe {
         let _ = CloseHandle(snapshot);
     }
-    active
+    (active, antigravity_desktop)
+}
+
+impl ActiveProviders {
+    /// Returns whether the executable also exposes the desktop quota service.
+    fn observe_google_client(&mut self, executable: &str) -> bool {
+        let provider = match executable {
+            "gemini.exe" => Provider::Gemini,
+            "antigravity.exe" | "agy.exe" => Provider::Antigravity,
+            _ => return false,
+        };
+        self.0[provider as usize] = true;
+        executable == "antigravity.exe"
+    }
 }
 
 fn claude_process_in_use(pid: u32) -> bool {
@@ -475,7 +493,11 @@ pub fn logo(provider: Provider) -> Option<&'static IconImage> {
     static OPENCODE: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
     static GEMINI: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
     static ZAI: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
+    static ANTIGRAVITY: std::sync::OnceLock<Option<IconImage>> = std::sync::OnceLock::new();
     match provider {
+        Provider::Antigravity => ANTIGRAVITY
+            .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/antigravity.png")))
+            .as_ref(),
         Provider::Claude => CLAUDE
             .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/claude.png")))
             .as_ref(),
@@ -683,7 +705,7 @@ fn fetch_all() -> Snapshot {
     let Ok(client) = Client::builder().timeout(Duration::from_secs(6)).build() else {
         return unavailable_snapshot();
     };
-    let active = active_providers();
+    let (active, antigravity_desktop) = active_clients();
     Snapshot {
         providers: std::array::from_fn(|index| {
             let provider = Provider::ALL[index];
@@ -695,6 +717,11 @@ fn fetch_all() -> Snapshot {
                 Provider::Codex => fetch_codex(&client),
                 Provider::OpenCode => fetch_opencode(&client),
                 Provider::Gemini => fetch_gemini(&client),
+                Provider::Antigravity if antigravity_desktop => {
+                    fetch_antigravity().unwrap_or_else(unavailable)
+                }
+                // ACP does not expose quota. Never substitute Gemini CLI's account.
+                Provider::Antigravity => unavailable(),
                 Provider::Zai => fetch_zai(&client),
             }
         }),
@@ -1131,11 +1158,6 @@ fn parse_zai(value: &Value) -> Vec<Window> {
 }
 
 fn fetch_gemini(client: &Client) -> ProviderUsage {
-    // Antigravity and Gemini CLI have distinct accounts and quotas. Prefer the
-    // running desktop app's own local quota service when it is available.
-    if let Some(usage) = fetch_antigravity() {
-        return usage;
-    }
     let Some(path) = home().map(|path| path.join(".gemini/oauth_creds.json")) else {
         return unavailable();
     };
@@ -1834,6 +1856,22 @@ mod tests {
         })();
         fs::remove_dir_all(&root)?;
         result
+    }
+
+    #[test]
+    fn antigravity_acp_and_gemini_cli_have_independent_status() {
+        let mut active = ActiveProviders::default();
+        assert!(!active.observe_google_client("agy.exe"));
+        assert!(active.has(Provider::Antigravity));
+        assert!(!active.has(Provider::Gemini));
+        assert!(
+            Snapshot::default()
+                .visible_providers(active)
+                .has(Provider::Antigravity)
+        );
+        assert!(!active.observe_google_client("gemini.exe"));
+        assert!(active.has(Provider::Gemini));
+        assert!(active.observe_google_client("antigravity.exe"));
     }
 
     #[test]
