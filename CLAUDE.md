@@ -14,7 +14,7 @@ Fork de crafter-station/Muelle. No se envían cambios al original.
 ## Reglas del fork
 - No borrar funciones del original: apagarlas con claves de configuración (por defecto, comportamiento original).
 - Traer novedades: `git fetch upstream; git merge upstream/main` solo cuando Pablo lo pida.
-- `autoUpdate` y `checkUpdates` apagados hasta tener versiones propias (F6).
+- `autoUpdate` y `checkUpdates` apagados. F6 (actualizaciones propias) queda descartada.
 - Credenciales de Claude y Codex: solo lectura.
 - Dock en reposo < ~40 MB (Memoria del Administrador de tareas, dock + vigilante).
 - Commits en español, concisos, sin `Co-Authored-By`. Una rama por fase y push tras cada commit.

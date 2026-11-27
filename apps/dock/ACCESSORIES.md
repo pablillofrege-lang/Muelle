@@ -9,7 +9,7 @@ DualSense y su detalle al hacer clic. Su valor por defecto es `false`.
 La batería de los Sony viene del nodo Hands-Free AG de la clase System.
 Muelle cruza su Container ID con el del dispositivo emparejado y solo muestra
 el porcentaje si Windows lo marca como conectado. Los AirPods Max emparejados
-aparecen como «Sin conectar» hasta F5.
+aparecen como «Sin conectar». La lectura de su batería (F5) queda descartada.
 
 DualSense (054C:0CE6) usa informes de entrada HID con un handle de lectura
 compartido. Se consulta al revelar la zona de estado si toca renovar la lectura,

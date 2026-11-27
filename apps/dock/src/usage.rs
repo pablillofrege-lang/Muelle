@@ -2,10 +2,10 @@
 
 use std::{
     env, fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -266,17 +266,23 @@ pub enum Provider {
     OpenCode,
     Gemini,
     Zai,
+    Antigravity,
 }
 
 impl Provider {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Claude,
         Self::Codex,
         Self::OpenCode,
         Self::Gemini,
         Self::Zai,
+        Self::Antigravity,
     ];
+
+    pub fn logo_in_color(self) -> bool {
+        matches!(self, Self::Claude | Self::Gemini | Self::Antigravity)
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -285,6 +291,7 @@ impl Provider {
             Self::OpenCode => "OpenCode Go",
             Self::Gemini => "Gemini",
             Self::Zai => "Z.ai GLM",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
@@ -309,15 +316,20 @@ impl ActiveProviders {
 /// Only show a provider while its local client is running. A stored login by
 /// itself does not imply the client is in use.
 pub fn active_providers() -> ActiveProviders {
+    active_clients().0
+}
+
+fn active_clients() -> (ActiveProviders, bool) {
     // SAFETY: The snapshot handle is closed before this function returns.
     let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return ActiveProviders::default();
+        return (ActiveProviders::default(), false);
     };
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
     let mut active = ActiveProviders::default();
+    let mut antigravity_desktop = false;
     // SAFETY: `entry` has the documented size and belongs to this snapshot.
     if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
         loop {
@@ -340,12 +352,9 @@ pub fn active_providers() -> ActiveProviders {
                     active.0[Provider::Zai as usize] = true;
                 }
                 "zai.exe" => active.0[Provider::Zai as usize] = true,
-                "gemini.exe" | "antigravity.exe" | "agy.exe" => {
-                    active.0[Provider::Gemini as usize] = true;
-                }
-                _ => {}
+                executable => antigravity_desktop |= active.observe_google_client(executable),
             }
-            if active.count() == Provider::COUNT {
+            if active.count() == Provider::COUNT && antigravity_desktop {
                 break;
             }
             // SAFETY: The snapshot and entry remain valid for this iteration.
@@ -358,7 +367,20 @@ pub fn active_providers() -> ActiveProviders {
     unsafe {
         let _ = CloseHandle(snapshot);
     }
-    active
+    (active, antigravity_desktop)
+}
+
+impl ActiveProviders {
+    /// Returns whether the executable also exposes the desktop quota service.
+    fn observe_google_client(&mut self, executable: &str) -> bool {
+        let provider = match executable {
+            "gemini.exe" => Provider::Gemini,
+            "antigravity.exe" | "agy.exe" => Provider::Antigravity,
+            _ => return false,
+        };
+        self.0[provider as usize] = true;
+        executable == "antigravity.exe"
+    }
 }
 
 fn claude_process_in_use(pid: u32) -> bool {
@@ -485,7 +507,7 @@ pub fn logo(provider: Provider) -> Option<&'static IconImage> {
         Provider::OpenCode => OPENCODE
             .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/opencode.png")))
             .as_ref(),
-        Provider::Gemini => GEMINI
+        Provider::Gemini | Provider::Antigravity => GEMINI
             .get_or_init(|| decode_logo(include_bytes!("../../../assets/usage/gemini.png")))
             .as_ref(),
         Provider::Zai => ZAI
@@ -683,7 +705,7 @@ fn fetch_all() -> Snapshot {
     let Ok(client) = Client::builder().timeout(Duration::from_secs(6)).build() else {
         return unavailable_snapshot();
     };
-    let active = active_providers();
+    let (active, antigravity_desktop) = active_clients();
     Snapshot {
         providers: std::array::from_fn(|index| {
             let provider = Provider::ALL[index];
@@ -695,6 +717,9 @@ fn fetch_all() -> Snapshot {
                 Provider::Codex => fetch_codex(&client),
                 Provider::OpenCode => fetch_opencode(&client),
                 Provider::Gemini => fetch_gemini(&client),
+                Provider::Antigravity => fetch_antigravity_acp()
+                    .or_else(|| antigravity_desktop.then(fetch_antigravity).flatten())
+                    .unwrap_or_else(unavailable),
                 Provider::Zai => fetch_zai(&client),
             }
         }),
@@ -1131,11 +1156,6 @@ fn parse_zai(value: &Value) -> Vec<Window> {
 }
 
 fn fetch_gemini(client: &Client) -> ProviderUsage {
-    // Antigravity and Gemini CLI have distinct accounts and quotas. Prefer the
-    // running desktop app's own local quota service when it is available.
-    if let Some(usage) = fetch_antigravity() {
-        return usage;
-    }
     let Some(path) = home().map(|path| path.join(".gemini/oauth_creds.json")) else {
         return unavailable();
     };
@@ -1202,6 +1222,86 @@ fn fetch_gemini(client: &Client) -> ProviderUsage {
     } else {
         ready(windows)
     }
+}
+
+fn fetch_antigravity_acp() -> Option<ProviderUsage> {
+    let system = env::var_os("SystemRoot")?;
+    let mut child =
+        Command::new(PathBuf::from(system).join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+    const SCRIPT: &str = concat!("& {\n", include_str!("antigravity-quota.ps1"), "\n}\n\n");
+    let sent = child
+        .stdin
+        .take()
+        .is_some_and(|mut input| input.write_all(SCRIPT.as_bytes()).is_ok());
+    if !sent {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().ok()?;
+    if !sent || !output.status.success() || output.stdout.len() > 128 * 1024 {
+        return None;
+    }
+    let value = serde_json::from_slice(&output.stdout).ok()?;
+    let windows = parse_antigravity_cli(&value);
+    (!windows.is_empty()).then(|| ready(windows))
+}
+
+fn parse_antigravity_cli(value: &Value) -> Vec<Window> {
+    if value.pointer("/command/name").and_then(Value::as_str) != Some("usage") {
+        return Vec::new();
+    }
+    let Some(groups) = value
+        .pointer("/command/data/groups")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let buckets = groups
+        .iter()
+        .filter_map(|group| group.get("buckets")?.as_array())
+        .flatten();
+    let mut windows: [Option<Window>; 2] = [None, None];
+    for bucket in buckets {
+        let (index, minutes) = match bucket.get("window").and_then(Value::as_str) {
+            Some("5h") => (0, 300),
+            Some("weekly") => (1, 10_080),
+            _ => continue,
+        };
+        let Some(fraction) = bucket
+            .get("remaining_fraction")
+            .and_then(Value::as_f64)
+            .filter(|fraction| (0.0..=1.0).contains(fraction))
+        else {
+            continue;
+        };
+        let Some(resets_at) = bucket
+            .get("reset_time")
+            .and_then(Value::as_str)
+            .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+            .filter(|time| time.timestamp() > 0)
+        else {
+            continue;
+        };
+        let used_percent = ((1.0 - fraction) * 100.0).round() as u8;
+        if windows[index]
+            .as_ref()
+            .is_none_or(|old| old.used_percent < used_percent)
+        {
+            windows[index] = Some(Window {
+                label: None,
+                minutes,
+                used_percent,
+                resets_at: Some(resets_at.with_timezone(&Utc)),
+            });
+        }
+    }
+    windows.into_iter().flatten().collect()
 }
 
 fn fetch_antigravity() -> Option<ProviderUsage> {
@@ -1834,6 +1934,44 @@ mod tests {
         })();
         fs::remove_dir_all(&root)?;
         result
+    }
+
+    #[test]
+    fn antigravity_cli_keeps_the_most_used_real_quota_per_window() {
+        let value = json!({"command": {"name": "usage", "data": {"groups": [
+            {"buckets": [
+                {"window":"5h","remaining_fraction":0.2,"reset_time":"2026-11-27T17:00:00Z"},
+                {"window":"weekly","remaining_fraction":0.7,"reset_time":"2026-12-04T10:00:00Z"}
+            ]},
+            {"buckets": [
+                {"window":"5h","remaining_fraction":0.05,"reset_time":"1970-01-01T00:00:00Z"},
+                {"window":"weekly","remaining_fraction":0.4,"reset_time":"2026-12-04T10:00:00Z"}
+            ]}
+        ]}}});
+        let windows = parse_antigravity_cli(&value);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|w| (w.minutes, w.used_percent))
+                .collect::<Vec<_>>(),
+            [(300, 80), (10_080, 60)]
+        );
+    }
+
+    #[test]
+    fn antigravity_acp_and_gemini_cli_have_independent_status() {
+        let mut active = ActiveProviders::default();
+        assert!(!active.observe_google_client("agy.exe"));
+        assert!(active.has(Provider::Antigravity));
+        assert!(!active.has(Provider::Gemini));
+        assert!(
+            Snapshot::default()
+                .visible_providers(active)
+                .has(Provider::Antigravity)
+        );
+        assert!(!active.observe_google_client("gemini.exe"));
+        assert!(active.has(Provider::Gemini));
+        assert!(active.observe_google_client("antigravity.exe"));
     }
 
     #[test]
