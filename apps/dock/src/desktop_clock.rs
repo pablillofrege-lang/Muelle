@@ -9,7 +9,7 @@ use windows::{
     },
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM},
-        Graphics::Gdi::ScreenToClient,
+        Graphics::Gdi::ClientToScreen,
         System::{
             LibraryLoader::GetModuleHandleW,
             RemoteDesktop::{
@@ -21,8 +21,8 @@ use windows::{
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW,
-            GWLP_USERDATA, GetParent, GetWindowLongPtrW, HTTRANSPARENT, IsWindow, KillTimer,
-            MA_NOACTIVATE, PostMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE,
+            GWLP_USERDATA, GetParent, GetWindowLongPtrW, GetWindowRect, HTTRANSPARENT, IsWindow,
+            KillTimer, MA_NOACTIVATE, PostMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE,
             SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SendMessageTimeoutW, SetTimer, SetWindowLongPtrW,
             SetWindowPos, ShowWindow, WM_APP, WM_DPICHANGED_AFTERPARENT, WM_MOUSEACTIVATE,
             WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE,
@@ -43,7 +43,7 @@ use crate::{
 };
 
 pub const TIMER: usize = 19;
-pub const DPI_CHANGED: u32 = WM_APP + 14;
+pub const GEOMETRY_CHANGED: u32 = WM_APP + 14;
 const CLASS: windows::core::PCWSTR = w!("MuelleDesktopClock");
 const WINDOW_TOP: f32 = 80.0;
 const WIDGET_TOP: f32 = 132.0;
@@ -81,6 +81,12 @@ impl Clock {
     pub fn reset_explorer(&mut self) {
         self.window = None;
         self.error_logged = false;
+    }
+
+    pub fn uses_parent(&self, hwnd: HWND) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.progman == hwnd)
     }
 
     pub fn time_changed(&mut self) {
@@ -229,6 +235,13 @@ fn viewport(monitor: Monitor) -> Viewport {
     }
 }
 
+fn parent_position(rect: RECT, origin: POINT) -> POINT {
+    POINT {
+        x: rect.left - origin.x,
+        y: rect.top - origin.y,
+    }
+}
+
 struct Window(HWND);
 
 impl Drop for Window {
@@ -342,34 +355,36 @@ impl ClockWindow {
     }
 
     fn place(&mut self, area: Viewport) -> Result<()> {
-        if self.viewport == Some(area) {
-            return Ok(());
-        }
         let rect = area.rect;
-        let mut point = POINT {
-            x: rect.left,
-            y: rect.top,
-        };
+        let mut actual = RECT::default();
+        // Progman can move the child in screen space without changing our viewport.
         // SAFETY: This child is positioned in its Progman parent's coordinates.
         unsafe {
-            ScreenToClient(self.progman, &mut point)
-                .ok()
-                .context("coordenadas de Progman")?;
-            SetWindowPos(
-                self.hwnd.0,
-                Some(self.icons),
-                point.x,
-                point.y,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOACTIVATE,
-            )?;
+            GetWindowRect(self.hwnd.0, &mut actual)?;
+            if actual != rect {
+                let mut origin = POINT::default();
+                ClientToScreen(self.progman, &mut origin)
+                    .ok()
+                    .context("coordenadas de Progman")?;
+                let point = parent_position(rect, origin);
+                SetWindowPos(
+                    self.hwnd.0,
+                    Some(self.icons),
+                    point.x,
+                    point.y,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOACTIVATE,
+                )?;
+            }
         }
-        self.viewport = Some(area);
-        self.date_key = None;
-        self.time_key = None;
-        self.weather_key = None;
-        self.forecast.SetIsVisible(false)?;
+        if self.viewport != Some(area) {
+            self.forecast.SetIsVisible(false)?;
+            self.viewport = Some(area);
+            self.date_key = None;
+            self.time_key = None;
+            self.weather_key = None;
+        }
         Ok(())
     }
 
@@ -488,7 +503,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             // SAFETY: Only a handle value was stored at window creation.
             let notify = HWND(unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as _);
             if !notify.is_invalid() {
-                let _ = unsafe { PostMessageW(Some(notify), DPI_CHANGED, WPARAM(0), LPARAM(0)) };
+                let _ =
+                    unsafe { PostMessageW(Some(notify), GEOMETRY_CHANGED, WPARAM(0), LPARAM(0)) };
             }
             LRESULT(0)
         }
@@ -534,6 +550,20 @@ mod tests {
     }
 
     #[test]
+    fn desktop_clock_converts_a_negative_virtual_origin_to_parent_coordinates() {
+        let rect = RECT {
+            left: 550,
+            top: 80,
+            right: 1370,
+            bottom: 421,
+        };
+        assert_eq!(
+            parent_position(rect, POINT { x: -1920, y: -1080 }),
+            POINT { x: 2470, y: 1160 },
+        );
+    }
+
+    #[test]
     #[ignore = "requires an unlocked Windows desktop with the dock stopped"]
     fn native_desktop_clock_attaches_and_paints_once_per_minute() -> Result<()> {
         use muelle_shell::system::primary_monitor;
@@ -554,8 +584,25 @@ mod tests {
         let gfx = Gfx::new()?;
         let monitor = primary_monitor().context("pantalla principal")?;
         let mut window = ClockWindow::create(&gfx, HWND::default())?;
-        window.place(viewport(monitor))?;
+        let area = viewport(monitor);
+        window.place(area)?;
         assert!(window.is_attached());
+        // Simulate the screen-space drift of a child when Progman moves.
+        unsafe {
+            SetWindowPos(
+                window.hwnd.0,
+                Some(window.icons),
+                0,
+                0,
+                area.rect.right - area.rect.left,
+                area.rect.bottom - area.rect.top,
+                SWP_NOACTIVATE,
+            )?;
+        }
+        window.place(area)?;
+        let mut actual = RECT::default();
+        unsafe { GetWindowRect(window.hwnd.0, &mut actual)? };
+        assert_eq!(actual, area.rect);
         let mut now = SYSTEMTIME {
             wYear: 2026,
             wMonth: 11,

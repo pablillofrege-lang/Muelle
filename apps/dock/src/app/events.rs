@@ -29,16 +29,16 @@ use crate::{
 };
 
 use super::{
-    APPBAR_CALLBACK, ASSETS_DELAY_MS, ASSETS_READY, ASSETS_TIMER, App, BIN_CHANGED, BIN_DELAY_MS,
-    BIN_STATE, BIN_TIMER, BREAK_TIMER, CONFIG_CHANGED, DRAG_CANCELLED, DRAG_TIMER, DROP_RUN,
-    EDGE_TIMER, FULLSCREEN_TIMER, HEALTH_CHECK, HIDE_TIMER, HSHELL_FLASH, HSHELL_LANGUAGE,
-    HSHELL_REDRAW, HSHELL_RUDEAPPACTIVATED, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWDESTROYED,
-    LAST_FRONT, MASCOT_TIMER, Outside, PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC,
-    PBT_POWERSETTINGCHANGE, PINS_CHANGED, PINS_DELAY_MS, PINS_TIMER, PREVIEW_TIMER,
-    REFRESH_DELAY_MS, REFRESH_TIMER, SHELL_HOOK, SPI_SETWORKAREA, SPRING_TIMER, SWITCHER_TIMER,
-    SYNC_DELAY_MS, SYNC_TIMER, TASKBAR_CREATED, TASKBAR_DELAY_MS, TASKBAR_PREFS_CHANGED,
-    TASKBAR_TAKEN, TASKBAR_TIMER, TRIM_TIMER, UPDATE_TIMER, WELCOME_TIMER, WM_MOUSELEAVE,
-    WM_POWERBROADCAST,
+    APP, APPBAR_CALLBACK, ASSETS_DELAY_MS, ASSETS_READY, ASSETS_TIMER, App, BIN_CHANGED,
+    BIN_DELAY_MS, BIN_STATE, BIN_TIMER, BREAK_TIMER, CONFIG_CHANGED, DRAG_CANCELLED, DRAG_TIMER,
+    DROP_RUN, EDGE_TIMER, FULLSCREEN_TIMER, HEALTH_CHECK, HIDE_TIMER, HSHELL_FLASH,
+    HSHELL_LANGUAGE, HSHELL_REDRAW, HSHELL_RUDEAPPACTIVATED, HSHELL_WINDOWACTIVATED,
+    HSHELL_WINDOWDESTROYED, LAST_FRONT, MASCOT_TIMER, Outside, PBT_APMPOWERSTATUSCHANGE,
+    PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, PINS_CHANGED, PINS_DELAY_MS, PINS_TIMER,
+    PREVIEW_TIMER, REFRESH_DELAY_MS, REFRESH_TIMER, SHELL_HOOK, SPI_SETWORKAREA, SPRING_TIMER,
+    SWITCHER_TIMER, SYNC_DELAY_MS, SYNC_TIMER, TASKBAR_CREATED, TASKBAR_DELAY_MS,
+    TASKBAR_PREFS_CHANGED, TASKBAR_TAKEN, TASKBAR_TIMER, TRIM_TIMER, UPDATE_TIMER, WELCOME_TIMER,
+    WM_MOUSELEAVE, WM_POWERBROADCAST,
     feedback::query_bin_in_background,
     lifecycle::{is_tracked, main_window},
     with_app, with_app_then,
@@ -87,6 +87,27 @@ pub(super) unsafe extern "system" fn on_win_event(
             with_app("ventana activa", App::on_foreground_changed);
         }
     } else if event == EVENT_OBJECT_LOCATIONCHANGE {
+        if child == 0
+            && APP.with(|cell| {
+                cell.try_borrow().ok().is_some_and(|app| {
+                    app.as_ref()
+                        .and_then(|app| app.desktop_clock.as_ref())
+                        .is_some_and(|clock| clock.uses_parent(hwnd))
+                })
+            })
+        {
+            // Explorer may finish moving the parent after our display refresh.
+            // SAFETY: Only a payload-free message is queued to the dock.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(main_window()),
+                    desktop_clock::GEOMETRY_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+            return;
+        }
         // Only the foreground top-level window matters. Ignore child controls,
         // carets and background animations, and coalesce resize bursts using
         // the existing full-screen timer, without enumerating apps or polling.
@@ -615,7 +636,7 @@ pub(super) unsafe extern "system" fn wndproc(
             app.refresh_desktop_clock(true);
             Ok(())
         }),
-        desktop_clock::DPI_CHANGED => with_app("escala del reloj del escritorio", |app| {
+        desktop_clock::GEOMETRY_CHANGED => with_app("posición del reloj del escritorio", |app| {
             app.refresh_desktop_clock(false);
             Ok(())
         }),
