@@ -53,9 +53,27 @@ pub fn query_main() -> Result<()> {
     Ok(())
 }
 
-pub fn selector() -> Result<String> {
+pub fn selector(legacy: bool, bluetooth: bool) -> Result<String> {
     let mut selectors = Vec::new();
     for profile in protocol::PROFILES {
+        if profile.model == Model::DualSense {
+            if !bluetooth {
+                continue;
+            }
+            let selector = HidDevice::GetDeviceSelectorVidPid(
+                profile.page,
+                profile.usage,
+                profile.vendor,
+                profile.product,
+            )?;
+            selectors.push(format!(
+                "{selector} AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True"
+            ));
+            continue;
+        }
+        if !legacy {
+            continue;
+        }
         if profile.page == 0 {
             // Only the two exact HyperX revisions whose usage is not fixed in
             // their protocol notes. No global HID enumeration or vendor-wide IO.
@@ -142,10 +160,10 @@ fn query_child(child: &mut Child, paths: &[String], timeout: u32) -> Result<Vec<
         readings.len() <= 6
             && readings.iter().all(|r| slots.insert(r.slot)
                 && r.percent.is_none_or(|n| n <= 100)
-                && if profile.model == Model::Logitech {
-                    (1..=profile.slots).contains(&r.slot)
-                } else {
-                    r.slot == 0 && r.kind == Kind::Headset
+                && match profile.model {
+                    Model::Logitech => (1..=profile.slots).contains(&r.slot),
+                    Model::DualSense => r.slot == 0 && r.kind == Kind::Gamepad,
+                    _ => r.slot == 0 && r.kind == Kind::Headset,
                 }),
         "invalid USB response"
     );
@@ -325,11 +343,12 @@ impl Sources {
                             } else {
                                 format!("{}/{}", entry.id, reading.slot)
                             },
-                            name: if reading.kind == Kind::Mouse {
-                                "Logitech HID++".into()
-                            } else {
-                                "Wireless headset".into()
-                            },
+                            name: match reading.kind {
+                                Kind::Mouse => "Logitech HID++",
+                                Kind::Headset => "Wireless headset",
+                                Kind::Gamepad => "DualSense",
+                            }
+                            .into(),
                             kind: reading.kind,
                             percent: reading.percent,
                             conflicting: false,
@@ -357,6 +376,12 @@ impl Sources {
         self.entries
             .values()
             .flat_map(|entry| entry.devices.iter().map(|held| &held.device))
+    }
+
+    pub fn dualsense_connected(&self) -> bool {
+        self.entries.keys().any(|path| {
+            protocol::profile_path(path).is_some_and(|profile| profile.model == Model::DualSense)
+        })
     }
 }
 fn retry_delay(failures: u8) -> Duration {

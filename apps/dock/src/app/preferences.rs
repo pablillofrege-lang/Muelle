@@ -396,7 +396,11 @@ impl App {
                     bar.set_visible(!fullscreen)
                 })
                 .and_then(|()| {
-                    bar.set_accessories_enabled(&self.gfx, self.config.accessory_battery)
+                    bar.set_accessories_enabled(
+                        &self.gfx,
+                        self.config.accessory_battery,
+                        self.config.bluetooth_accessory_battery,
+                    )
                 })
                 .and_then(|()| {
                     if weather_changed {

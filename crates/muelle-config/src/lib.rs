@@ -140,6 +140,7 @@ pub struct Config {
     pub menu_bar_ai_alerts: bool,
     /// Opt-in peripheral monitoring. Off means no accessory reader or queries.
     pub accessory_battery: bool,
+    pub bluetooth_accessory_battery: bool,
     /// The dot under apps that have windows open.
     pub show_indicators: bool,
     /// The section of recently used apps that are not pinned.
@@ -465,6 +466,7 @@ impl Default for Config {
             desktop_clock_monitor: None,
             weather: Weather::default(),
             accessory_battery: false,
+            bluetooth_accessory_battery: false,
             show_indicators: true,
             show_recents: true,
             bounce_on_open: true,
@@ -618,6 +620,19 @@ fn write_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bluetooth_accessory_battery_is_independently_opted_in() -> serde_json::Result<()> {
+        let default = serde_json::to_value(super::Config::default())?;
+        assert_eq!(default["bluetoothAccessoryBattery"], false);
+        let config: super::Config =
+            serde_json::from_value(serde_json::json!({"bluetoothAccessoryBattery": true}))?;
+        assert_eq!(
+            serde_json::to_value(&config)?["bluetoothAccessoryBattery"],
+            true
+        );
+        assert!(!config.accessory_battery);
+        Ok(())
+    }
     use super::*;
 
     #[test]
